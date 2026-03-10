@@ -180,8 +180,8 @@ class TestVecChunksStore:
 
 
 class TestSchemaMigration:
-    def test_migration_v1_to_v2(self, tmp_path: Path) -> None:
-        """A v1 store migrates to v2 and gets vec_chunks."""
+    def test_migration_v1_to_latest(self, tmp_path: Path) -> None:
+        """A v1 store migrates to the latest version."""
         db_path = tmp_path / "migrate.db"
         s = IndexStore(db_path)
         s.open()
@@ -199,7 +199,7 @@ class TestSchemaMigration:
         s2.run_migrations()
 
         version = s2.get_meta("schema_version")
-        assert version == "2"
+        assert int(version) >= 3
         s2.close()
 
 
@@ -384,6 +384,7 @@ class TestHybridQuery:
         querier.repo_path = tmp_path
         querier.config = config
         querier.embedder = BagOfWordsEmbedder()
+        querier.reranker = None
         querier._store = IndexStore(db_path)
         querier._store.open()
 

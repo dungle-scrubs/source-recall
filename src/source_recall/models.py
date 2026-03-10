@@ -27,6 +27,16 @@ class ParseMode(enum.StrEnum):
     TEXT_FALLBACK = "text_fallback"
 
 
+class RefType(enum.StrEnum):
+    """Classification of a cross-reference relationship."""
+
+    IMPORT = "import"
+    TYPE_REF = "type_ref"
+    CALL = "call"
+    INHERITS = "inherits"
+    DECORATOR = "decorator"
+
+
 class SymbolType(enum.StrEnum):
     """Classification of a chunk's structural role."""
 
@@ -90,6 +100,20 @@ class ChunkData:
             f"|{content_hash}"
         )
         return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+@dataclass(frozen=True, slots=True)
+class RefData:
+    """A cross-reference from one chunk to a symbol.
+
+    @param source_chunk_id: Chunk that contains the reference.
+    @param target_symbol: Symbol name being referenced.
+    @param ref_type: Kind of reference (import, call, etc.).
+    """
+
+    source_chunk_id: str
+    target_symbol: str
+    ref_type: RefType
 
 
 @dataclass(frozen=True, slots=True)

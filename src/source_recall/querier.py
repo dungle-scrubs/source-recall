@@ -12,6 +12,7 @@ from source_recall.store import IndexStore, get_db_path
 
 if TYPE_CHECKING:
     from source_recall.embedder import Embedder
+    from source_recall.reranker import Reranker
 
 # ---------------------------------------------------------------------------
 # Query classification
@@ -148,10 +149,12 @@ class IndexQuerier:
         repo_path: Path,
         config: SRConfig,
         embedder: Embedder | None = None,
+        reranker: Reranker | None = None,
     ) -> None:
         self.repo_path = repo_path.resolve()
         self.config = config
         self.embedder = embedder
+        self.reranker = reranker
         self._store: IndexStore | None = None
 
     def _get_store(self) -> IndexStore:
@@ -299,6 +302,44 @@ class IndexQuerier:
             scores = seen
             ranked_ids = sorted(scores, key=lambda c: scores[c], reverse=True)
 
+        # Rerank top candidates if reranker is available.
+        candidates = ranked_ids[: k * 3]  # Rerank 3x top_k for quality.
+        if self.reranker is not None and candidates and question.strip():
+            try:
+                items = [
+                    {"chunk_id": cid, "content": all_chunks[cid]["content"]}
+                    for cid in candidates
+                    if cid in all_chunks
+                ]
+                reranked = self.reranker.rerank(question, items)
+                # Replace ranking with reranker scores.
+                ranked_ids = [item["chunk_id"] for item, _score in reranked]
+                for item, score in reranked:
+                    scores[item["chunk_id"]] = score
+                    reason = reasons.get(item["chunk_id"], "")
+                    if reason:
+                        reasons[item["chunk_id"]] = f"{reason}+reranked"
+                    else:
+                        reasons[item["chunk_id"]] = "reranked"
+            except Exception:
+                pass  # Reranking failure is non-fatal.
+
+        # Graph expansion: expand top results along ref edges.
+        top_ids = ranked_ids[:5]
+        expanded: list[str] = []
+        if top_ids:
+            expanded = self._graph_expand(store, top_ids, all_chunks, question)
+
+        # Merge expanded into ranked results.
+        final_ids = ranked_ids[:k]
+        expansion_slots = k - len(final_ids)
+        if expansion_slots <= 0:
+            expansion_slots = min(3, k)  # Always allow a few expansions.
+        for eid in expanded[:expansion_slots]:
+            if eid not in final_ids:
+                final_ids.append(eid)
+                reasons[eid] = "graph_expansion"
+
         # Return top_k.
         return [
             QueryResult(
@@ -307,15 +348,50 @@ class IndexQuerier:
                 symbol_name=all_chunks[cid]["symbol_name"],
                 symbol_type=all_chunks[cid]["symbol_type"],
                 content=all_chunks[cid]["content"],
-                score=round(scores[cid], 4),
+                score=round(scores.get(cid, 0.0), 4),
                 start_line=all_chunks[cid]["start_line"],
                 end_line=all_chunks[cid]["end_line"],
                 search_quality=all_chunks[cid]["search_quality"],
                 match_reason=reasons.get(cid, ""),
             )
-            for cid in ranked_ids[:k]
+            for cid in final_ids[: k + expansion_slots]
             if cid in all_chunks
         ]
+
+    def _graph_expand(
+        self,
+        store: IndexStore,
+        top_ids: list[str],
+        all_chunks: dict[str, dict[str, Any]],
+        _question: str,
+    ) -> list[str]:
+        """Expand top results along the ref graph.
+
+        For each top result, look up its outgoing refs, resolve targets
+        via symbol_lookup, and include chunks that aren't already in results.
+
+        @param store: Active IndexStore.
+        @param top_ids: Top chunk IDs to expand from.
+        @param all_chunks: Already-loaded chunk data.
+        @param _question: Original query (reserved for future score-gating).
+        @returns: List of expanded chunk IDs.
+        """
+        existing = set(all_chunks.keys())
+        expanded: list[str] = []
+
+        for cid in top_ids:
+            refs = store.get_refs_for_chunk(cid)
+            for ref in refs:
+                # Resolve target symbol to chunk(s).
+                targets = store.lookup_symbol(ref.target_symbol)
+                for target in targets:
+                    tcid = target["chunk_id"]
+                    if tcid not in existing and tcid not in expanded:
+                        # Add to all_chunks so we can build QueryResult.
+                        all_chunks[tcid] = target
+                        expanded.append(tcid)
+
+        return expanded[:10]  # Cap at 10 expansion slots.
 
     def status(self) -> IndexStatus:
         """Get index status information.

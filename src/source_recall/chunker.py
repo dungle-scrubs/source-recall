@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from source_recall.models import ChunkData, SearchQuality, SymbolType
+from source_recall.models import ChunkData, RefData, RefType, SearchQuality, SymbolType
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -55,6 +55,31 @@ def chunk_file(
     if ext in _TEXT_EXTENSIONS:
         return _chunk_prose(file_path, content, max_chars)
     return _chunk_text_fallback(file_path, content, max_chars)
+
+
+def chunk_file_with_refs(
+    file_path: str,
+    content: str,
+    *,
+    max_chars: int = 6000,
+) -> tuple[list[ChunkData], SearchQuality, list[RefData]]:
+    """Chunk a file and extract cross-references.
+
+    @param file_path: Repo-relative path to the file.
+    @param content: Full text of the file.
+    @param max_chars: Character threshold for sub-chunking.
+    @returns: Tuple of (chunks, search_quality, refs).
+    """
+    chunks, quality = chunk_file(file_path, content, max_chars=max_chars)
+    ext = _get_extension(file_path)
+
+    refs: list[RefData] = []
+    if ext in _PY_EXTENSIONS:
+        refs = _extract_python_refs(chunks, content)
+    elif ext in _TS_EXTENSIONS:
+        refs = _extract_ts_refs(chunks, content)
+
+    return chunks, quality, refs
 
 
 # ---------------------------------------------------------------------------
@@ -1331,3 +1356,116 @@ def _get_extension(file_path: str) -> str:
     if idx == -1:
         return ""
     return file_path[idx:].lower()
+
+
+# ---------------------------------------------------------------------------
+# Cross-reference extraction
+# ---------------------------------------------------------------------------
+
+# Python patterns
+_PY_IMPORT_FROM_RE = re.compile(
+    r"^from\s+([\w.]+)\s+import\s+(.+?)(?:\s+#.*)?$", re.MULTILINE
+)
+_PY_IMPORT_RE = re.compile(r"^import\s+([\w.]+)", re.MULTILINE)
+_PY_CLASS_RE = re.compile(r"^class\s+\w+\(([^)]+)\)", re.MULTILINE)
+_PY_DECORATOR_RE = re.compile(r"^@([\w.]+)", re.MULTILINE)
+
+
+def _extract_python_refs(chunks: list[ChunkData], content: str) -> list[RefData]:
+    """Extract cross-references from Python source.
+
+    @param chunks: Chunks produced from this file.
+    @param content: Full file content.
+    @returns: List of RefData.
+    """
+    refs: list[RefData] = []
+
+    # Map line ranges to chunk IDs for attribution.
+    def _chunk_for_line(line: int) -> str | None:
+        for c in chunks:
+            if c.start_line <= line <= c.end_line:
+                return c.chunk_id
+        return chunks[0].chunk_id if chunks else None
+
+    # from X import Y, Z
+    for m in _PY_IMPORT_FROM_RE.finditer(content):
+        module = m.group(1)
+        names = [n.strip().split(" as ")[0].strip() for n in m.group(2).split(",")]
+        line = content[: m.start()].count("\n") + 1
+        cid = _chunk_for_line(line)
+        if cid:
+            for name in names:
+                if name and name != "*":
+                    refs.append(RefData(cid, f"{module}.{name}", RefType.IMPORT))
+
+    # import X
+    for m in _PY_IMPORT_RE.finditer(content):
+        line = content[: m.start()].count("\n") + 1
+        cid = _chunk_for_line(line)
+        if cid:
+            refs.append(RefData(cid, m.group(1), RefType.IMPORT))
+
+    # class Foo(Bar, Baz):
+    for m in _PY_CLASS_RE.finditer(content):
+        line = content[: m.start()].count("\n") + 1
+        cid = _chunk_for_line(line)
+        if cid:
+            bases = [b.strip() for b in m.group(1).split(",")]
+            for base in bases:
+                # Strip generic params: Base[T] → Base
+                base = base.split("[")[0].strip()
+                if base and base not in ("object",):
+                    refs.append(RefData(cid, base, RefType.INHERITS))
+
+    # @decorator
+    for m in _PY_DECORATOR_RE.finditer(content):
+        line = content[: m.start()].count("\n") + 1
+        cid = _chunk_for_line(line)
+        if cid:
+            refs.append(RefData(cid, m.group(1), RefType.DECORATOR))
+
+    return refs
+
+
+# TypeScript/JavaScript patterns
+_TS_IMPORT_RE = re.compile(
+    r"import\s+\{([^}]+)\}\s+from\s+['\"]([^'\"]+)['\"]", re.MULTILINE
+)
+_TS_IMPORT_DEFAULT_RE = re.compile(
+    r"import\s+(\w+)\s+from\s+['\"]([^'\"]+)['\"]", re.MULTILINE
+)
+
+
+def _extract_ts_refs(chunks: list[ChunkData], content: str) -> list[RefData]:
+    """Extract cross-references from TypeScript/JavaScript source.
+
+    @param chunks: Chunks produced from this file.
+    @param content: Full file content.
+    @returns: List of RefData.
+    """
+    refs: list[RefData] = []
+
+    def _chunk_for_line(line: int) -> str | None:
+        for c in chunks:
+            if c.start_line <= line <= c.end_line:
+                return c.chunk_id
+        return chunks[0].chunk_id if chunks else None
+
+    # import { X, Y } from 'module'
+    for m in _TS_IMPORT_RE.finditer(content):
+        names = [n.strip().split(" as ")[0].strip() for n in m.group(1).split(",")]
+        line = content[: m.start()].count("\n") + 1
+        cid = _chunk_for_line(line)
+        if cid:
+            for name in names:
+                if name:
+                    refs.append(RefData(cid, name, RefType.IMPORT))
+
+    # import X from 'module'
+    for m in _TS_IMPORT_DEFAULT_RE.finditer(content):
+        line = content[: m.start()].count("\n") + 1
+        cid = _chunk_for_line(line)
+        if cid:
+            refs.append(RefData(cid, m.group(1), RefType.IMPORT))
+
+    return refs

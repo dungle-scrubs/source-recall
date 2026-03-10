@@ -20,6 +20,7 @@ from source_recall.models import (
     FileRecord,
     IndexLockError,
     ParseMode,
+    RefData,
     SchemaVersionError,
 )
 
@@ -45,7 +46,7 @@ if TYPE_CHECKING:
 # Schema
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 _DDL = """\
 CREATE TABLE IF NOT EXISTS meta (
@@ -108,6 +109,28 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at  TEXT NOT NULL,
     description TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS refs (
+    source_chunk_id TEXT NOT NULL,
+    target_symbol   TEXT NOT NULL,
+    ref_type        TEXT NOT NULL
+        CHECK (ref_type IN ('import', 'type_ref', 'call', 'inherits', 'decorator')),
+    FOREIGN KEY (source_chunk_id) REFERENCES chunks(id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_symbol);
+CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_chunk_id);
+
+CREATE TABLE IF NOT EXISTS symbol_lookup (
+    symbol_name TEXT NOT NULL,
+    chunk_id    TEXT NOT NULL,
+    file_path   TEXT NOT NULL,
+    FOREIGN KEY (chunk_id) REFERENCES chunks(id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_name ON symbol_lookup(symbol_name);
 """
 
 # ---------------------------------------------------------------------------
@@ -125,6 +148,31 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         # sqlite-vec virtual tables require the extension to be loaded.
         # This migration is a no-op placeholder to bump schema_version.
         "SELECT 1;",
+    ),
+    (
+        3,
+        "add refs and symbol_lookup tables",
+        """
+        CREATE TABLE IF NOT EXISTS refs (
+            source_chunk_id TEXT NOT NULL,
+            target_symbol   TEXT NOT NULL,
+            ref_type        TEXT NOT NULL
+                CHECK (ref_type IN ('import', 'type_ref', 'call', 'inherits', 'decorator')),
+            FOREIGN KEY (source_chunk_id) REFERENCES chunks(id)
+                ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(target_symbol);
+        CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_chunk_id);
+
+        CREATE TABLE IF NOT EXISTS symbol_lookup (
+            symbol_name TEXT NOT NULL,
+            chunk_id    TEXT NOT NULL,
+            file_path   TEXT NOT NULL,
+            FOREIGN KEY (chunk_id) REFERENCES chunks(id)
+                ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_symbol_name ON symbol_lookup(symbol_name)
+        """,
     ),
 ]
 
@@ -535,6 +583,127 @@ class IndexStore:
             }
             for row in rows
         ]
+
+    # -- Refs / symbol_lookup operations ---------------------------------------
+
+    def insert_refs(self, refs: Sequence[RefData]) -> None:
+        """Batch-insert cross-references.
+
+        @param refs: List of RefData to insert.
+        """
+        if not refs:
+            return
+        self.conn.executemany(
+            "INSERT INTO refs (source_chunk_id, target_symbol, ref_type) "
+            "VALUES (?, ?, ?)",
+            [(r.source_chunk_id, r.target_symbol, r.ref_type) for r in refs],
+        )
+        self.conn.commit()
+
+    def get_refs_for_chunk(self, chunk_id: str) -> list[RefData]:
+        """Get all outgoing refs from a chunk.
+
+        @param chunk_id: Source chunk ID.
+        @returns: List of RefData.
+        """
+        from source_recall.models import RefType as _RefType
+
+        rows = self.conn.execute(
+            "SELECT source_chunk_id, target_symbol, ref_type FROM refs "
+            "WHERE source_chunk_id = ?",
+            (chunk_id,),
+        ).fetchall()
+        return [
+            RefData(
+                source_chunk_id=row["source_chunk_id"],
+                target_symbol=row["target_symbol"],
+                ref_type=_RefType(row["ref_type"]),
+            )
+            for row in rows
+        ]
+
+    def get_chunks_referencing(self, symbol: str) -> list[dict[str, Any]]:
+        """Find chunks that reference a given symbol (reverse lookup).
+
+        @param symbol: Target symbol name.
+        @returns: List of chunk dicts with ref_type.
+        """
+        rows = self.conn.execute(
+            "SELECT r.ref_type, c.* FROM refs r "
+            "JOIN chunks c ON c.id = r.source_chunk_id "
+            "WHERE r.target_symbol = ?",
+            (symbol,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def insert_symbol_lookup(
+        self, chunk_id: str, symbol_name: str, file_path: str
+    ) -> None:
+        """Register a symbol definition for graph resolution.
+
+        @param chunk_id: Chunk that defines this symbol.
+        @param symbol_name: Symbol name.
+        @param file_path: File containing the definition.
+        """
+        self.conn.execute(
+            "INSERT INTO symbol_lookup (symbol_name, chunk_id, file_path) "
+            "VALUES (?, ?, ?)",
+            (symbol_name, chunk_id, file_path),
+        )
+        self.conn.commit()
+
+    def insert_symbol_lookups(self, entries: Sequence[tuple[str, str, str]]) -> None:
+        """Batch-insert symbol lookup entries.
+
+        @param entries: List of (chunk_id, symbol_name, file_path) tuples.
+        """
+        if not entries:
+            return
+        self.conn.executemany(
+            "INSERT INTO symbol_lookup (symbol_name, chunk_id, file_path) "
+            "VALUES (?, ?, ?)",
+            [(sym, cid, fp) for cid, sym, fp in entries],
+        )
+        self.conn.commit()
+
+    def lookup_symbol(self, symbol_name: str) -> list[dict[str, Any]]:
+        """Find chunks that define a symbol.
+
+        @param symbol_name: Symbol to look up.
+        @returns: List of dicts with chunk_id, file_path, etc.
+        """
+        rows = self.conn.execute(
+            "SELECT sl.chunk_id, sl.file_path, c.symbol_name, c.symbol_type, "
+            "c.content, c.start_line, c.end_line, c.search_quality "
+            "FROM symbol_lookup sl "
+            "JOIN chunks c ON c.id = sl.chunk_id "
+            "WHERE sl.symbol_name = ?",
+            (symbol_name,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_refs_for_file(self, file_path: str) -> None:
+        """Delete all refs originating from chunks in a file.
+
+        @param file_path: Repo-relative file path.
+        """
+        self.conn.execute(
+            "DELETE FROM refs WHERE source_chunk_id IN "
+            "(SELECT id FROM chunks WHERE file_path = ?)",
+            (file_path,),
+        )
+        self.conn.commit()
+
+    def delete_symbol_lookups_for_file(self, file_path: str) -> None:
+        """Delete all symbol_lookup entries for a file.
+
+        @param file_path: Repo-relative file path.
+        """
+        self.conn.execute(
+            "DELETE FROM symbol_lookup WHERE file_path = ?",
+            (file_path,),
+        )
+        self.conn.commit()
 
     # -- Vector CRUD (sqlite-vec via apsw) ---------------------------------
     #

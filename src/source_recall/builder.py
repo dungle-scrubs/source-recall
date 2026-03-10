@@ -11,7 +11,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from source_recall.chunker import chunk_file, chunk_pdf
+from source_recall.chunker import chunk_file_with_refs, chunk_pdf
 from source_recall.config import SRConfig
 from source_recall.models import (
     FileDiscoveryError,
@@ -328,8 +328,8 @@ class IndexBuilder:
 
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
-        # Chunk the file.
-        chunks, quality = chunk_file(
+        # Chunk the file and extract refs.
+        chunks, quality, refs = chunk_file_with_refs(
             rel_path, content, max_chars=self.config.chunk_max_chars
         )
 
@@ -337,6 +337,19 @@ class IndexBuilder:
         if chunks:
             store.insert_chunks(chunks)
             chunk_pairs = [(c.chunk_id, c.content) for c in chunks]
+
+            # Store refs.
+            if refs:
+                store.insert_refs(refs)
+
+            # Store symbol_lookup for named symbols.
+            sym_entries = [
+                (c.chunk_id, c.symbol_name, c.file_path)
+                for c in chunks
+                if c.symbol_name
+            ]
+            if sym_entries:
+                store.insert_symbol_lookups(sym_entries)
 
         # Record file hash.
         try:

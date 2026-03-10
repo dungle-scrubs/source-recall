@@ -67,3 +67,6 @@ indent-style = "space"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: marks tests that load ML models (deselect with '-m not slow')",
+]

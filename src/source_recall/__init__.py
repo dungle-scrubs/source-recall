@@ -74,6 +74,8 @@ class Index:
         else:
             self._embedder = embedder  # type: ignore[assignment]
 
+        self._reranker: object = _SENTINEL  # Lazy-loaded.
+
     @staticmethod
     def _create_default_embedder() -> Embedder | None:
         """Attempt to create a CodeRankEmbedder.
@@ -90,6 +92,31 @@ class Index:
                 exc_info=True,
             )
             return None
+
+    def _get_reranker(self) -> object | None:
+        """Lazily create a CrossEncoderReranker if config allows.
+
+        Only loads the model when rerank_enabled is True in config.
+        The model is ~90MB and takes ~2s to load, so we defer until
+        the first query and only when explicitly enabled.
+
+        @returns: Reranker instance or None.
+        """
+        if self._reranker is not _SENTINEL:
+            return self._reranker
+
+        if not getattr(self.config, "rerank_enabled", False):
+            self._reranker = None
+            return None
+
+        try:
+            from source_recall.reranker import CrossEncoderReranker
+
+            self._reranker = CrossEncoderReranker()
+        except Exception:
+            logger.warning("Could not create CrossEncoderReranker — skipping rerank")
+            self._reranker = None
+        return self._reranker
 
     def build(self) -> Path:
         """Build the full index with atomic swap.
@@ -129,7 +156,9 @@ class Index:
         """
         from source_recall.querier import IndexQuerier
 
-        querier = IndexQuerier(self.repo_path, self.config, self._embedder)
+        querier = IndexQuerier(
+            self.repo_path, self.config, self._embedder, self._get_reranker()
+        )
         try:
             return querier.query(question, top_k=top_k)
         finally:

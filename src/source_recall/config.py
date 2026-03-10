@@ -58,6 +58,7 @@ class SRConfig(BaseSettings):
     exclude_patterns: tuple[str, ...] = _DEFAULT_EXCLUDES
     embed_enabled: bool = True
     embed_batch_size: int = Field(default=32, gt=0, le=512)
+    rerank_enabled: bool = False
 
     @field_validator("exclude_patterns", mode="before")
     @classmethod
@@ -129,6 +130,7 @@ def format_config(config: SRConfig) -> str:
     lines.append(f"auto_refresh = {'true' if config.auto_refresh else 'false'}")
     lines.append(f"embed_enabled = {'true' if config.embed_enabled else 'false'}")
     lines.append(f"embed_batch_size = {config.embed_batch_size}")
+    lines.append(f"rerank_enabled = {'true' if config.rerank_enabled else 'false'}")
 
     excludes = ", ".join(f'"{p}"' for p in config.exclude_patterns)
     lines.append(f"exclude_patterns = [{excludes}]")
