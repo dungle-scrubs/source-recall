@@ -361,6 +361,45 @@ def config_show(
 
 
 # ---------------------------------------------------------------------------
+# sr serve
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def serve(
+    path: str = typer.Argument(".", help="Path to the repository root."),
+    port: int = typer.Option(7249, "--port", "-p", help="Port to listen on."),
+    host: str = typer.Option("127.0.0.1", "--host", help="Host to bind to."),
+) -> None:
+    """Start a persistent query server.
+
+    Loads the embedding model once on startup, then serves queries
+    over HTTP. Much faster than sr ask for repeated queries.
+
+    Endpoints:
+      POST /query    {question, top_k?} → ranked results
+      GET  /status   → index metrics
+      POST /refresh  → incremental re-index
+    """
+    import uvicorn
+
+    from source_recall.server import create_app
+
+    repo_path = Path(path).resolve()
+
+    err_console.print(f"[bold]Starting source-recall server[/bold] for {repo_path}")
+    err_console.print("  Loading model (first time may download ~522 MB)...")
+
+    server_app = create_app(repo_path)
+
+    err_console.print(f"  Listening on [cyan]http://{host}:{port}[/cyan]")
+    err_console.print("  POST /query  GET /status  POST /refresh")
+    err_console.print()
+
+    uvicorn.run(server_app, host=host, port=port, log_level="warning")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

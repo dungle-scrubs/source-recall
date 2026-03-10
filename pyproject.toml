@@ -18,6 +18,8 @@ dependencies = [
     "sentence-transformers>=3.0.0",
     "onnxruntime>=1.18.0",
     "einops>=0.8.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
     "apsw>=3.52.0.0",
 ]
 
