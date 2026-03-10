@@ -122,6 +122,16 @@ TypeScript extraction patterns:
 | 6 | `querier.py` | Rerank after RRF, graph expansion |
 | 7 | `config.py` | `rerank_enabled`, `graph_expansion` fields |
 
+## Configuration
+
+| Field | Env var | Default | Description |
+|-------|---------|---------|-------------|
+| `rerank_enabled` | `SR_RERANK_ENABLED` | `false` | Enable cross-encoder reranking |
+
+Reranking is opt-in because it adds ~100ms per query and
+downloads a ~90MB model on first use. Enable it when retrieval
+quality matters more than latency.
+
 ## Dependencies
 
 ```toml
