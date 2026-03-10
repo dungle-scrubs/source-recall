@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+_SENTINEL = object()
 
 logger = logging.getLogger(__name__)
 
@@ -106,33 +110,31 @@ class RefreshResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def create_app(repo_path: Path) -> FastAPI:
+def create_app(
+    repo_path: Path,
+    embedder: Any | None = _SENTINEL,
+) -> FastAPI:
     """Create a FastAPI app bound to a specific repository index.
 
     Loads the embedder and opens the index on startup. All query
     requests share the pre-loaded model — no per-request load cost.
 
     @param repo_path: Absolute path to the repository root.
+    @param embedder: Embedder instance (omit for auto-create, None for FTS-only).
     @returns: Configured FastAPI application.
     """
-    app = FastAPI(
-        title="source-recall",
-        description="Code search and retrieval server.",
-    )
-
-    # Shared state — loaded once at startup.
+    # Shared state — populated during lifespan startup.
     state: dict[str, Any] = {}
 
-    @app.on_event("startup")
-    async def startup() -> None:
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         """Load embedder and open index on server start."""
         from source_recall import Index
 
         logger.info("Loading embedder for %s...", repo_path)
         t0 = time.monotonic()
 
-        idx = Index(repo_path)
-        # Force a status check to verify the index exists.
+        idx = Index(repo_path, embedder=embedder)
         idx.status()
 
         elapsed = time.monotonic() - t0
@@ -140,6 +142,13 @@ def create_app(repo_path: Path) -> FastAPI:
 
         state["index"] = idx
         state["repo_path"] = repo_path
+        yield
+
+    app = FastAPI(
+        title="source-recall",
+        description="Code search and retrieval server.",
+        lifespan=lifespan,
+    )
 
     @app.post("/query", response_model=QueryResponse)
     async def query(req: QueryRequest) -> QueryResponse:

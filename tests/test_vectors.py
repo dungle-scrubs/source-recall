@@ -260,6 +260,64 @@ class TestRRFMerge:
 # ---------------------------------------------------------------------------
 
 
+class TestGracefulDegradation:
+    def test_build_continues_when_embedder_crashes(self, tmp_path: Path) -> None:
+        """If embedder.embed_chunks raises, chunks are still indexed (FTS works)."""
+        import shutil
+
+        from source_recall.builder import IndexBuilder
+        from source_recall.config import SRConfig
+        from source_recall.embedder import BagOfWordsEmbedder
+        from source_recall.store import IndexStore, get_db_path
+
+        # Copy py-app fixture.
+        src = Path(__file__).parent / "fixtures" / "py-app"
+        repo = tmp_path / "repo"
+        shutil.copytree(src, repo)
+
+        class ExplodingEmbedder(BagOfWordsEmbedder):
+            """Embedder that always raises on embed_chunks."""
+
+            def embed_chunks(self, _texts: list[str]) -> list[list[float]]:
+                msg = "GPU exploded"
+                raise RuntimeError(msg)
+
+        config = SRConfig()
+        builder = IndexBuilder(repo, config, embedder=ExplodingEmbedder())
+        builder.build()
+
+        # FTS still works — chunks were inserted.
+        store = IndexStore(get_db_path(repo))
+        store.open()
+        assert store.get_chunk_count() > 0
+
+        # But no vectors.
+        assert store.get_vector_count() == 0
+
+        # FTS search returns results.
+        results = store.fts_search("validate")
+        assert len(results) > 0
+        store.close()
+
+    def test_embed_enabled_false_skips_vectors(self, tmp_path: Path) -> None:
+        """Index with embed_enabled=false produces zero vectors."""
+        import shutil
+
+        from source_recall import Index
+
+        src = Path(__file__).parent / "fixtures" / "py-app"
+        repo = tmp_path / "repo2"
+        shutil.copytree(src, repo)
+
+        idx = Index(repo, embedder=None)
+        idx.build()
+
+        s = idx.status()
+        assert s.chunk_count > 0
+        assert s.vector_count == 0
+        assert s.embed_model == ""
+
+
 class TestHybridQuery:
     def test_vector_search_finds_semantic_match(
         self, vec_store: IndexStore, embedder: BagOfWordsEmbedder

@@ -81,6 +81,50 @@ class TestConfigValidation:
             SRConfig(chunk_max_chars=100)
 
 
+class TestEmbedConfig:
+    def test_embed_enabled_default_true(self) -> None:
+        """embed_enabled defaults to True."""
+        config = resolve_config()
+        assert config.embed_enabled is True
+
+    def test_embed_enabled_from_env(self, monkeypatch: object) -> None:
+        """SR_EMBED_ENABLED=false disables embeddings."""
+        import os
+
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            os, "environ", {**os.environ, "SR_EMBED_ENABLED": "false"}
+        )
+        config = resolve_config()
+        assert config.embed_enabled is False
+
+    def test_embed_batch_size_default(self) -> None:
+        """embed_batch_size defaults to 32."""
+        config = resolve_config()
+        assert config.embed_batch_size == 32
+
+    def test_embed_batch_size_from_env(self, monkeypatch: object) -> None:
+        """SR_EMBED_BATCH_SIZE env var is respected."""
+        import os
+
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            os, "environ", {**os.environ, "SR_EMBED_BATCH_SIZE": "16"}
+        )
+        config = resolve_config()
+        assert config.embed_batch_size == 16
+
+    def test_embed_batch_size_from_override(self) -> None:
+        """Keyword override sets embed_batch_size."""
+        config = resolve_config(embed_batch_size=64)
+        assert config.embed_batch_size == 64
+
+    def test_format_includes_embed_fields(self) -> None:
+        """format_config includes embed_enabled and embed_batch_size."""
+        config = SRConfig()
+        text = format_config(config)
+        assert "embed_enabled = true" in text
+        assert "embed_batch_size = 32" in text
+
+
 class TestFormatConfig:
     def test_round_trip(self) -> None:
         """format_config produces valid TOML-like output."""

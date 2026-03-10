@@ -202,8 +202,9 @@ class IndexQuerier:
         fts_results = store.fts_search(question, limit=30)
 
         # Vector search if embedder and vec_chunks available.
+        # Skip for empty/whitespace queries — no meaningful embedding.
         vec_results: list[dict[str, Any]] = []
-        if self.embedder is not None and store.has_vec_table():
+        if self.embedder is not None and store.has_vec_table() and question.strip():
             try:
                 query_vec = self.embedder.embed_query(question)
                 vec_results = store.search_vectors(query_vec, top_k=30)
