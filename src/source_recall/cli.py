@@ -56,6 +56,16 @@ def index(
             f"Regex: {status.regex_files}  "
             f"Text: {status.text_fallback_files}"
         )
+        if status.vector_count > 0:
+            pct = (
+                status.vector_count / status.chunk_count * 100
+                if status.chunk_count > 0
+                else 0
+            )
+            err_console.print(
+                f"  Vectors: {status.vector_count}/{status.chunk_count} "
+                f"({pct:.0f}%) — {status.embed_model} ({status.embed_dimensions}d)"
+            )
     except Exception as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1) from e
@@ -218,23 +228,22 @@ def status(
         raise typer.Exit(1) from e
 
     if json_output:
-        print(
-            json.dumps(
-                {
-                    "repo_path": s.repo_path,
-                    "db_path": s.db_path,
-                    "db_size_bytes": s.db_size_bytes,
-                    "indexed_at": s.indexed_at,
-                    "last_commit": s.last_commit,
-                    "file_count": s.file_count,
-                    "chunk_count": s.chunk_count,
-                    "ast_files": s.ast_files,
-                    "regex_files": s.regex_files,
-                    "text_fallback_files": s.text_fallback_files,
-                },
-                indent=2,
-            )
-        )
+        data = {
+            "repo_path": s.repo_path,
+            "db_path": s.db_path,
+            "db_size_bytes": s.db_size_bytes,
+            "indexed_at": s.indexed_at,
+            "last_commit": s.last_commit,
+            "file_count": s.file_count,
+            "chunk_count": s.chunk_count,
+            "ast_files": s.ast_files,
+            "regex_files": s.regex_files,
+            "text_fallback_files": s.text_fallback_files,
+            "vector_count": s.vector_count,
+            "embed_model": s.embed_model,
+            "embed_dimensions": s.embed_dimensions,
+        }
+        print(json.dumps(data, indent=2))
     else:
         _human_size = _format_bytes(s.db_size_bytes)
         console.print(f"[bold]Repository:[/bold]  {s.repo_path}")
@@ -250,6 +259,16 @@ def status(
             f"{s.text_fallback_files} text fallback)"
         )
         console.print(f"[bold]Chunks:[/bold]      {s.chunk_count:,}")
+        if s.vector_count > 0:
+            pct = s.vector_count / s.chunk_count * 100 if s.chunk_count > 0 else 0
+            console.print(
+                f"[bold]Vectors:[/bold]     {s.vector_count:,}/{s.chunk_count:,} ({pct:.0f}%)"
+            )
+            console.print(
+                f"[bold]Embed model:[/bold] {s.embed_model} ({s.embed_dimensions}d)"
+            )
+        else:
+            console.print("[bold]Vectors:[/bold]     [dim]none[/dim]")
 
 
 # ---------------------------------------------------------------------------

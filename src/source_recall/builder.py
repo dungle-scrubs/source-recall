@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import subprocess
 from datetime import UTC, datetime
@@ -23,6 +24,10 @@ from source_recall.store import IndexStore, get_db_path
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from source_recall.embedder import Embedder
+
+logger = logging.getLogger(__name__)
+
 
 class IndexBuilder:
     """Orchestrates building and refreshing a code index.
@@ -30,6 +35,7 @@ class IndexBuilder:
     @param repo_path: Absolute path to the repository root.
     @param config: Resolved SRConfig.
     @param on_progress: Optional callback(file_path, current, total).
+    @param embedder: Optional embedder for vector search. None disables vectors.
     """
 
     def __init__(
@@ -37,10 +43,12 @@ class IndexBuilder:
         repo_path: Path,
         config: SRConfig,
         on_progress: Callable[[str, int, int], None] | None = None,
+        embedder: Embedder | None = None,
     ) -> None:
         self.repo_path = repo_path.resolve()
         self.config = config
         self.on_progress = on_progress
+        self.embedder = embedder
 
     def build(self) -> Path:
         """Full index build with atomic swap.
@@ -65,26 +73,55 @@ class IndexBuilder:
             store.open()
             store.create_schema()
 
+            # Set up vector table if embedder is available.
+            vec_enabled = False
+            if self.embedder is not None:
+                vec_enabled = store.ensure_vec_table(self.embedder.dimensions)
+                if not vec_enabled:
+                    logger.warning("sqlite-vec unavailable — building FTS-only index")
+
             # Discover and index files.
             files = self._discover_files()
             total = len(files)
 
+            # Collect chunks for batch embedding.
+            pending_vectors: list[tuple[str, str]] = []  # (chunk_id, content)
+
             for i, rel_path in enumerate(files):
                 if self.on_progress:
                     self.on_progress(rel_path, i + 1, total)
-                self._index_file(store, rel_path)
+                chunk_ids = self._index_file(store, rel_path)
+
+                if vec_enabled and self.embedder is not None:
+                    for cid, content in chunk_ids:
+                        pending_vectors.append((cid, content))
+
+                    # Batch embed when we have enough.
+                    if len(pending_vectors) >= self.config.embed_batch_size:
+                        self._flush_vectors(store, pending_vectors)
+                        pending_vectors.clear()
+
+            # Flush remaining vectors.
+            if pending_vectors and vec_enabled and self.embedder is not None:
+                self._flush_vectors(store, pending_vectors)
 
             # Write meta.
-            store.set_meta_batch(
-                {
-                    "repo_path": str(self.repo_path),
-                    "indexed_at": _now_iso(),
-                    "last_commit": _git_head(self.repo_path) or "",
-                    "repo_root_commit": _git_root_commit(self.repo_path) or "",
-                    "repo_remote_url_hash": _git_remote_hash(self.repo_path) or "",
-                    "schema_version": "1",
-                }
-            )
+            meta = {
+                "repo_path": str(self.repo_path),
+                "indexed_at": _now_iso(),
+                "last_commit": _git_head(self.repo_path) or "",
+                "repo_root_commit": _git_root_commit(self.repo_path) or "",
+                "repo_remote_url_hash": _git_remote_hash(self.repo_path) or "",
+                "schema_version": "2",
+            }
+            if vec_enabled and self.embedder is not None:
+                meta["embed_model"] = type(self.embedder).__name__
+                meta["embed_dimensions"] = str(self.embedder.dimensions)
+                chunk_count = store.get_chunk_count()
+                vec_count = store.get_vector_count()
+                coverage = vec_count / chunk_count if chunk_count > 0 else 0.0
+                meta["embed_coverage"] = f"{coverage:.4f}"
+            store.set_meta_batch(meta)
 
             store.close()
 
@@ -129,27 +166,54 @@ class IndexBuilder:
                 self.build()
                 return len(changed_files)
 
+            # Set up vectors for refresh if embedder available.
+            vec_enabled = False
+            if self.embedder is not None:
+                vec_enabled = store.ensure_vec_table(self.embedder.dimensions)
+
             # Incremental update.
             total = len(changed_files)
+            pending_vectors: list[tuple[str, str]] = []
+
             for i, (rel_path, action) in enumerate(changed_files):
                 if self.on_progress:
                     self.on_progress(rel_path, i + 1, total)
 
                 if action == "delete":
+                    if vec_enabled:
+                        store.delete_vectors_by_file(rel_path)
                     store.delete_chunks_for_file(rel_path)
                     store.delete_file_hash(rel_path)
                 else:
+                    if vec_enabled:
+                        store.delete_vectors_by_file(rel_path)
                     store.delete_chunks_for_file(rel_path)
                     store.delete_file_hash(rel_path)
-                    self._index_file(store, rel_path)
+                    chunk_ids = self._index_file(store, rel_path)
+
+                    if vec_enabled and self.embedder is not None:
+                        for cid, content in chunk_ids:
+                            pending_vectors.append((cid, content))
+
+                        if len(pending_vectors) >= self.config.embed_batch_size:
+                            self._flush_vectors(store, pending_vectors)
+                            pending_vectors.clear()
+
+            # Flush remaining vectors.
+            if pending_vectors and vec_enabled and self.embedder is not None:
+                self._flush_vectors(store, pending_vectors)
 
             # Update meta.
-            store.set_meta_batch(
-                {
-                    "indexed_at": _now_iso(),
-                    "last_commit": _git_head(self.repo_path) or "",
-                }
-            )
+            meta: dict[str, str] = {
+                "indexed_at": _now_iso(),
+                "last_commit": _git_head(self.repo_path) or "",
+            }
+            if vec_enabled and self.embedder is not None:
+                chunk_count = store.get_chunk_count()
+                vec_count = store.get_vector_count()
+                coverage = vec_count / chunk_count if chunk_count > 0 else 0.0
+                meta["embed_coverage"] = f"{coverage:.4f}"
+            store.set_meta_batch(meta)
 
             store.close()
 
@@ -244,17 +308,18 @@ class IndexBuilder:
 
     # -- File indexing ------------------------------------------------------
 
-    def _index_file(self, store: IndexStore, rel_path: str) -> None:
+    def _index_file(self, store: IndexStore, rel_path: str) -> list[tuple[str, str]]:
         """Read, chunk, and store a single file.
 
         @param store: IndexStore to write to.
         @param rel_path: Repo-relative path.
+        @returns: List of (chunk_id, content) tuples for embedding.
         """
         full = self.repo_path / rel_path
         try:
             content = full.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            return
+            return []
 
         content_hash = hashlib.sha256(content.encode()).hexdigest()
 
@@ -263,8 +328,10 @@ class IndexBuilder:
             rel_path, content, max_chars=self.config.chunk_max_chars
         )
 
+        chunk_pairs: list[tuple[str, str]] = []
         if chunks:
             store.insert_chunks(chunks)
+            chunk_pairs = [(c.chunk_id, c.content) for c in chunks]
 
         # Record file hash.
         try:
@@ -281,6 +348,32 @@ class IndexBuilder:
                 mtime_ns=mtime_ns,
             )
         )
+
+        return chunk_pairs
+
+    def _flush_vectors(
+        self,
+        store: IndexStore,
+        pending: list[tuple[str, str]],
+    ) -> None:
+        """Embed and insert a batch of chunks into vec_chunks.
+
+        @param store: IndexStore to write to.
+        @param pending: List of (chunk_id, content) to embed.
+        """
+        if not pending or self.embedder is None:
+            return
+        chunk_ids = [p[0] for p in pending]
+        texts = [p[1] for p in pending]
+        try:
+            embeddings = self.embedder.embed_chunks(texts)
+            store.insert_vectors(chunk_ids, embeddings)
+        except Exception:
+            logger.warning(
+                "Embedding failed for batch of %d chunks — skipping vectors",
+                len(pending),
+                exc_info=True,
+            )
 
     # -- Change detection ---------------------------------------------------
 

@@ -56,6 +56,8 @@ class SRConfig(BaseSettings):
     chunk_max_chars: int = Field(default=6000, gt=500)
     auto_refresh: bool = True
     exclude_patterns: tuple[str, ...] = _DEFAULT_EXCLUDES
+    embed_enabled: bool = True
+    embed_batch_size: int = Field(default=32, gt=0, le=512)
 
     @field_validator("exclude_patterns", mode="before")
     @classmethod
@@ -125,6 +127,8 @@ def format_config(config: SRConfig) -> str:
     lines.append(f"top_k = {config.top_k}")
     lines.append(f"chunk_max_chars = {config.chunk_max_chars}")
     lines.append(f"auto_refresh = {'true' if config.auto_refresh else 'false'}")
+    lines.append(f"embed_enabled = {'true' if config.embed_enabled else 'false'}")
+    lines.append(f"embed_batch_size = {config.embed_batch_size}")
 
     excludes = ", ".join(f'"{p}"' for p in config.exclude_patterns)
     lines.append(f"exclude_patterns = [{excludes}]")

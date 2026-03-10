@@ -153,6 +153,9 @@ class IndexStatus:
     @param regex_files: Files parsed via regex heuristics.
     @param text_fallback_files: Files using text fallback.
     @param stale_files: Files modified since last index.
+    @param vector_count: Number of chunks with vector embeddings.
+    @param embed_model: Name of the embedding model used.
+    @param embed_dimensions: Dimensionality of embedding vectors.
     """
 
     repo_path: str
@@ -166,6 +169,9 @@ class IndexStatus:
     regex_files: int
     text_fallback_files: int
     stale_files: int = 0
+    vector_count: int = 0
+    embed_model: str = ""
+    embed_dimensions: int = 0
 
 
 @dataclass(slots=True)

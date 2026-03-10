@@ -4,7 +4,9 @@ PID-file locking, and atomic swap.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -21,6 +23,21 @@ from source_recall.models import (
     SchemaVersionError,
 )
 
+# ---------------------------------------------------------------------------
+# sqlite-vec availability (requires apsw for extension loading on macOS)
+# ---------------------------------------------------------------------------
+
+_HAS_SQLITE_VEC = False
+try:
+    import apsw  # noqa: F401
+    import sqlite_vec  # noqa: F401
+
+    _HAS_SQLITE_VEC = True
+except ImportError:
+    pass
+
+_store_logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from collections.abc import Generator, Sequence
 
@@ -28,7 +45,7 @@ if TYPE_CHECKING:
 # Schema
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 _DDL = """\
 CREATE TABLE IF NOT EXISTS meta (
@@ -101,6 +118,14 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 _MIGRATIONS: list[tuple[int, str, str]] = [
     # (version, description, sql)
     # Version 1 is the initial schema — created by DDL above.
+    (
+        2,
+        "add vec_chunks for vector search",
+        # vec_chunks creation is handled in _ensure_vec_table() since
+        # sqlite-vec virtual tables require the extension to be loaded.
+        # This migration is a no-op placeholder to bump schema_version.
+        "SELECT 1;",
+    ),
 ]
 
 
@@ -178,6 +203,7 @@ class IndexStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self._conn: sqlite3.Connection | None = None
+        self._vec_conn: Any = None  # apsw.Connection, lazily opened
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -199,7 +225,10 @@ class IndexStore:
         return conn
 
     def close(self) -> None:
-        """Close the connection if open."""
+        """Close all connections if open."""
+        if self._vec_conn is not None:
+            self._vec_conn.close()
+            self._vec_conn = None
         if self._conn is not None:
             self._conn.close()
             self._conn = None
@@ -234,13 +263,23 @@ class IndexStore:
                 continue
             self.conn.execute(f"SAVEPOINT migration_{version}")
             try:
-                self.conn.executescript(sql)
+                # Use execute (not executescript) to stay within the
+                # savepoint — executescript auto-commits.
+                for stmt in sql.split(";"):
+                    stmt = stmt.strip()
+                    if stmt:
+                        self.conn.execute(stmt)
                 self.conn.execute(
                     "INSERT INTO schema_migrations (version, applied_at, description) "
                     "VALUES (?, ?, ?)",
                     (version, _now_iso(), description),
                 )
-                self._set_meta("schema_version", str(version))
+                # Use direct execute (not _set_meta) to avoid commit()
+                # which would release the savepoint.
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    ("schema_version", str(version)),
+                )
                 self.conn.execute(f"RELEASE migration_{version}")
             except Exception:
                 self.conn.execute(f"ROLLBACK TO migration_{version}")
@@ -496,6 +535,178 @@ class IndexStore:
             }
             for row in rows
         ]
+
+    # -- Vector CRUD (sqlite-vec via apsw) ---------------------------------
+    #
+    # macOS Python doesn't compile sqlite3 with SQLITE_ENABLE_LOAD_EXTENSION.
+    # We use apsw (which bundles its own sqlite3 build with extension support)
+    # for all vec_chunks operations. The apsw connection opens the same
+    # database file in WAL mode, so reads/writes interleave safely with the
+    # sqlite3 connection used for FTS/chunks/meta.
+
+    def _get_vec_conn(self) -> Any:
+        """Get or open the apsw connection with sqlite-vec loaded.
+
+        @returns: An apsw.Connection with the vec extension, or None.
+        """
+        if not _HAS_SQLITE_VEC:
+            return None
+
+        if self._vec_conn is not None:
+            return self._vec_conn
+
+        try:
+            vec_conn = apsw.Connection(str(self.db_path))  # type: ignore[name-defined]
+            vec_conn.execute("PRAGMA journal_mode = WAL")
+            vec_conn.execute("PRAGMA busy_timeout = 5000")
+            vec_conn.enable_load_extension(True)
+            vec_conn.load_extension(sqlite_vec.loadable_path())  # type: ignore[name-defined]
+            vec_conn.enable_load_extension(False)
+            self._vec_conn = vec_conn
+            return vec_conn
+        except Exception:
+            _store_logger.debug("Failed to open apsw vec connection", exc_info=True)
+            return None
+
+    def ensure_vec_table(self, dimensions: int) -> bool:
+        """Create the vec_chunks virtual table if sqlite-vec is available.
+
+        @param dimensions: Embedding vector dimensionality.
+        @returns: True if table exists (created or already present).
+        """
+        vec_conn = self._get_vec_conn()
+        if vec_conn is None:
+            return False
+        vec_conn.execute(
+            f"""CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
+                chunk_id TEXT PRIMARY KEY,
+                embedding FLOAT[{dimensions}]
+            )"""
+        )
+        return True
+
+    def has_vec_table(self) -> bool:
+        """Check if the vec_chunks table exists.
+
+        @returns: True if the table exists.
+        """
+        row = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_chunks'"
+        ).fetchone()
+        return row is not None
+
+    def insert_vectors(
+        self,
+        chunk_ids: list[str],
+        embeddings: list[list[float]],
+    ) -> None:
+        """Batch insert vectors into vec_chunks via apsw.
+
+        @param chunk_ids: Chunk IDs matching rows in the chunks table.
+        @param embeddings: Embedding vectors (must match table dimensions).
+        """
+        if not chunk_ids:
+            return
+
+        vec_conn = self._get_vec_conn()
+        if vec_conn is None:
+            return
+
+        import struct
+
+        for cid, emb in zip(chunk_ids, embeddings, strict=True):
+            blob = struct.pack(f"{len(emb)}f", *emb)
+            # vec0 doesn't support INSERT OR REPLACE — delete first.
+            with contextlib.suppress(Exception):
+                vec_conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
+            vec_conn.execute(
+                "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
+                (cid, blob),
+            )
+
+    def search_vectors(
+        self,
+        query_embedding: list[float],
+        top_k: int = 30,
+    ) -> list[dict[str, Any]]:
+        """Search vec_chunks by distance, join with chunks via apsw.
+
+        @param query_embedding: Query vector.
+        @param top_k: Max results.
+        @returns: List of dicts with chunk data and distance score.
+        """
+        vec_conn = self._get_vec_conn()
+        if vec_conn is None:
+            return []
+        if not self.has_vec_table():
+            return []
+
+        import struct
+
+        blob = struct.pack(f"{len(query_embedding)}f", *query_embedding)
+
+        rows = list(
+            vec_conn.execute(
+                """SELECT
+                     c.id, c.file_path, c.symbol_name, c.symbol_type,
+                     c.content, c.start_line, c.end_line, c.search_quality,
+                     v.distance
+                   FROM vec_chunks v
+                   JOIN chunks c ON c.id = v.chunk_id
+                   WHERE v.embedding MATCH ?
+                     AND k = ?
+                   ORDER BY v.distance""",
+                (blob, top_k),
+            )
+        )
+
+        return [
+            {
+                "chunk_id": row[0],
+                "file_path": row[1],
+                "symbol_name": row[2],
+                "symbol_type": row[3],
+                "content": row[4],
+                "start_line": row[5],
+                "end_line": row[6],
+                "search_quality": row[7],
+                "distance": row[8],
+            }
+            for row in rows
+        ]
+
+    def delete_vectors_by_file(self, file_path: str) -> None:
+        """Delete vec_chunks rows for chunks belonging to a file.
+
+        Uses the apsw connection since vec_chunks is a vec0 virtual table.
+
+        @param file_path: Repo-relative file path.
+        """
+        if not self.has_vec_table():
+            return
+        vec_conn = self._get_vec_conn()
+        if vec_conn is None:
+            return
+        vec_conn.execute(
+            """DELETE FROM vec_chunks
+               WHERE chunk_id IN (
+                   SELECT id FROM chunks WHERE file_path = ?
+               )""",
+            (file_path,),
+        )
+
+    def get_vector_count(self) -> int:
+        """Count rows in vec_chunks.
+
+        @returns: Number of vectors stored (0 if table doesn't exist).
+        """
+        if not self.has_vec_table():
+            return 0
+        vec_conn = self._get_vec_conn()
+        if vec_conn is None:
+            return 0
+        row = list(vec_conn.execute("SELECT COUNT(*) FROM vec_chunks"))
+        return row[0][0] if row else 0
 
     # -- Atomic swap --------------------------------------------------------
 
