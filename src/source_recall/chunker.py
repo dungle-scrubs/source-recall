@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from source_recall.models import ChunkData, SearchQuality, SymbolType
@@ -18,6 +19,11 @@ if TYPE_CHECKING:
 _TS_EXTENSIONS = frozenset({".ts", ".tsx", ".js", ".jsx"})
 _PY_EXTENSIONS = frozenset({".py"})
 _BASH_EXTENSIONS = frozenset({".sh", ".bash"})
+_MARKDOWN_EXTENSIONS = frozenset({".md", ".mdx", ".markdown"})
+_TEXT_EXTENSIONS = frozenset({".txt", ".text", ".rst", ".log"})
+
+# Sentence-ending punctuation followed by whitespace.
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 
 # Overlap lines between consecutive sub-chunks.
 _SUB_CHUNK_OVERLAP = 8
@@ -44,6 +50,10 @@ def chunk_file(
         return _chunk_python(file_path, content, max_chars)
     if ext in _BASH_EXTENSIONS:
         return _chunk_bash_regex(file_path, content, max_chars)
+    if ext in _MARKDOWN_EXTENSIONS:
+        return _chunk_markdown(file_path, content, max_chars)
+    if ext in _TEXT_EXTENSIONS:
+        return _chunk_prose(file_path, content, max_chars)
     return _chunk_text_fallback(file_path, content, max_chars)
 
 
@@ -724,6 +734,218 @@ def _chunk_bash_regex(
 # ---------------------------------------------------------------------------
 # Text fallback
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# PDF chunking
+# ---------------------------------------------------------------------------
+
+
+def chunk_pdf(file_path: str, pdf_path: Path) -> tuple[list[ChunkData], SearchQuality]:
+    """Extract text from a PDF and produce one chunk per non-empty page.
+
+    @param file_path: Repo-relative path for chunk metadata.
+    @param pdf_path: Absolute path to the PDF file on disk.
+    @returns: (chunks, quality).
+    """
+    import fitz
+
+    chunks: list[ChunkData] = []
+    doc = fitz.open(str(pdf_path))
+
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        text = page.get_text().strip()
+        if not text:
+            continue
+
+        chunks.append(
+            ChunkData(
+                file_path=file_path,
+                symbol_name=f"Page {page_num + 1}",
+                symbol_type=SymbolType.MODULE,
+                content=text,
+                start_line=page_num + 1,
+                end_line=page_num + 1,
+                search_quality=SearchQuality.AST,
+            )
+        )
+
+    doc.close()
+    return chunks, SearchQuality.AST
+
+
+# ---------------------------------------------------------------------------
+# Markdown chunking
+# ---------------------------------------------------------------------------
+
+# Matches ATX headings: # Foo, ## Bar, etc.  Skips lines inside fenced blocks.
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+_FENCE_RE = re.compile(r"^(`{3,}|~{3,})", re.MULTILINE)
+
+
+def _chunk_markdown(
+    file_path: str, content: str, max_chars: int
+) -> tuple[list[ChunkData], SearchQuality]:
+    """Split markdown on ATX headings, respecting fenced code blocks.
+
+    Each heading starts a new chunk.  The heading text becomes the
+    symbol_name.  Content before the first heading is its own chunk.
+
+    @param file_path: Repo-relative path.
+    @param content: Markdown text.
+    @param max_chars: Sub-chunk threshold.
+    @returns: (chunks, quality).
+    """
+    # Find headings that are NOT inside fenced code blocks.
+    fenced_ranges: list[tuple[int, int]] = []
+    for m in _FENCE_RE.finditer(content):
+        if len(fenced_ranges) % 2 == 0:
+            fenced_ranges.append((m.start(), -1))
+        elif fenced_ranges:
+            fenced_ranges[-1] = (fenced_ranges[-1][0], m.end())
+
+    def _in_fence(pos: int) -> bool:
+        return any(s <= pos <= e for s, e in fenced_ranges if e != -1)
+
+    # Collect heading positions.
+    sections: list[tuple[str, int]] = []  # (heading_text, char_offset)
+    for m in _HEADING_RE.finditer(content):
+        if not _in_fence(m.start()):
+            sections.append((m.group(2).strip(), m.start()))
+
+    chunks: list[ChunkData] = []
+
+    # Content before first heading.
+    if sections:
+        preamble = content[: sections[0][1]].strip()
+        if preamble:
+            line_count = preamble.count("\n") + 1
+            _add_chunk(
+                chunks,
+                file_path,
+                "",
+                SymbolType.BLOCK,
+                preamble,
+                1,
+                line_count,
+                SearchQuality.AST,
+                max_chars,
+            )
+
+    # Each section: from this heading to the next (or EOF).
+    for i, (heading, start) in enumerate(sections):
+        end = sections[i + 1][1] if i + 1 < len(sections) else len(content)
+        body = content[start:end].strip()
+        if not body:
+            continue
+
+        start_line = content[:start].count("\n") + 1
+        end_line = start_line + body.count("\n")
+        _add_chunk(
+            chunks,
+            file_path,
+            heading,
+            SymbolType.MODULE,
+            body,
+            start_line,
+            end_line,
+            SearchQuality.AST,
+            max_chars,
+        )
+
+    # File with no headings at all → single chunk.
+    if not sections and content.strip():
+        _add_chunk(
+            chunks,
+            file_path,
+            "",
+            SymbolType.BLOCK,
+            content.strip(),
+            1,
+            content.count("\n") + 1,
+            SearchQuality.AST,
+            max_chars,
+        )
+
+    return chunks, SearchQuality.AST
+
+
+# ---------------------------------------------------------------------------
+# Prose chunking (sentence-boundary sliding window)
+# ---------------------------------------------------------------------------
+
+
+def _chunk_prose(
+    file_path: str, content: str, max_chars: int
+) -> tuple[list[ChunkData], SearchQuality]:
+    """Split plain text on sentence boundaries within max_chars.
+
+    Accumulates sentences until adding the next would exceed max_chars,
+    then emits a chunk and starts a new one.
+
+    @param file_path: Repo-relative path.
+    @param content: Plain text content.
+    @param max_chars: Target max characters per chunk.
+    @returns: (chunks, quality).
+    """
+    if not content.strip():
+        return [], SearchQuality.TEXT_FALLBACK
+
+    sentences = _SENTENCE_END_RE.split(content.strip())
+    chunks: list[ChunkData] = []
+    current: list[str] = []
+    current_len = 0
+    current_start_line = 1
+    lines_so_far = 0
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        added_len = len(sentence) + (1 if current else 0)
+
+        if current and current_len + added_len > max_chars:
+            # Emit current chunk.
+            text = " ".join(current)
+            end_line = current_start_line + text.count("\n")
+            chunks.append(
+                ChunkData(
+                    file_path=file_path,
+                    symbol_name="",
+                    symbol_type=SymbolType.BLOCK,
+                    content=text,
+                    start_line=current_start_line,
+                    end_line=end_line,
+                    search_quality=SearchQuality.TEXT_FALLBACK,
+                )
+            )
+            lines_so_far += text.count("\n") + 1
+            current_start_line = lines_so_far + 1
+            current = []
+            current_len = 0
+
+        current.append(sentence)
+        current_len += added_len
+
+    # Emit remaining.
+    if current:
+        text = " ".join(current)
+        end_line = current_start_line + text.count("\n")
+        chunks.append(
+            ChunkData(
+                file_path=file_path,
+                symbol_name="",
+                symbol_type=SymbolType.BLOCK,
+                content=text,
+                start_line=current_start_line,
+                end_line=end_line,
+                search_quality=SearchQuality.TEXT_FALLBACK,
+            )
+        )
+
+    return chunks, SearchQuality.TEXT_FALLBACK
 
 
 def _chunk_text_fallback(

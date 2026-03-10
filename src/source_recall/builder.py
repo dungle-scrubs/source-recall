@@ -11,7 +11,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from source_recall.chunker import chunk_file
+from source_recall.chunker import chunk_file, chunk_pdf
 from source_recall.config import SRConfig
 from source_recall.models import (
     FileDiscoveryError,
@@ -316,6 +316,11 @@ class IndexBuilder:
         @returns: List of (chunk_id, content) tuples for embedding.
         """
         full = self.repo_path / rel_path
+
+        # PDF files need binary extraction via pymupdf.
+        if full.suffix.lower() == ".pdf":
+            return self._index_pdf(store, rel_path, full)
+
         try:
             content = full.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -338,6 +343,46 @@ class IndexBuilder:
             mtime_ns = full.stat().st_mtime_ns
         except OSError:
             mtime_ns = None
+
+        parse_mode = ParseMode(quality.value)
+        store.upsert_file_hash(
+            FileRecord(
+                file_path=rel_path,
+                content_hash=content_hash,
+                parse_mode=parse_mode,
+                mtime_ns=mtime_ns,
+            )
+        )
+
+        return chunk_pairs
+
+    def _index_pdf(
+        self, store: IndexStore, rel_path: str, full: Path
+    ) -> list[tuple[str, str]]:
+        """Extract text from a PDF and index its chunks.
+
+        @param store: IndexStore to write to.
+        @param rel_path: Repo-relative path.
+        @param full: Absolute path to the PDF file.
+        @returns: List of (chunk_id, content) tuples for embedding.
+        """
+        try:
+            chunks, quality = chunk_pdf(rel_path, full)
+        except Exception:
+            return []
+
+        # Use file mtime as hash proxy for PDFs.
+        try:
+            mtime_ns = full.stat().st_mtime_ns
+            content_hash = hashlib.sha256(str(mtime_ns).encode()).hexdigest()
+        except OSError:
+            content_hash = hashlib.sha256(b"pdf").hexdigest()
+            mtime_ns = None
+
+        chunk_pairs: list[tuple[str, str]] = []
+        if chunks:
+            store.insert_chunks(chunks)
+            chunk_pairs = [(c.chunk_id, c.content) for c in chunks]
 
         parse_mode = ParseMode(quality.value)
         store.upsert_file_hash(
