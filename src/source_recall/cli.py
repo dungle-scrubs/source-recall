@@ -29,24 +29,39 @@ def index(
     path: str = typer.Argument(".", help="Path to the repository root."),
 ) -> None:
     """Build or rebuild the index for a repository."""
+    from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
+
     from source_recall import Index
 
     repo_path = Path(path).resolve()
 
+    progress = Progress(
+        TextColumn("[bold blue]Indexing"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("[dim]{task.fields[file]}"),
+        console=err_console,
+        transient=True,
+    )
+    task_id: object = None
+
     def on_progress(file_path: str, current: int, total: int) -> None:
         """Progress callback for indexing."""
-        err_console.print(
-            f"  [{current}/{total}] {file_path}",
-            highlight=False,
-            end="\r",
-        )
+        nonlocal task_id
+        if task_id is None:
+            task_id = progress.add_task("index", total=total, file=file_path)
+            progress.start()
+        progress.update(task_id, completed=current, file=file_path)  # type: ignore[arg-type]
 
     try:
         idx = Index(repo_path, on_progress=on_progress)
         db_path = idx.build()
+
+        if progress.live.is_started:
+            progress.stop()
+
         status = idx.status()
 
-        err_console.print()  # Clear progress line.
         err_console.print(
             f"[green]✓[/green] Indexed {status.file_count} files "
             f"({status.chunk_count} chunks) → {db_path}"
