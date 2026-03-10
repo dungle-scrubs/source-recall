@@ -367,17 +367,26 @@ def config_show(
 
 @app.command()
 def serve(
-    path: str = typer.Argument(".", help="Path to the repository root."),
+    paths: list[str] = typer.Argument(
+        None, help="Repository paths to serve (default: current dir)."
+    ),
     port: int = typer.Option(7249, "--port", "-p", help="Port to listen on."),
     host: str = typer.Option("127.0.0.1", "--host", help="Host to bind to."),
 ) -> None:
     """Start a persistent query server.
 
     Loads the embedding model once on startup, then serves queries
-    over HTTP. Much faster than sr ask for repeated queries.
+    over HTTP. Accepts one or more repo paths.
+
+    Examples:
+      sr serve                           # serve current dir
+      sr serve ~/dev/cheater             # serve one repo
+      sr serve ~/dev/cheater ~/dev/api   # serve multiple repos
 
     Endpoints:
-      POST /query    {question, top_k?} → ranked results
+      GET  /health   → liveness check
+      GET  /repos    → list loaded repos
+      POST /query    {question, top_k?, repo?} → ranked results
       GET  /status   → index metrics
       POST /refresh  → incremental re-index
     """
@@ -385,15 +394,27 @@ def serve(
 
     from source_recall.server import create_app
 
-    repo_path = Path(path).resolve()
+    if not paths:
+        paths = ["."]
 
-    err_console.print(f"[bold]Starting source-recall server[/bold] for {repo_path}")
+    repo_paths = [Path(p).resolve() for p in paths]
+
+    if len(repo_paths) == 1:
+        err_console.print(
+            f"[bold]Starting source-recall server[/bold] for {repo_paths[0]}"
+        )
+    else:
+        err_console.print(
+            f"[bold]Starting source-recall server[/bold] for {len(repo_paths)} repos:"
+        )
+        for rp in repo_paths:
+            err_console.print(f"  • {rp.name} → {rp}")
+
     err_console.print("  Loading model (first time may download ~522 MB)...")
 
-    server_app = create_app(repo_path)
+    server_app = create_app(repo_paths)
 
     err_console.print(f"  Listening on [cyan]http://{host}:{port}[/cyan]")
-    err_console.print("  POST /query  GET /status  POST /refresh")
     err_console.print()
 
     uvicorn.run(server_app, host=host, port=port, log_level="warning")

@@ -93,3 +93,59 @@ class TestQueryTopK:
         resp = indexed_app.post("/query", json={"question": ""})
         assert resp.status_code == 200
         assert resp.json()["results"] == []
+
+
+class TestHealthEndpoint:
+    def test_returns_ok(self, indexed_app: TestClient) -> None:
+        """GET /health returns ok=true with repos and uptime."""
+        resp = indexed_app.get("/health")
+        assert resp.status_code == 200
+
+        data = resp.json()
+        assert data["ok"] is True
+        assert len(data["repos"]) == 1
+        assert data["uptime_s"] >= 0
+
+
+class TestReposEndpoint:
+    def test_lists_loaded_repos(self, indexed_app: TestClient) -> None:
+        """GET /repos returns repo info with stats."""
+        resp = indexed_app.get("/repos")
+        assert resp.status_code == 200
+
+        data = resp.json()
+        assert len(data["repos"]) == 1
+        repo = data["repos"][0]
+        assert repo["file_count"] > 0
+        assert repo["chunk_count"] > 0
+
+
+class TestMultiRepo:
+    def test_query_requires_repo_when_multiple(self, py_app_path: Path) -> None:
+        """POST /query without repo returns 400 when multiple repos loaded."""
+        import shutil
+
+        from source_recall import Index
+        from source_recall.server import create_app
+
+        # Create a second repo.
+        repo2 = py_app_path.parent / "repo2"
+        shutil.copytree(py_app_path, repo2)
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        Index(py_app_path, embedder=emb).build()
+        Index(repo2, embedder=emb).build()
+
+        app = create_app([py_app_path, repo2], embedder=emb)
+        with TestClient(app) as client:
+            # Without repo → 400.
+            resp = client.post("/query", json={"question": "test"})
+            assert resp.status_code == 400
+
+            # With repo → 200.
+            repo_name = py_app_path.name
+            resp = client.post("/query", json={"question": "test", "repo": repo_name})
+            assert resp.status_code == 200
+            assert len(resp.json()["results"]) > 0
+
+        shutil.rmtree(repo2)

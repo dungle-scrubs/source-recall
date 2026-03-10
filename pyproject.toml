@@ -55,6 +55,9 @@ select = [
 ]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+"src/source_recall/cli.py" = ["B008"]  # typer uses function calls in arg defaults
+
 [tool.ruff.lint.isort]
 known-first-party = ["source_recall"]
 
