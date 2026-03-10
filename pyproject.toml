@@ -1,0 +1,58 @@
+[project]
+name = "source-recall"
+version = "0.1.0"
+description = "Code search and retrieval for AI coding tools"
+readme = "README.md"
+authors = [
+    { name = "Kevin", email = "dungle-scrubs@users.noreply.github.com" },
+]
+requires-python = ">=3.12"
+dependencies = [
+    "tree-sitter==0.25.2",
+    "tree-sitter-language-pack==0.13.0",
+    "typer>=0.15.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.9.0",
+]
+
+[project.scripts]
+sr = "source_recall.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "B",
+    "C4",
+    "UP",
+    "ARG",
+    "SIM",
+]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["source_recall"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
