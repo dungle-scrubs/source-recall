@@ -922,19 +922,12 @@ class IndexStore:
 
         import struct
 
-        # Batch delete existing vectors (vec0 lacks INSERT OR REPLACE).
-        for i in range(0, len(chunk_ids), 500):
-            batch = chunk_ids[i : i + 500]
-            placeholders = ",".join("?" * len(batch))
-            with contextlib.suppress(Exception):
-                vec_conn.execute(
-                    f"DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})",
-                    batch,
-                )
-
-        # Batch insert new vectors.
+        # vec0 virtual tables don't support DELETE ... WHERE IN (...),
+        # so delete-then-insert must be per-row.
         for cid, emb in zip(chunk_ids, embeddings, strict=True):
             blob = struct.pack(f"{len(emb)}f", *emb)
+            with contextlib.suppress(Exception):
+                vec_conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
             vec_conn.execute(
                 "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
                 (cid, blob),
