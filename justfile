@@ -25,6 +25,26 @@ fix:
 index path=".":
     uv run sr index {{path}}
 
+# Build index and output JSON summary
+index-json path=".":
+    uv run sr index {{path}} --json
+
+# List all indexed repos
+list:
+    uv run sr list
+
+# List all indexed repos (JSON)
+list-json:
+    uv run sr list --json
+
+# Show index status
+status path=".":
+    uv run sr status {{path}}
+
+# Show index status (JSON)
+status-json path=".":
+    uv run sr status {{path}} --json
+
 # Start query server (one or more repos)
 serve *paths:
     uv run sr serve {{paths}}
@@ -44,8 +64,20 @@ repos:
     curl -s http://127.0.0.1:7249/repos | python3 -m json.tool
 
 # Server status
-status:
+server-status:
     curl -s http://127.0.0.1:7249/status | python3 -m json.tool
+
+# Remove orphaned indexes
+clean:
+    uv run sr clean
+
+# Remove orphaned indexes (dry run)
+clean-dry:
+    uv run sr clean --dry-run
+
+# Show resolved config
+config path=".":
+    uv run sr config {{path}}
 
 # Install sr globally
 install:

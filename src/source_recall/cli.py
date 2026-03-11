@@ -1,4 +1,4 @@
-"""CLI: sr index, sr ask, sr status, sr clean, sr config show."""
+"""CLI: sr index, sr ask, sr status, sr list, sr clean, sr config show."""
 
 from __future__ import annotations
 
@@ -13,7 +13,20 @@ from rich.syntax import Syntax
 
 app = typer.Typer(
     name="sr",
-    help="source-recall: Code search and retrieval for AI coding tools.",
+    help=(
+        "source-recall: Code search and retrieval for AI coding tools.\n\n"
+        "Indexes repositories into searchable chunks (AST-parsed, FTS5-indexed,\n"
+        "optionally vector-embedded). Designed for integration with coding agents\n"
+        "and LLM pipelines.\n\n"
+        "Quick start:\n\n"
+        "  sr index .          # Build index for current repo\n\n"
+        "  sr ask 'auth flow'  # Search for relevant code\n\n"
+        "  sr status .         # Check index health\n\n"
+        "  sr list             # Show all indexed repos\n\n"
+        "Agent integration:\n\n"
+        "  Most commands accept --json for machine-readable output.\n"
+        "  Use 'sr serve' for persistent HTTP access."
+    ),
     no_args_is_help=True,
 )
 console = Console()
@@ -34,8 +47,27 @@ def index(
     rerank: bool = typer.Option(
         False, "--rerank", help="Enable cross-encoder reranking."
     ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output final summary as JSON to stdout (progress on stderr).",
+    ),
 ) -> None:
-    """Build or rebuild the index for a repository."""
+    """Build or rebuild the index for a repository.
+
+    Discovers files, parses them with tree-sitter (AST), regex, or text
+    fallback, stores chunks in FTS5, and optionally generates vector
+    embeddings for semantic search.
+
+    Progress is printed to stderr. With --json, a machine-readable
+    summary is printed to stdout on completion.
+
+    Examples:\n
+      sr index .                    # Index current repo\n
+      sr index ~/dev/myproject      # Index specific repo\n
+      sr index . --no-embed         # FTS-only (fast, no model download)\n
+      sr index . --json             # JSON summary for agent consumption
+    """
     from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
 
     from source_recall import Index
@@ -78,27 +110,28 @@ def index(
         raise SystemExit(130)  # noqa: B904
 
     try:
-        status = idx.status()
+        s = idx.status()
 
-        err_console.print(
-            f"[green]✓[/green] Indexed {status.file_count} files "
-            f"({status.chunk_count} chunks) → {db_path}"
-        )
-        err_console.print(
-            f"  AST: {status.ast_files}  "
-            f"Regex: {status.regex_files}  "
-            f"Text: {status.text_fallback_files}"
-        )
-        if status.vector_count > 0:
-            pct = (
-                status.vector_count / status.chunk_count * 100
-                if status.chunk_count > 0
-                else 0
+        if json_output:
+            data = _status_to_dict(s)
+            data["db_path"] = str(db_path)
+            print(json.dumps(data, indent=2))
+        else:
+            err_console.print(
+                f"[green]✓[/green] Indexed {s.file_count} files "
+                f"({s.chunk_count} chunks) → {db_path}"
             )
             err_console.print(
-                f"  Vectors: {status.vector_count}/{status.chunk_count} "
-                f"({pct:.0f}%) — {status.embed_model} ({status.embed_dimensions}d)"
+                f"  AST: {s.ast_files}  "
+                f"Regex: {s.regex_files}  "
+                f"Text: {s.text_fallback_files}"
             )
+            if s.vector_count > 0:
+                pct = s.vector_count / s.chunk_count * 100 if s.chunk_count > 0 else 0
+                err_console.print(
+                    f"  Vectors: {s.vector_count}/{s.chunk_count} "
+                    f"({pct:.0f}%) — {s.embed_model} ({s.embed_dimensions}d)"
+                )
     except Exception as e:
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1) from e
@@ -123,8 +156,21 @@ def ask(
 ) -> None:
     """Search the index for relevant code.
 
-    Returns ranked code chunks matching the query. Use --json for
-    structured output suitable for piping to other tools or LLMs.
+    Returns ranked code chunks matching the query using FTS5 full-text
+    search and (optionally) vector similarity. Results include file paths,
+    line ranges, symbol names, scores, and the matched code.
+
+    Output modes:\n
+      (default)   Rich-formatted with syntax highlighting\n
+      --json      Structured JSON array for piping to agents/LLMs\n
+      --plain     Plain text without ANSI formatting\n
+      --files     Unique file paths only (one per line)
+
+    Examples:\n
+      sr ask 'authentication middleware'\n
+      sr ask 'database connection' --json | jq '.[0].content'\n
+      sr ask 'error handling' --files\n
+      sr ask 'parse config' ~/dev/myproject -k 20
     """
     from source_recall import Index
 
@@ -249,9 +295,24 @@ def _ext_to_lexer(ext: str) -> str:
 @app.command()
 def status(
     path: str = typer.Argument(".", help="Path to the repository root."),
-    json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output as JSON for machine consumption.",
+    ),
 ) -> None:
-    """Show index status for a repository."""
+    """Show index status for a repository.
+
+    Reports file count, chunk count, vector coverage, embedding model,
+    database size, and last indexed timestamp. Use --json for structured
+    output suitable for agent health checks.
+
+    Examples:\n
+      sr status .                    # Human-readable status\n
+      sr status ~/dev/myproject      # Check specific repo\n
+      sr status . --json             # JSON for agent integration\n
+      sr status . --json | jq '.vector_coverage_pct'
+    """
     from source_recall import Index
 
     repo_path = Path(path).resolve()
@@ -264,22 +325,7 @@ def status(
         raise typer.Exit(1) from e
 
     if json_output:
-        data = {
-            "repo_path": s.repo_path,
-            "db_path": s.db_path,
-            "db_size_bytes": s.db_size_bytes,
-            "indexed_at": s.indexed_at,
-            "last_commit": s.last_commit,
-            "file_count": s.file_count,
-            "chunk_count": s.chunk_count,
-            "ast_files": s.ast_files,
-            "regex_files": s.regex_files,
-            "text_fallback_files": s.text_fallback_files,
-            "vector_count": s.vector_count,
-            "embed_model": s.embed_model,
-            "embed_dimensions": s.embed_dimensions,
-        }
-        print(json.dumps(data, indent=2))
+        print(json.dumps(_status_to_dict(s), indent=2))
     else:
         _human_size = _format_bytes(s.db_size_bytes)
         console.print(f"[bold]Repository:[/bold]  {s.repo_path}")
@@ -308,6 +354,159 @@ def status(
 
 
 # ---------------------------------------------------------------------------
+# sr list
+# ---------------------------------------------------------------------------
+
+
+@app.command("list")
+def list_indexes(
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output as JSON array for machine consumption.",
+    ),
+) -> None:
+    """List all indexed repositories.
+
+    Scans the source-recall data directory and reports every indexed
+    repo with its path, size, chunk count, and vector coverage.
+    Use --json for structured output.
+
+    Examples:\n
+      sr list                  # Human-readable table\n
+      sr list --json           # JSON array for agent integration\n
+      sr list --json | jq '.[].repo_path'
+    """
+    base = Path.home() / ".local" / "share" / "source-recall"
+    if not base.exists():
+        if json_output:
+            print("[]")
+        else:
+            console.print("[dim]No indexes found.[/dim]")
+        return
+
+    from source_recall.store import IndexStore
+
+    entries: list[dict[str, object]] = []
+
+    for d in sorted(base.iterdir()):
+        if not d.is_dir():
+            continue
+        db_path = d / "index.db"
+        if not db_path.exists():
+            continue
+
+        try:
+            with IndexStore(db_path) as store:
+                repo_path = store.get_meta("repo_path") or ""
+                indexed_at = store.get_meta("indexed_at") or ""
+                last_commit = store.get_meta("last_commit") or ""
+
+                file_count = store.conn.execute(
+                    "SELECT COUNT(*) FROM file_hashes"
+                ).fetchone()[0]
+                chunk_count = store.conn.execute(
+                    "SELECT COUNT(*) FROM chunks"
+                ).fetchone()[0]
+
+                # Parse mode breakdown.
+                mode_rows = store.conn.execute(
+                    "SELECT parse_mode, COUNT(*) FROM file_hashes GROUP BY parse_mode"
+                ).fetchall()
+                modes = dict(mode_rows)
+                ast_files = modes.get("ast", 0)
+                regex_files = modes.get("regex", 0)
+                text_files = modes.get("text", 0)
+
+                # Vector count — query via store's apsw connection
+                # which loads sqlite-vec extension automatically.
+                vec_count = 0
+                try:
+                    vec_conn = store._get_vec_conn()  # noqa: SLF001
+                    vec_count = vec_conn.execute(
+                        "SELECT COUNT(*) FROM vec_chunks"
+                    ).fetchone()[0]
+                except Exception:
+                    # sqlite-vec not available or no vec table.
+                    pass  # noqa: SIM105
+
+                # Embed model info.
+                embed_model = store.get_meta("embed_model") or ""
+                embed_dims_str = store.get_meta("embed_dimensions") or "0"
+                embed_dims = int(embed_dims_str)
+
+            db_size = db_path.stat().st_size
+            exists = Path(repo_path).exists() if repo_path else False
+            vec_pct = round(vec_count / chunk_count * 100, 1) if chunk_count > 0 else 0
+
+            entries.append(
+                {
+                    "repo_path": repo_path,
+                    "repo_exists": exists,
+                    "db_path": str(db_path),
+                    "db_size_bytes": db_size,
+                    "indexed_at": indexed_at,
+                    "last_commit": last_commit,
+                    "file_count": file_count,
+                    "chunk_count": chunk_count,
+                    "ast_files": ast_files,
+                    "regex_files": regex_files,
+                    "text_fallback_files": text_files,
+                    "vector_count": vec_count,
+                    "vector_coverage_pct": vec_pct,
+                    "embed_model": embed_model,
+                    "embed_dimensions": embed_dims,
+                }
+            )
+        except Exception:
+            continue
+
+    if not entries:
+        if json_output:
+            print("[]")
+        else:
+            console.print("[dim]No indexes found.[/dim]")
+        return
+
+    if json_output:
+        print(json.dumps(entries, indent=2))
+    else:
+        from rich.table import Table
+
+        table = Table(title="Indexed Repositories", show_lines=False)
+        table.add_column("Repository", style="cyan", no_wrap=True)
+        table.add_column("Files", justify="right")
+        table.add_column("Chunks", justify="right")
+        table.add_column("Vectors", justify="right")
+        table.add_column("Size", justify="right")
+        table.add_column("Indexed", style="dim")
+        table.add_column("", style="dim")  # exists indicator
+
+        for e in entries:
+            repo_name = Path(str(e["repo_path"])).name if e["repo_path"] else "?"
+            vec_str = (
+                f"{e['vector_count']}/{e['chunk_count']} ({e['vector_coverage_pct']}%)"
+                if e["vector_count"]
+                else "—"
+            )
+            size_str = _format_bytes(int(str(e["db_size_bytes"])))
+            indexed = str(e["indexed_at"])[:10] if e["indexed_at"] else "?"
+            exists_mark = "✓" if e["repo_exists"] else "[red]✗ gone[/red]"
+
+            table.add_row(
+                repo_name,
+                str(e["file_count"]),
+                f"{e['chunk_count']:,}",
+                vec_str,
+                size_str,
+                indexed,
+                exists_mark,
+            )
+
+        console.print(table)
+
+
+# ---------------------------------------------------------------------------
 # sr clean
 # ---------------------------------------------------------------------------
 
@@ -317,23 +516,39 @@ def clean(
     dry_run: bool = typer.Option(
         False, "--dry-run", "-n", help="Show what would be removed."
     ),
+    json_output: bool = typer.Option(
+        False, "--json", help="Output removed paths as JSON array."
+    ),
 ) -> None:
-    """Remove orphaned indexes (repos that no longer exist)."""
+    """Remove orphaned indexes (repos that no longer exist).
+
+    Scans all indexes and removes those whose original repo path no
+    longer exists on disk. Use --dry-run to preview, --json for
+    machine-readable output.
+
+    Examples:\n
+      sr clean                 # Remove orphaned indexes\n
+      sr clean --dry-run       # Preview what would be removed\n
+      sr clean --json          # JSON output for automation
+    """
     base = Path.home() / ".local" / "share" / "source-recall"
     if not base.exists():
-        console.print("[dim]No indexes found.[/dim]")
+        if json_output:
+            print("[]")
+        else:
+            console.print("[dim]No indexes found.[/dim]")
         return
 
-    removed = 0
+    removed_entries: list[dict[str, str]] = []
+
+    from source_recall.store import IndexStore
+
     for d in sorted(base.iterdir()):
         if not d.is_dir():
             continue
         db_path = d / "index.db"
         if not db_path.exists():
             continue
-
-        # Read repo_path from meta via IndexStore.
-        from source_recall.store import IndexStore
 
         try:
             with IndexStore(db_path) as store:
@@ -345,20 +560,33 @@ def clean(
             if repo_path.exists():
                 continue
 
-            if dry_run:
-                console.print(f"[yellow]Would remove:[/yellow] {d} → {stored_path}")
-            else:
+            if not dry_run and not json_output:
                 shutil.rmtree(d)
                 console.print(f"[green]Removed:[/green] {d} → {stored_path}")
-            removed += 1
+            elif not json_output:
+                console.print(f"[yellow]Would remove:[/yellow] {d} → {stored_path}")
+            else:
+                if not dry_run:
+                    shutil.rmtree(d)
+
+            removed_entries.append(
+                {
+                    "index_dir": str(d),
+                    "repo_path": stored_path,
+                }
+            )
 
         except Exception:
             continue
 
-    if removed == 0:
+    if json_output:
+        print(json.dumps(removed_entries, indent=2))
+    elif not removed_entries:
         console.print("[dim]No orphaned indexes found.[/dim]")
     elif not dry_run:
-        console.print(f"\n[green]Cleaned {removed} orphaned index(es).[/green]")
+        console.print(
+            f"\n[green]Cleaned {len(removed_entries)} orphaned index(es).[/green]"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +598,16 @@ def clean(
 def config_show(
     path: str = typer.Argument(".", help="Path to the repository root."),
 ) -> None:
-    """Print the resolved configuration as TOML."""
+    """Print the resolved configuration as TOML.
+
+    Shows all configuration values after merging defaults, project-level
+    .source-recall.toml, and environment variables. Useful for debugging
+    config resolution.
+
+    Examples:\n
+      sr config .              # Show config for current repo\n
+      sr config ~/dev/project  # Show config for specific repo
+    """
     from source_recall.config import format_config, resolve_config
 
     repo_path = Path(path).resolve()
@@ -397,22 +634,24 @@ def serve(
         False, "--rerank", help="Enable cross-encoder reranking."
     ),
 ) -> None:
-    """Start a persistent query server.
+    """Start a persistent query server (HTTP/JSON).
 
     Loads the embedding model once on startup, then serves queries
-    over HTTP. Accepts one or more repo paths.
+    over HTTP. Accepts one or more repo paths. Designed for integration
+    with coding agents that need persistent search access.
 
-    Examples:
-      sr serve                           # serve current dir
-      sr serve ~/dev/cheater             # serve one repo
-      sr serve ~/dev/cheater ~/dev/api   # serve multiple repos
-
-    Endpoints:
-      GET  /health   → liveness check
-      GET  /repos    → list loaded repos
-      POST /query    {question, top_k?, repo?} → ranked results
-      GET  /status   → index metrics
+    Endpoints:\n
+      GET  /health   → liveness check (200 OK)\n
+      GET  /repos    → list loaded repos with metadata\n
+      GET  /status   → index metrics (file/chunk/vector counts)\n
+      POST /query    → search: {question, top_k?, repo?}\n
       POST /refresh  → incremental re-index
+
+    Examples:\n
+      sr serve                           # Serve current dir on :7249\n
+      sr serve ~/dev/project             # Serve one repo\n
+      sr serve ~/dev/a ~/dev/b -p 8080   # Serve multiple repos\n
+      sr serve . --no-embed              # FTS-only mode
     """
     import uvicorn
 
@@ -460,6 +699,38 @@ def serve(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _status_to_dict(s: object) -> dict[str, object]:
+    """Convert an IndexStatus to a JSON-serializable dict.
+
+    Adds computed fields like vector_coverage_pct and human-readable size.
+
+    @param s: IndexStatus instance.
+    @returns: Dict with all status fields plus computed helpers.
+    """
+    vec_pct = (
+        round(s.vector_count / s.chunk_count * 100, 1)  # type: ignore[union-attr]
+        if s.chunk_count > 0  # type: ignore[union-attr]
+        else 0
+    )
+    return {
+        "repo_path": s.repo_path,  # type: ignore[union-attr]
+        "db_path": s.db_path,  # type: ignore[union-attr]
+        "db_size_bytes": s.db_size_bytes,  # type: ignore[union-attr]
+        "db_size_human": _format_bytes(s.db_size_bytes),  # type: ignore[union-attr]
+        "indexed_at": s.indexed_at,  # type: ignore[union-attr]
+        "last_commit": s.last_commit,  # type: ignore[union-attr]
+        "file_count": s.file_count,  # type: ignore[union-attr]
+        "chunk_count": s.chunk_count,  # type: ignore[union-attr]
+        "ast_files": s.ast_files,  # type: ignore[union-attr]
+        "regex_files": s.regex_files,  # type: ignore[union-attr]
+        "text_fallback_files": s.text_fallback_files,  # type: ignore[union-attr]
+        "vector_count": s.vector_count,  # type: ignore[union-attr]
+        "vector_coverage_pct": vec_pct,
+        "embed_model": s.embed_model,  # type: ignore[union-attr]
+        "embed_dimensions": s.embed_dimensions,  # type: ignore[union-attr]
+    }
 
 
 def _format_bytes(n: int) -> str:
