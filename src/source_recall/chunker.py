@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -1358,6 +1359,36 @@ def _get_extension(file_path: str) -> str:
     return file_path[idx:].lower()
 
 
+def _build_line_index(
+    chunks: list[ChunkData],
+) -> Any:
+    """Build a bisect-based lookup from line number to chunk_id.
+
+    Returns a callable: (line: int) -> str | None.
+
+    @param chunks: Chunks sorted by start_line (as produced by chunkers).
+    @returns: Callable that maps line → chunk_id or None.
+    """
+    if not chunks:
+        return lambda _line: None
+
+    # Sort by start_line and build parallel arrays for bisect.
+    sorted_chunks = sorted(chunks, key=lambda c: c.start_line)
+    starts = [c.start_line for c in sorted_chunks]
+    fallback_id = sorted_chunks[0].chunk_id
+
+    def _lookup(line: int) -> str | None:
+        idx = bisect.bisect_right(starts, line) - 1
+        if idx < 0:
+            return fallback_id
+        c = sorted_chunks[idx]
+        if c.start_line <= line <= c.end_line:
+            return c.chunk_id
+        return fallback_id
+
+    return _lookup
+
+
 # ---------------------------------------------------------------------------
 # Cross-reference extraction
 # ---------------------------------------------------------------------------
@@ -1380,12 +1411,8 @@ def _extract_python_refs(chunks: list[ChunkData], content: str) -> list[RefData]
     """
     refs: list[RefData] = []
 
-    # Map line ranges to chunk IDs for attribution.
-    def _chunk_for_line(line: int) -> str | None:
-        for c in chunks:
-            if c.start_line <= line <= c.end_line:
-                return c.chunk_id
-        return chunks[0].chunk_id if chunks else None
+    # Build sorted index for O(log n) line → chunk_id lookup.
+    _chunk_for_line = _build_line_index(chunks)
 
     # from X import Y, Z
     for m in _PY_IMPORT_FROM_RE.finditer(content):
@@ -1445,11 +1472,7 @@ def _extract_ts_refs(chunks: list[ChunkData], content: str) -> list[RefData]:
     """
     refs: list[RefData] = []
 
-    def _chunk_for_line(line: int) -> str | None:
-        for c in chunks:
-            if c.start_line <= line <= c.end_line:
-                return c.chunk_id
-        return chunks[0].chunk_id if chunks else None
+    _chunk_for_line = _build_line_index(chunks)
 
     # import { X, Y } from 'module'
     for m in _TS_IMPORT_RE.finditer(content):
