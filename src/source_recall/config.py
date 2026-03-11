@@ -78,16 +78,19 @@ def _load_toml(path: Path) -> dict[str, Any]:
 
     @param path: Absolute path to the TOML file.
     @returns: Dict of config values (empty if file missing or no table).
+    @raises ConfigError: If the file exists but contains invalid TOML.
     """
     if not path.is_file():
         return {}
-    try:
-        import tomllib
+    import tomllib
 
+    from source_recall.models import ConfigError
+
+    try:
         data = tomllib.loads(path.read_text())
-        return data.get("source-recall", data)
-    except Exception:
-        return {}
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError("toml_file", str(path), f"invalid TOML: {e}") from e
+    return data.get("source-recall", data)
 
 
 def resolve_config(
