@@ -79,21 +79,23 @@ class CodeRankEmbedder:
 
         from sentence_transformers import SentenceTransformer
 
-        # Cap PyTorch threads to half the CPU cores to avoid starving
-        # the OS during long builds.  Users can override via env vars.
-        if "OMP_NUM_THREADS" not in os.environ:
-            import multiprocessing
-
-            cap = max(1, multiprocessing.cpu_count() // 2)
-            import torch
-
-            torch.set_num_threads(cap)
+        # Force CPU.  MPS (Apple Silicon GPU) shares memory with the
+        # display compositor — large attention matrices from long code
+        # chunks trigger Metal OOM that freezes the entire system.
+        # CPU is also faster than MPS for this model size.
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         logger.info("Loading %s (first run downloads ~522 MB)...", _CODERANK_MODEL)
         self._model = SentenceTransformer(
             _CODERANK_MODEL,
             trust_remote_code=True,
+            device="cpu",
         )
+        # The model defaults to 8192 tokens — attention is O(n²) so
+        # long sequences explode memory (9.7 GB at 8192, 1.7 GB at 512).
+        # 512 tokens covers most function signatures + bodies and keeps
+        # builds fast (~134ms/chunk vs 1825ms at full context).
+        self._model.max_seq_length = 512
         return self._model
 
     @property
@@ -113,7 +115,9 @@ class CodeRankEmbedder:
         if not texts:
             return []
         model = self._load_model()
-        embeddings = model.encode(texts, show_progress_bar=False)  # type: ignore[union-attr]
+        # Use small encode batch to limit peak memory from attention
+        # matrices on long code chunks (up to 6000 chars / 8192 tokens).
+        embeddings = model.encode(texts, show_progress_bar=False, batch_size=8)  # type: ignore[union-attr]
         return embeddings.tolist()  # type: ignore[union-attr]
 
     def embed_query(self, query: str) -> list[float]:
