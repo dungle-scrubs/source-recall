@@ -6,7 +6,6 @@ import hashlib
 import logging
 import os
 import subprocess
-from datetime import UTC, datetime
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -19,7 +18,7 @@ from source_recall.models import (
     IndexIdentityError,
     ParseMode,
 )
-from source_recall.store import IndexStore, get_db_path
+from source_recall.store import IndexStore, _now_iso, get_db_path
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -69,66 +68,65 @@ class IndexBuilder:
             tmp_path = db_path.parent / f"{db_path.name}.tmp.{os.getpid()}"
             tmp_path.parent.mkdir(parents=True, exist_ok=True)
 
-            store = IndexStore(tmp_path)
-            store.open()
-            store.create_schema()
+            with IndexStore(tmp_path) as store:
+                store.create_schema()
 
-            # Set up vector table if embedder is available.
-            vec_enabled = False
-            if self.embedder is not None:
-                vec_enabled = store.ensure_vec_table(self.embedder.dimensions)
-                if not vec_enabled:
-                    logger.warning("sqlite-vec unavailable — building FTS-only index")
+                # Set up vector table if embedder is available.
+                vec_enabled = False
+                if self.embedder is not None:
+                    vec_enabled = store.ensure_vec_table(self.embedder.dimensions)
+                    if not vec_enabled:
+                        logger.warning(
+                            "sqlite-vec unavailable — building FTS-only index"
+                        )
 
-            # Detect current branch for branch-aware indexing.
-            branch = self._get_current_branch()
+                # Detect current branch for branch-aware indexing.
+                branch = self._get_current_branch()
 
-            # Discover and index files.
-            files = self._discover_files()
-            total = len(files)
+                # Discover and index files.
+                files = self._discover_files()
+                total = len(files)
 
-            # Collect chunks for batch embedding.
-            pending_vectors: list[tuple[str, str]] = []  # (chunk_id, content)
+                # Collect chunks for batch embedding.
+                pending_vectors: list[tuple[str, str]] = []  # (chunk_id, content)
 
-            for i, rel_path in enumerate(files):
-                if self.on_progress:
-                    self.on_progress(rel_path, i + 1, total)
-                chunk_ids = self._index_file(store, rel_path, branch=branch)
+                for i, rel_path in enumerate(files):
+                    if self.on_progress:
+                        self.on_progress(rel_path, i + 1, total)
+                    chunk_ids = self._index_file(store, rel_path, branch=branch)
 
+                    if vec_enabled and self.embedder is not None:
+                        for cid, content in chunk_ids:
+                            pending_vectors.append((cid, content))
+
+                        # Batch embed when we have enough.
+                        if len(pending_vectors) >= self.config.embed_batch_size:
+                            self._flush_vectors(store, pending_vectors)
+                            pending_vectors.clear()
+
+                # Flush remaining vectors.
+                if pending_vectors and vec_enabled and self.embedder is not None:
+                    self._flush_vectors(store, pending_vectors)
+
+                # Write meta.
+                meta = {
+                    "repo_path": str(self.repo_path),
+                    "indexed_at": _now_iso(),
+                    "last_commit": _git_head(self.repo_path) or "",
+                    "repo_root_commit": _git_root_commit(self.repo_path) or "",
+                    "repo_remote_url_hash": _git_remote_hash(self.repo_path) or "",
+                    "active_branch": branch,
+                }
                 if vec_enabled and self.embedder is not None:
-                    for cid, content in chunk_ids:
-                        pending_vectors.append((cid, content))
+                    meta["embed_model"] = type(self.embedder).__name__
+                    meta["embed_dimensions"] = str(self.embedder.dimensions)
+                    chunk_count = store.get_chunk_count()
+                    vec_count = store.get_vector_count()
+                    coverage = vec_count / chunk_count if chunk_count > 0 else 0.0
+                    meta["embed_coverage"] = f"{coverage:.4f}"
+                store.set_meta_batch(meta)
 
-                    # Batch embed when we have enough.
-                    if len(pending_vectors) >= self.config.embed_batch_size:
-                        self._flush_vectors(store, pending_vectors)
-                        pending_vectors.clear()
-
-            # Flush remaining vectors.
-            if pending_vectors and vec_enabled and self.embedder is not None:
-                self._flush_vectors(store, pending_vectors)
-
-            # Write meta.
-            meta = {
-                "repo_path": str(self.repo_path),
-                "indexed_at": _now_iso(),
-                "last_commit": _git_head(self.repo_path) or "",
-                "repo_root_commit": _git_root_commit(self.repo_path) or "",
-                "repo_remote_url_hash": _git_remote_hash(self.repo_path) or "",
-                "active_branch": branch,
-            }
-            if vec_enabled and self.embedder is not None:
-                meta["embed_model"] = type(self.embedder).__name__
-                meta["embed_dimensions"] = str(self.embedder.dimensions)
-                chunk_count = store.get_chunk_count()
-                vec_count = store.get_vector_count()
-                coverage = vec_count / chunk_count if chunk_count > 0 else 0.0
-                meta["embed_coverage"] = f"{coverage:.4f}"
-            store.set_meta_batch(meta)
-
-            store.close()
-
-            # Atomic swap.
+            # Atomic swap (after store is closed by context manager).
             IndexStore.atomic_swap(tmp_path, db_path)
 
         finally:
@@ -150,88 +148,93 @@ class IndexBuilder:
 
         IndexStore.acquire_lock(db_path, timeout=5)
         try:
-            store = IndexStore(db_path)
-            store.open()
-            store.run_migrations()
+            with IndexStore(db_path) as store:
+                store.run_migrations()
 
-            # Verify identity.
-            self._verify_identity(store)
+                # Verify identity.
+                self._verify_identity(store)
 
-            # Detect current branch.
-            branch = self._get_current_branch()
+                # Detect current branch.
+                branch = self._get_current_branch()
 
-            changed_files = self._detect_changes(store)
-            if not changed_files:
-                # Still update active_branch even if no files changed.
-                store.set_meta_batch({"active_branch": branch})
-                store.close()
-                return 0
+                changed_files = self._detect_changes(store)
+                if not changed_files:
+                    # Still update active_branch even if no files changed.
+                    store.set_meta_batch({"active_branch": branch})
+                    return 0
 
-            # If too many changes, full rebuild is more efficient.
-            if len(changed_files) > 500:
-                store.close()
-                IndexStore.release_lock(db_path)
-                self.build()
-                return len(changed_files)
+                # If too many changes, full rebuild is more efficient.
+                if len(changed_files) > 500:
+                    # Close store (via context manager exit) before rebuild.
+                    # build() acquires its own lock, so release ours first.
+                    store.close()
+                    IndexStore.release_lock(db_path)
+                    self.build()
+                    return len(changed_files)
 
-            # Set up vectors for refresh if embedder available.
-            vec_enabled = False
-            if self.embedder is not None:
-                vec_enabled = store.ensure_vec_table(self.embedder.dimensions)
+                # Set up vectors for refresh if embedder available.
+                vec_enabled = False
+                if self.embedder is not None:
+                    vec_enabled = store.ensure_vec_table(self.embedder.dimensions)
 
-            # Incremental update.
-            total = len(changed_files)
-            pending_vectors: list[tuple[str, str]] = []
+                # Incremental update.
+                total = len(changed_files)
+                pending_vectors: list[tuple[str, str]] = []
 
-            for i, (rel_path, action) in enumerate(changed_files):
-                if self.on_progress:
-                    self.on_progress(rel_path, i + 1, total)
+                for i, (rel_path, action) in enumerate(changed_files):
+                    if self.on_progress:
+                        self.on_progress(rel_path, i + 1, total)
 
-                if action == "delete":
-                    if vec_enabled:
-                        store.delete_vectors_by_file(rel_path)
-                    store.delete_chunks_for_file(rel_path)
-                    store.delete_file_hash(rel_path)
-                else:
-                    if vec_enabled:
-                        store.delete_vectors_by_file(rel_path)
-                    store.delete_chunks_for_file(rel_path)
-                    store.delete_file_hash(rel_path)
-                    chunk_ids = self._index_file(
-                        store, rel_path, branch=branch
-                    )
+                    # Common cleanup: remove existing data for this file.
+                    self._remove_file_data(store, rel_path, vec_enabled)
 
-                    if vec_enabled and self.embedder is not None:
-                        for cid, content in chunk_ids:
-                            pending_vectors.append((cid, content))
+                    if action != "delete":
+                        chunk_ids = self._index_file(store, rel_path, branch=branch)
 
-                        if len(pending_vectors) >= self.config.embed_batch_size:
-                            self._flush_vectors(store, pending_vectors)
-                            pending_vectors.clear()
+                        if vec_enabled and self.embedder is not None:
+                            for cid, content in chunk_ids:
+                                pending_vectors.append((cid, content))
 
-            # Flush remaining vectors.
-            if pending_vectors and vec_enabled and self.embedder is not None:
-                self._flush_vectors(store, pending_vectors)
+                            if len(pending_vectors) >= self.config.embed_batch_size:
+                                self._flush_vectors(store, pending_vectors)
+                                pending_vectors.clear()
 
-            # Update meta.
-            meta: dict[str, str] = {
-                "indexed_at": _now_iso(),
-                "last_commit": _git_head(self.repo_path) or "",
-                "active_branch": branch,
-            }
-            if vec_enabled and self.embedder is not None:
-                chunk_count = store.get_chunk_count()
-                vec_count = store.get_vector_count()
-                coverage = vec_count / chunk_count if chunk_count > 0 else 0.0
-                meta["embed_coverage"] = f"{coverage:.4f}"
-            store.set_meta_batch(meta)
+                # Flush remaining vectors.
+                if pending_vectors and vec_enabled and self.embedder is not None:
+                    self._flush_vectors(store, pending_vectors)
 
-            store.close()
+                # Update meta.
+                meta: dict[str, str] = {
+                    "indexed_at": _now_iso(),
+                    "last_commit": _git_head(self.repo_path) or "",
+                    "active_branch": branch,
+                }
+                if vec_enabled and self.embedder is not None:
+                    chunk_count = store.get_chunk_count()
+                    vec_count = store.get_vector_count()
+                    coverage = vec_count / chunk_count if chunk_count > 0 else 0.0
+                    meta["embed_coverage"] = f"{coverage:.4f}"
+                store.set_meta_batch(meta)
 
         finally:
             IndexStore.release_lock(db_path)
 
         return len(changed_files)
+
+    # -- File cleanup -------------------------------------------------------
+
+    @staticmethod
+    def _remove_file_data(store: IndexStore, rel_path: str, vec_enabled: bool) -> None:
+        """Remove all indexed data for a file (vectors, chunks, file hash).
+
+        @param store: Active IndexStore.
+        @param rel_path: Repo-relative file path.
+        @param vec_enabled: Whether vector table is available.
+        """
+        if vec_enabled:
+            store.delete_vectors_by_file(rel_path)
+        store.delete_chunks_for_file(rel_path)
+        store.delete_file_hash(rel_path)
 
     # -- File discovery -----------------------------------------------------
 
@@ -657,72 +660,6 @@ class IndexBuilder:
             return f"detached-{head[:8]}"
         return ""
 
-    def _is_shallow_clone(self) -> bool:
-        """Detect if the repo is a shallow clone.
-
-        @returns: True if shallow.
-        """
-        result = _git_cmd(
-            self.repo_path, ["git", "rev-parse", "--is-shallow-repository"]
-        )
-        return result == "true"
-
-    def _read_content_via_git(
-        self, rel_path: str
-    ) -> tuple[str, str] | None:
-        """Read file content from git blob, falling back to working tree.
-
-        For committed files, reads via git cat-file blob. For uncommitted
-        or untracked files, reads from disk and computes a synthetic blob
-        SHA via git hash-object.
-
-        @param rel_path: Repo-relative file path.
-        @returns: (content, blob_or_content_hash) or None on failure.
-        """
-        full = self.repo_path / rel_path
-
-        # Try to get blob SHA from HEAD tree.
-        blob_sha = _git_cmd(
-            self.repo_path,
-            ["git", "ls-tree", "-r", "HEAD", "--", rel_path],
-        )
-        if blob_sha:
-            # Parse: "100644 blob <sha>\t<path>"
-            parts = blob_sha.split()
-            if len(parts) >= 3:
-                sha = parts[2]
-                content = _git_cmd(
-                    self.repo_path, ["git", "cat-file", "blob", sha]
-                )
-                if content is not None:
-                    # Check if working tree differs from committed version.
-                    try:
-                        wt_content = full.read_text(
-                            encoding="utf-8", errors="replace"
-                        )
-                        if wt_content != content:
-                            # Working tree has uncommitted changes — use it.
-                            wt_hash = _git_cmd(
-                                self.repo_path,
-                                ["git", "hash-object", "--stdin"],
-                            )
-                            if wt_hash is None:
-                                wt_hash = hashlib.sha256(
-                                    wt_content.encode()
-                                ).hexdigest()
-                            return wt_content, wt_hash
-                    except OSError:
-                        pass  # File deleted on disk — use committed version.
-                    return content, sha
-
-        # File not in HEAD (untracked/new) — read from working tree.
-        try:
-            content = full.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return None
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-        return content, content_hash
-
 
 # ---------------------------------------------------------------------------
 # Git helpers
@@ -784,11 +721,3 @@ def _git_cmd(repo_path: Path, cmd: list[str]) -> str | None:
         return result.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
-
-
-def _now_iso() -> str:
-    """Current UTC time as ISO string.
-
-    @returns: ISO-formatted timestamp.
-    """
-    return datetime.now(UTC).isoformat()

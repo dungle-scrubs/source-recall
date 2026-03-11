@@ -298,6 +298,18 @@ class IndexStore:
             self._conn.close()
             self._conn = None
 
+    def __enter__(self) -> IndexStore:
+        """Context manager entry — opens the connection.
+
+        @returns: Self with connection opened.
+        """
+        self.open()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        """Context manager exit — always closes connections."""
+        self.close()
+
     @property
     def conn(self) -> sqlite3.Connection:
         """Get or open the connection.
