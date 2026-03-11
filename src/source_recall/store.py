@@ -1107,6 +1107,9 @@ class IndexStore:
 # ---------------------------------------------------------------------------
 
 
+_FTS5_STRIP = str.maketrans("", "", "\"'*^-")
+
+
 def _fts_escape(query: str) -> str:
     """Escape an FTS5 query for safe matching.
 
@@ -1118,7 +1121,6 @@ def _fts_escape(query: str) -> str:
     @param query: Raw user query.
     @returns: Escaped FTS5 query string.
     """
-    _FTS5_STRIP = str.maketrans("", "", "\"'*^-")
     tokens = query.split()
     escaped = []
     for token in tokens:
