@@ -75,7 +75,19 @@ class CodeRankEmbedder:
         if self._model is not None:
             return self._model
 
+        import os
+
         from sentence_transformers import SentenceTransformer
+
+        # Cap PyTorch threads to half the CPU cores to avoid starving
+        # the OS during long builds.  Users can override via env vars.
+        if "OMP_NUM_THREADS" not in os.environ:
+            import multiprocessing
+
+            cap = max(1, multiprocessing.cpu_count() // 2)
+            import torch
+
+            torch.set_num_threads(cap)
 
         logger.info("Loading %s (first run downloads ~522 MB)...", _CODERANK_MODEL)
         self._model = SentenceTransformer(
