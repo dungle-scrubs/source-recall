@@ -28,11 +28,13 @@ class QueryRequest(BaseModel):
     @param question: Natural language or symbol query.
     @param top_k: Max results (default: config value).
     @param repo: Repo name to query (required when multiple repos served).
+    @param branch: Filter to this branch. None = active branch.
     """
 
     question: str
     top_k: int | None = None
     repo: str | None = None
+    branch: str | None = None
 
 
 class QueryResultResponse(BaseModel):
@@ -262,7 +264,7 @@ def create_app(
         idx = _resolve_index(req.repo)
 
         t0 = time.monotonic()
-        results = idx.query(req.question, top_k=req.top_k)
+        results = idx.query(req.question, top_k=req.top_k, branch=req.branch)
         elapsed_ms = (time.monotonic() - t0) * 1000
 
         return QueryResponse(

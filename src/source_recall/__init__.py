@@ -147,11 +147,13 @@ class Index:
         question: str,
         *,
         top_k: int | None = None,
+        branch: str | None = None,
     ) -> list[QueryResult]:
         """Search the index.
 
         @param question: Natural language or symbol query.
         @param top_k: Override number of results.
+        @param branch: Filter to this branch. None = active branch.
         @returns: Ranked list of QueryResult.
         """
         from source_recall.querier import IndexQuerier
@@ -160,7 +162,7 @@ class Index:
             self.repo_path, self.config, self._embedder, self._get_reranker()
         )
         try:
-            return querier.query(question, top_k=top_k)
+            return querier.query(question, top_k=top_k, branch=branch)
         finally:
             querier.close()
 

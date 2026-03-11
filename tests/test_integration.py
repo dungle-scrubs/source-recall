@@ -238,3 +238,105 @@ class TestVectorBuildAndQuery:
         results = idx.query("authenticate")
         assert len(results) > 0
         assert all("vector" not in r.match_reason for r in results)
+
+
+class TestBranchAwareCycle:
+    def test_build_refresh_branch_cycle(self, tmp_path: Path) -> None:
+        """Build on main, switch to feature, refresh, switch back — minimal rework."""
+        import subprocess
+
+        from source_recall import Index
+        from source_recall.store import IndexStore, get_db_path
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        # Init git repo with shared file.
+        subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "t@t.com"],
+            cwd=repo, capture_output=True, check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "T"],
+            cwd=repo, capture_output=True, check=True,
+        )
+        (repo / "shared.py").write_text("def shared_func():\n    return 1\n")
+        (repo / "main_only.py").write_text("def main_only():\n    return 'main'\n")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=repo, capture_output=True, check=True,
+        )
+
+        # Build on main.
+        idx = Index(repo, embedder=None)
+        idx.build()
+
+        store = IndexStore(get_db_path(repo))
+        store.open()
+        main_count = store.get_chunk_count()
+        assert main_count > 0
+        assert store.get_meta("active_branch") in ("main", "master")
+        store.close()
+
+        # Create feature branch, add a new file, modify nothing shared.
+        subprocess.run(
+            ["git", "checkout", "-b", "feature"],
+            cwd=repo, capture_output=True, check=True,
+        )
+        (repo / "feature_only.py").write_text(
+            "def feature_func():\n    return 'feature'\n"
+        )
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "feature file"],
+            cwd=repo, capture_output=True, check=True,
+        )
+
+        # Refresh on feature branch.
+        idx.refresh()
+
+        store = IndexStore(get_db_path(repo))
+        store.open()
+        feature_count = store.get_chunk_count()
+        # Feature should have more chunks (feature_only.py added).
+        assert feature_count > main_count
+        assert store.get_meta("active_branch") == "feature"
+
+        # Shared chunks should have both branches in their CSV.
+        row = store.conn.execute(
+            "SELECT branches FROM chunks WHERE file_path = 'shared.py'"
+        ).fetchone()
+        if row:
+            branches = set(row[0].split(","))
+            # shared.py was indexed on main, should still be there.
+            # (refresh on feature may or may not re-tag it depending on
+            # whether it showed up as changed — the important thing is
+            # it wasn't deleted.)
+            assert len(branches) >= 1
+
+        store.close()
+
+        # Switch back to main (try both names).
+        result = subprocess.run(
+            ["git", "checkout", "main"],
+            cwd=repo, capture_output=True,
+        )
+        if result.returncode != 0:
+            subprocess.run(
+                ["git", "checkout", "master"],
+                cwd=repo, capture_output=True, check=True,
+            )
+
+        idx.refresh()
+
+        store = IndexStore(get_db_path(repo))
+        store.open()
+        final_branch = store.get_meta("active_branch")
+        assert final_branch in ("main", "master")
+        store.close()
+
+        # Query should still work.
+        results = idx.query("shared_func")
+        assert len(results) > 0

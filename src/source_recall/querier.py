@@ -102,6 +102,30 @@ def _extract_symbol_candidates(query: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _filter_by_branch(
+    results: list[dict[str, Any]], branch: str
+) -> list[dict[str, Any]]:
+    """Filter search results to those belonging to a specific branch.
+
+    Uses exact match against the comma-separated branches field.
+    Results without a branches key or with empty branches pass through
+    (backward compatibility with pre-v4 indexes).
+
+    @param results: Search results with optional 'branches' key.
+    @param branch: Target branch name.
+    @returns: Filtered results.
+    """
+    filtered: list[dict[str, Any]] = []
+    for row in results:
+        branches_csv = row.get("branches", "")
+        if not branches_csv:
+            # Legacy chunk (no branch info) — include by default.
+            filtered.append(row)
+        elif branch in branches_csv.split(","):
+            filtered.append(row)
+    return filtered
+
+
 def _rrf_merge(
     fts_results: list[dict[str, Any]],
     vec_results: list[dict[str, Any]],
@@ -187,6 +211,7 @@ class IndexQuerier:
         question: str,
         *,
         top_k: int | None = None,
+        branch: str | None = None,
     ) -> list[QueryResult]:
         """Search the index using FTS + vectors + symbol matching.
 
@@ -196,10 +221,16 @@ class IndexQuerier:
 
         @param question: Natural language or symbol query.
         @param top_k: Override number of results (default: config.top_k).
+        @param branch: Filter results to this branch. None = use active_branch
+            from meta; empty string = no filtering (all branches).
         @returns: Ranked list of QueryResult.
         """
         store = self._get_store()
         k = top_k if top_k is not None else self.config.top_k
+
+        # Resolve branch: None → active_branch from meta.
+        if branch is None:
+            branch = store.get_meta("active_branch") or ""
 
         # FTS BM25 search.
         fts_results = store.fts_search(question, limit=30)
@@ -222,6 +253,12 @@ class IndexQuerier:
             candidates = _extract_symbol_candidates(question)
             for candidate in candidates:
                 symbol_results.extend(store.symbol_search(candidate, limit=5))
+
+        # Post-filter by branch if specified.
+        if branch:
+            fts_results = _filter_by_branch(fts_results, branch)
+            vec_results = _filter_by_branch(vec_results, branch)
+            symbol_results = _filter_by_branch(symbol_results, branch)
 
         # Build chunk data lookup.
         all_chunks: dict[str, dict[str, Any]] = {}
