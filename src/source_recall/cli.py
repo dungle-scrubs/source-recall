@@ -27,6 +27,12 @@ err_console = Console(stderr=True)
 @app.command()
 def index(
     path: str = typer.Argument(".", help="Path to the repository root."),
+    no_embed: bool = typer.Option(
+        False, "--no-embed", help="Skip vector embeddings (FTS-only, much faster)."
+    ),
+    rerank: bool = typer.Option(
+        False, "--rerank", help="Enable cross-encoder reranking."
+    ),
 ) -> None:
     """Build or rebuild the index for a repository."""
     from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
@@ -54,12 +60,23 @@ def index(
         progress.update(task_id, completed=current, file=file_path)  # type: ignore[arg-type]
 
     try:
-        idx = Index(repo_path, on_progress=on_progress)
+        kwargs: dict[str, object] = {}
+        if no_embed:
+            kwargs["embedder"] = None
+        if rerank:
+            kwargs["rerank_enabled"] = True
+        idx = Index(repo_path, on_progress=on_progress, **kwargs)
         db_path = idx.build()
 
         if progress.live.is_started:
             progress.stop()
+    except KeyboardInterrupt:
+        if progress.live.is_started:
+            progress.stop()
+        err_console.print("\n[yellow]Interrupted.[/yellow]")
+        raise SystemExit(130)  # noqa: B904
 
+    try:
         status = idx.status()
 
         err_console.print(
@@ -99,6 +116,9 @@ def ask(
     json_output: bool = typer.Option(False, "--json", help="Output as JSON."),
     plain: bool = typer.Option(False, "--plain", help="Plain text, no formatting."),
     files_only: bool = typer.Option(False, "--files", help="File paths only."),
+    no_embed: bool = typer.Option(
+        False, "--no-embed", help="Skip vector search (FTS-only)."
+    ),
 ) -> None:
     """Search the index for relevant code.
 
@@ -110,7 +130,7 @@ def ask(
     repo_path = Path(path).resolve()
 
     try:
-        idx = Index(repo_path)
+        idx = Index(repo_path, **({"embedder": None} if no_embed else {}))
 
         # Auto-refresh if configured.
         if idx.config.auto_refresh:
@@ -372,6 +392,12 @@ def serve(
     ),
     port: int = typer.Option(7249, "--port", "-p", help="Port to listen on."),
     host: str = typer.Option("127.0.0.1", "--host", help="Host to bind to."),
+    no_embed: bool = typer.Option(
+        False, "--no-embed", help="Disable vector search (FTS-only)."
+    ),
+    rerank: bool = typer.Option(
+        False, "--rerank", help="Enable cross-encoder reranking."
+    ),
 ) -> None:
     """Start a persistent query server.
 
@@ -410,9 +436,20 @@ def serve(
         for rp in repo_paths:
             err_console.print(f"  • {rp.name} → {rp}")
 
-    err_console.print("  Loading model (first time may download ~522 MB)...")
+    if rerank:
+        import os
 
-    server_app = create_app(repo_paths)
+        os.environ["SR_RERANK_ENABLED"] = "true"
+
+    if no_embed:
+        err_console.print("  FTS-only mode (embeddings disabled)")
+    else:
+        err_console.print("  Loading model (first time may download ~522 MB)...")
+
+    if no_embed:
+        server_app = create_app(repo_paths, embedder=None)
+    else:
+        server_app = create_app(repo_paths)
 
     err_console.print(f"  Listening on [cyan]http://{host}:{port}[/cyan]")
     err_console.print()
