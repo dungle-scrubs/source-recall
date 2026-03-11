@@ -10,7 +10,7 @@ import pytest
 from source_recall.builder import IndexBuilder
 from source_recall.config import resolve_config
 from source_recall.models import IndexIdentityError
-from source_recall.store import get_db_path
+from source_recall.store import IndexStore, get_db_path
 
 
 def _git_init(repo: Path, *, marker: str = "") -> None:
@@ -181,6 +181,122 @@ class TestCleanOrphanedIndexes:
         conn.close()
         assert row is not None
         assert not Path(row[0]).exists()
+
+
+class TestBranchAwareBuilder:
+    def test_build_stores_active_branch(self, tmp_path: Path) -> None:
+        """build() records the current branch in meta."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init(repo, marker="branch-test")
+        (repo / "app.py").write_text("def hello(): pass\n")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add app"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        config = resolve_config(str(repo))
+        builder = IndexBuilder(repo, config)
+        builder.build()
+
+        store = IndexStore(get_db_path(repo))
+        store.open()
+        branch = store.get_meta("active_branch")
+        assert branch is not None
+        assert branch != ""
+        # Should be "main" or "master" depending on git default.
+        assert branch in ("main", "master")
+        store.close()
+
+    def test_build_sets_branches_on_chunks(self, tmp_path: Path) -> None:
+        """build() sets the branches column on all chunks."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init(repo, marker="chunks-branch-test")
+        (repo / "app.py").write_text("def hello(): pass\n")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add app"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        config = resolve_config(str(repo))
+        builder = IndexBuilder(repo, config)
+        builder.build()
+
+        store = IndexStore(get_db_path(repo))
+        store.open()
+        rows = store.conn.execute(
+            "SELECT branches FROM chunks WHERE branches = ''"
+        ).fetchall()
+        # No chunks should have empty branches.
+        assert len(rows) == 0
+
+        # All chunks should have a branch set.
+        total = store.conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE branches != ''"
+        ).fetchone()[0]
+        assert total > 0
+        store.close()
+
+    def test_refresh_after_branch_switch_preserves_chunks(
+        self, tmp_path: Path
+    ) -> None:
+        """Switching branches and refreshing preserves shared chunks."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init(repo, marker="switch-test")
+        (repo / "shared.py").write_text("def shared(): return 1\n")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "shared file"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        config = resolve_config(str(repo))
+        builder = IndexBuilder(repo, config)
+        builder.build()
+
+        store = IndexStore(get_db_path(repo))
+        store.open()
+        count_after_build = store.get_chunk_count()
+
+        # Create and switch to feature branch, add a new file.
+        subprocess.run(
+            ["git", "checkout", "-b", "feature"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+        (repo / "feature.py").write_text("def feature_only(): return 2\n")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "feature file"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        store.close()
+
+        builder.refresh()
+
+        store = IndexStore(get_db_path(repo))
+        store.open()
+        count_after_refresh = store.get_chunk_count()
+        # Should have more chunks (feature.py added).
+        assert count_after_refresh > count_after_build
+
+        # The active_branch should now be "feature".
+        assert store.get_meta("active_branch") == "feature"
+        store.close()
 
 
 class TestIdentityVerification:

@@ -80,6 +80,9 @@ class IndexBuilder:
                 if not vec_enabled:
                     logger.warning("sqlite-vec unavailable — building FTS-only index")
 
+            # Detect current branch for branch-aware indexing.
+            branch = self._get_current_branch()
+
             # Discover and index files.
             files = self._discover_files()
             total = len(files)
@@ -90,7 +93,7 @@ class IndexBuilder:
             for i, rel_path in enumerate(files):
                 if self.on_progress:
                     self.on_progress(rel_path, i + 1, total)
-                chunk_ids = self._index_file(store, rel_path)
+                chunk_ids = self._index_file(store, rel_path, branch=branch)
 
                 if vec_enabled and self.embedder is not None:
                     for cid, content in chunk_ids:
@@ -112,7 +115,7 @@ class IndexBuilder:
                 "last_commit": _git_head(self.repo_path) or "",
                 "repo_root_commit": _git_root_commit(self.repo_path) or "",
                 "repo_remote_url_hash": _git_remote_hash(self.repo_path) or "",
-                "schema_version": "2",
+                "active_branch": branch,
             }
             if vec_enabled and self.embedder is not None:
                 meta["embed_model"] = type(self.embedder).__name__
@@ -154,8 +157,13 @@ class IndexBuilder:
             # Verify identity.
             self._verify_identity(store)
 
+            # Detect current branch.
+            branch = self._get_current_branch()
+
             changed_files = self._detect_changes(store)
             if not changed_files:
+                # Still update active_branch even if no files changed.
+                store.set_meta_batch({"active_branch": branch})
                 store.close()
                 return 0
 
@@ -189,7 +197,9 @@ class IndexBuilder:
                         store.delete_vectors_by_file(rel_path)
                     store.delete_chunks_for_file(rel_path)
                     store.delete_file_hash(rel_path)
-                    chunk_ids = self._index_file(store, rel_path)
+                    chunk_ids = self._index_file(
+                        store, rel_path, branch=branch
+                    )
 
                     if vec_enabled and self.embedder is not None:
                         for cid, content in chunk_ids:
@@ -207,6 +217,7 @@ class IndexBuilder:
             meta: dict[str, str] = {
                 "indexed_at": _now_iso(),
                 "last_commit": _git_head(self.repo_path) or "",
+                "active_branch": branch,
             }
             if vec_enabled and self.embedder is not None:
                 chunk_count = store.get_chunk_count()
@@ -308,11 +319,14 @@ class IndexBuilder:
 
     # -- File indexing ------------------------------------------------------
 
-    def _index_file(self, store: IndexStore, rel_path: str) -> list[tuple[str, str]]:
+    def _index_file(
+        self, store: IndexStore, rel_path: str, branch: str = ""
+    ) -> list[tuple[str, str]]:
         """Read, chunk, and store a single file.
 
         @param store: IndexStore to write to.
         @param rel_path: Repo-relative path.
+        @param branch: Branch name for branch-aware indexing.
         @returns: List of (chunk_id, content) tuples for embedding.
         """
         full = self.repo_path / rel_path
@@ -335,7 +349,7 @@ class IndexBuilder:
 
         chunk_pairs: list[tuple[str, str]] = []
         if chunks:
-            store.insert_chunks(chunks)
+            store.insert_chunks(chunks, branch=branch)
             chunk_pairs = [(c.chunk_id, c.content) for c in chunks]
 
             # Store refs.
@@ -364,7 +378,8 @@ class IndexBuilder:
                 content_hash=content_hash,
                 parse_mode=parse_mode,
                 mtime_ns=mtime_ns,
-            )
+            ),
+            branch=branch,
         )
 
         return chunk_pairs
@@ -625,6 +640,88 @@ class IndexBuilder:
             raise FileDiscoveryError("path_not_found", str(self.repo_path))
         if not self.repo_path.is_dir():
             raise FileDiscoveryError("not_a_directory", str(self.repo_path))
+
+    # -- Branch-aware helpers -----------------------------------------------
+
+    def _get_current_branch(self) -> str:
+        """Get current branch name, with detached HEAD fallback.
+
+        @returns: Branch name or 'detached-<sha[:8]>'.
+        """
+        result = _git_cmd(self.repo_path, ["git", "branch", "--show-current"])
+        if result:
+            return result
+        # Detached HEAD — use commit SHA as pseudo-branch.
+        head = _git_head(self.repo_path)
+        if head:
+            return f"detached-{head[:8]}"
+        return ""
+
+    def _is_shallow_clone(self) -> bool:
+        """Detect if the repo is a shallow clone.
+
+        @returns: True if shallow.
+        """
+        result = _git_cmd(
+            self.repo_path, ["git", "rev-parse", "--is-shallow-repository"]
+        )
+        return result == "true"
+
+    def _read_content_via_git(
+        self, rel_path: str
+    ) -> tuple[str, str] | None:
+        """Read file content from git blob, falling back to working tree.
+
+        For committed files, reads via git cat-file blob. For uncommitted
+        or untracked files, reads from disk and computes a synthetic blob
+        SHA via git hash-object.
+
+        @param rel_path: Repo-relative file path.
+        @returns: (content, blob_or_content_hash) or None on failure.
+        """
+        full = self.repo_path / rel_path
+
+        # Try to get blob SHA from HEAD tree.
+        blob_sha = _git_cmd(
+            self.repo_path,
+            ["git", "ls-tree", "-r", "HEAD", "--", rel_path],
+        )
+        if blob_sha:
+            # Parse: "100644 blob <sha>\t<path>"
+            parts = blob_sha.split()
+            if len(parts) >= 3:
+                sha = parts[2]
+                content = _git_cmd(
+                    self.repo_path, ["git", "cat-file", "blob", sha]
+                )
+                if content is not None:
+                    # Check if working tree differs from committed version.
+                    try:
+                        wt_content = full.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        if wt_content != content:
+                            # Working tree has uncommitted changes — use it.
+                            wt_hash = _git_cmd(
+                                self.repo_path,
+                                ["git", "hash-object", "--stdin"],
+                            )
+                            if wt_hash is None:
+                                wt_hash = hashlib.sha256(
+                                    wt_content.encode()
+                                ).hexdigest()
+                            return wt_content, wt_hash
+                    except OSError:
+                        pass  # File deleted on disk — use committed version.
+                    return content, sha
+
+        # File not in HEAD (untracked/new) — read from working tree.
+        try:
+            content = full.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        return content, content_hash
 
 
 # ---------------------------------------------------------------------------
