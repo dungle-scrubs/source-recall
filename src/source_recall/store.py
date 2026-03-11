@@ -1044,7 +1044,14 @@ class IndexStore:
             sidecar = Path(str(target_path) + suffix)
             sidecar.unlink(missing_ok=True)
 
-        # Atomic rename.
+        # Atomic rename — only works within the same filesystem.
+        # Guard against accidental cross-device usage.
+        if tmp_path.stat().st_dev != target_path.parent.stat().st_dev:
+            msg = (
+                f"atomic_swap requires same filesystem: "
+                f"{tmp_path} and {target_path} are on different devices"
+            )
+            raise OSError(msg)
         os.rename(tmp_path, target_path)
 
     # -- Locking (delegates to module-level functions) ----------------------
