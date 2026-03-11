@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-_SENTINEL = object()
+from source_recall.models import _SENTINEL
 
 logger = logging.getLogger(__name__)
 

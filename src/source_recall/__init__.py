@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from source_recall.config import SRConfig, resolve_config
 from source_recall.models import (
+    _SENTINEL,
     ConfigError,
     FileDiscoveryError,
     IndexIdentityError,
@@ -39,8 +40,6 @@ __all__ = [
     "ConfigError",
     "FileDiscoveryError",
 ]
-
-_SENTINEL = object()
 
 
 class Index:

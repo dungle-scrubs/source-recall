@@ -311,6 +311,10 @@ class FileDiscoveryError(SourceRecallError):
         super().__init__(detail or reason)
 
 
+# Sentinel for distinguishing "not provided" from None.
+_SENTINEL = object()
+
+
 # Private — not exported from __init__.py
 class _ParseError(Exception):
     """Internal: tree-sitter or regex parse failure."""
