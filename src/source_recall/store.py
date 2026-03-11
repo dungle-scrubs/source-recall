@@ -203,45 +203,42 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
 
 
 def _acquire_lock(lock_path: Path, timeout: float = 0) -> None:
-    """Acquire a PID-file advisory lock.
+    """Acquire a PID-file advisory lock using atomic O_CREAT|O_EXCL.
 
     @param lock_path: Path to the lock file.
     @param timeout: Seconds to wait before giving up (0 = fail immediately).
     @raises IndexLockError: If the lock is held by a live process.
     """
     deadline = time.monotonic() + timeout
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     while True:
-        if lock_path.exists():
-            try:
-                data = json.loads(lock_path.read_text())
-                pid = data["pid"]
-                # Check if process is still alive.
-                os.kill(pid, 0)
-            except (json.JSONDecodeError, KeyError, ProcessLookupError, OSError):
-                # Stale lock — steal it.
-                lock_path.unlink(missing_ok=True)
-            else:
-                if time.monotonic() >= deadline:
-                    raise IndexLockError(str(lock_path), pid)
-                time.sleep(0.2)
-                continue
-
-        # Write our PID.
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path.write_text(json.dumps({"pid": os.getpid(), "started": _now_iso()}))
-
-        # Re-read to confirm we won the race.
+        # Attempt atomic creation — fails if file already exists.
         try:
-            data = json.loads(lock_path.read_text())
-            if data["pid"] == os.getpid():
-                return
-        except Exception:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                payload = json.dumps({"pid": os.getpid(), "started": _now_iso()})
+                os.write(fd, payload.encode())
+            finally:
+                os.close(fd)
+            return  # Lock acquired.
+        except FileExistsError:
             pass
 
-        if time.monotonic() >= deadline:
-            raise IndexLockError(str(lock_path), 0)
-        time.sleep(0.1)
+        # Lock file exists — check if holder is still alive.
+        try:
+            data = json.loads(lock_path.read_text())
+            pid = data["pid"]
+            os.kill(pid, 0)  # Signal 0: check if alive.
+        except (json.JSONDecodeError, KeyError, ProcessLookupError, OSError):
+            # Stale lock — remove and retry.
+            lock_path.unlink(missing_ok=True)
+            continue
+        else:
+            # Process is alive — wait or fail.
+            if time.monotonic() >= deadline:
+                raise IndexLockError(str(lock_path), pid)
+            time.sleep(0.2)
 
 
 def _release_lock(lock_path: Path) -> None:
