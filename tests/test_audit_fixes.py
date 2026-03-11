@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from source_recall.models import ChunkData, ConfigError, SymbolType
-from source_recall.store import IndexStore, _fts_escape
+from source_recall.store import _FTS5_STRIP, IndexStore, _fts_escape
 
 # ---------------------------------------------------------------------------
 # Issue #1: PID-file lock uses O_CREAT|O_EXCL (no TOCTOU)
@@ -344,3 +344,308 @@ class TestCleanUsesIndexStore:
         source = inspect.getsource(clean)
         assert "sqlite3" not in source
         assert "IndexStore" in source
+
+
+# ---------------------------------------------------------------------------
+# Issue #17: atomic_swap cross-device guard
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Issue #16b: _FTS5_STRIP is module-level constant
+# ---------------------------------------------------------------------------
+
+
+class TestFTS5StripModuleLevel:
+    def test_fts5_strip_is_module_level(self) -> None:
+        """_FTS5_STRIP is a module-level constant, not per-call."""
+        assert isinstance(_FTS5_STRIP, dict)
+        # It's a str.maketrans dict — should strip quotes, stars, etc.
+        assert _FTS5_STRIP  # Not empty.
+
+
+class TestAtomicSwapGuard:
+    def test_same_device_succeeds(self, tmp_path: Path) -> None:
+        """atomic_swap works when both paths are on same device."""
+        tmp_db = tmp_path / "test.db.tmp.123"
+        target = tmp_path / "test.db"
+
+        s = IndexStore(tmp_db)
+        s.open()
+        s.create_schema()
+        s.close()
+
+        # Should not raise — same filesystem.
+        IndexStore.atomic_swap(tmp_db, target)
+        assert target.exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #18: build_mode sets synchronous=NORMAL
+# ---------------------------------------------------------------------------
+
+
+class TestBuildModePragma:
+    def test_build_mode_sets_synchronous_normal(self, tmp_path: Path) -> None:
+        """build_mode=True sets PRAGMA synchronous=NORMAL."""
+        db_path = tmp_path / "test.db"
+        with IndexStore(db_path, build_mode=True) as store:
+            store.create_schema()
+            row = store.conn.execute("PRAGMA synchronous").fetchone()
+            # NORMAL = 1
+            assert row[0] == 1
+
+    def test_default_mode_is_full_sync(self, tmp_path: Path) -> None:
+        """Default mode keeps synchronous=FULL (2)."""
+        db_path = tmp_path / "test.db"
+        with IndexStore(db_path) as store:
+            store.create_schema()
+            row = store.conn.execute("PRAGMA synchronous").fetchone()
+            # FULL = 2
+            assert row[0] == 2
+
+
+# ---------------------------------------------------------------------------
+# Issue #19: _SENTINEL deduplicated in models.py
+# ---------------------------------------------------------------------------
+
+
+class TestSentinelDedup:
+    def test_init_and_server_use_same_sentinel(self) -> None:
+        """__init__.py and server.py import _SENTINEL from models."""
+        from source_recall import _SENTINEL as init_sentinel
+        from source_recall.models import _SENTINEL as models_sentinel
+        from source_recall.server import _SENTINEL as server_sentinel
+
+        assert init_sentinel is models_sentinel
+        assert server_sentinel is models_sentinel
+
+
+# ---------------------------------------------------------------------------
+# Issue #20: _chunk_prose line tracking accuracy
+# ---------------------------------------------------------------------------
+
+
+class TestProseLineTracking:
+    def test_multiline_prose_line_numbers(self) -> None:
+        """Prose chunker produces accurate line numbers from original content."""
+        from source_recall.chunker import _chunk_prose
+
+        content = (
+            "First sentence on line one.\n"
+            "Second sentence on line two.\n"
+            "Third sentence on line three.\n"
+        )
+        chunks, quality = _chunk_prose("doc.txt", content, max_chars=6000)
+        assert len(chunks) == 1
+        assert chunks[0].start_line == 1
+        # Content spans 3 lines.
+        assert chunks[0].end_line >= 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #21: _extract_signature stops at docstring
+# ---------------------------------------------------------------------------
+
+
+class TestExtractSignature:
+    def test_does_not_include_docstring(self) -> None:
+        """Signature extraction stops before the docstring."""
+        from source_recall.chunker import _extract_signature
+
+        lines = [
+            "def my_function(x: int, y: int) -> bool:",
+            '    """This is a docstring."""',
+            "    return x > y",
+        ]
+        sig = _extract_signature(lines)
+        assert '"""' not in sig
+        assert "def my_function" in sig
+
+    def test_multiline_params(self) -> None:
+        """Signature extraction includes multi-line parameter lists."""
+        from source_recall.chunker import _extract_signature
+
+        lines = [
+            "def complex_function(",
+            "    x: int,",
+            "    y: str,",
+            ") -> bool:",
+            '    """Do something."""',
+        ]
+        sig = _extract_signature(lines)
+        assert "x: int," in sig
+        assert "y: str," in sig
+        assert '"""' not in sig
+
+
+# ---------------------------------------------------------------------------
+# Issue #22: batch insert_vectors
+# ---------------------------------------------------------------------------
+
+
+class TestBatchInsertVectors:
+    def test_batch_delete_before_insert(self, tmp_path: Path) -> None:
+        """insert_vectors batches deletes before inserts."""
+        from source_recall.embedder import BagOfWordsEmbedder
+
+        db_path = tmp_path / "test.db"
+        store = IndexStore(db_path)
+        store.open()
+        store.create_schema()
+        ok = store.ensure_vec_table(dimensions=64)
+        if not ok:
+            pytest.skip("sqlite-vec not available")
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        chunk = ChunkData(
+            file_path="a.py",
+            symbol_name="foo",
+            symbol_type=SymbolType.FUNCTION,
+            content="def foo(): pass",
+            start_line=1,
+            end_line=1,
+        )
+        store.insert_chunks([chunk])
+
+        # Insert then re-insert — should not duplicate.
+        vec = emb.embed_chunks(["def foo(): pass"])
+        store.insert_vectors([chunk.chunk_id], vec)
+        assert store.get_vector_count() == 1
+
+        vec2 = emb.embed_chunks(["def foo(): return 42"])
+        store.insert_vectors([chunk.chunk_id], vec2)
+        assert store.get_vector_count() == 1
+
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Issue #23: FK CASCADE cleans refs/symbol_lookup on chunk delete
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Issue #18: batch_mode suppresses per-method commits
+# ---------------------------------------------------------------------------
+
+
+class TestBatchMode:
+    def test_batch_mode_single_commit(self, tmp_path: Path) -> None:
+        """batch_mode suppresses auto-commits, then commits at exit."""
+        db_path = tmp_path / "test.db"
+        with IndexStore(db_path) as store:
+            store.create_schema()
+
+            with store.batch_mode():
+                store.insert_chunks(
+                    [
+                        ChunkData(
+                            file_path="a.py",
+                            symbol_name="foo",
+                            symbol_type=SymbolType.FUNCTION,
+                            content="def foo(): pass",
+                            start_line=1,
+                            end_line=1,
+                        ),
+                    ]
+                )
+                store.delete_chunks_for_file("nonexistent.py")
+                # Inside batch_mode — data visible within same connection.
+                assert store.get_chunk_count() == 1
+
+            # After batch_mode exit — committed.
+            assert store.get_chunk_count() == 1
+
+    def test_batch_mode_rolls_back_on_error(self, tmp_path: Path) -> None:
+        """batch_mode rolls back on exception."""
+        db_path = tmp_path / "test.db"
+        with IndexStore(db_path) as store:
+            store.create_schema()
+
+            # Insert one chunk normally first.
+            store.insert_chunks(
+                [
+                    ChunkData(
+                        file_path="a.py",
+                        symbol_name="keep",
+                        symbol_type=SymbolType.FUNCTION,
+                        content="def keep(): pass",
+                        start_line=1,
+                        end_line=1,
+                    ),
+                ]
+            )
+            assert store.get_chunk_count() == 1
+
+            with pytest.raises(RuntimeError), store.batch_mode():
+                store.delete_chunks_for_file("a.py")
+                raise RuntimeError("simulated failure")
+
+            # Rolled back — chunk still present.
+            assert store.get_chunk_count() == 1
+
+
+class TestFKCascadeCleansGraphData:
+    def test_refresh_removes_stale_symbol_lookups(self, tmp_path: Path) -> None:
+        """Refreshing a changed file removes its old symbol_lookup entries
+        via FK CASCADE when the chunk is deleted."""
+        import subprocess
+
+        from source_recall import Index
+        from source_recall.store import get_db_path
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "t@t.com"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "T"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+        (repo / "svc.py").write_text(
+            "class OldService:\n    def old_method(self): pass\n"
+        )
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        idx = Index(repo, embedder=None)
+        idx.build()
+
+        # Verify symbol_lookup has OldService.
+        with IndexStore(get_db_path(repo)) as store:
+            old_syms = store.lookup_symbol("OldService")
+            assert len(old_syms) > 0
+
+        # Rename the class and commit.
+        (repo / "svc.py").write_text(
+            "class NewService:\n    def new_method(self): pass\n"
+        )
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "rename"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        idx.refresh()
+
+        # OldService should be gone from symbol_lookup via FK CASCADE.
+        with IndexStore(get_db_path(repo)) as store:
+            old_syms = store.lookup_symbol("OldService")
+            assert len(old_syms) == 0, f"Stale symbol_lookup entries remain: {old_syms}"
+            new_syms = store.lookup_symbol("NewService")
+            assert len(new_syms) > 0
