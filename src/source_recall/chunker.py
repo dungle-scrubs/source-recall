@@ -1162,6 +1162,10 @@ def _split_into_sub_chunks(
 def _extract_signature(lines: list[str]) -> str:
     """Extract the function/class signature from the first lines.
 
+    Collects the opening declaration (def/class/function) and any
+    continuation lines that are part of the parameter list or type
+    annotation.  Stops at the body (docstring, statements, etc.).
+
     @param lines: All lines of the chunk.
     @returns: Signature string (may be multi-line).
     """
@@ -1175,12 +1179,11 @@ def _extract_signature(lines: list[str]) -> str:
         stripped = line.rstrip()
         if stripped.endswith((":", "{", "=>", "(", ",")):
             sig_lines.append(line)
+        elif stripped.endswith(")") or stripped.endswith(") ->"):
+            # Closing paren of parameter list.
+            sig_lines.append(line)
+            break
         else:
-            # Include this line if it looks like a continuation.
-            if stripped and not stripped.startswith((" " * 4, "\t")):
-                break
-            if stripped.endswith((":", "{", "=>")):
-                sig_lines.append(line)
             break
 
     return "\n".join(sig_lines)
