@@ -68,7 +68,7 @@ class IndexBuilder:
             tmp_path = db_path.parent / f"{db_path.name}.tmp.{os.getpid()}"
             tmp_path.parent.mkdir(parents=True, exist_ok=True)
 
-            with IndexStore(tmp_path) as store:
+            with IndexStore(tmp_path, build_mode=True) as store:
                 store.create_schema()
 
                 # Set up vector table if embedder is available.

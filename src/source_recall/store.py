@@ -274,8 +274,9 @@ class IndexStore:
     @param db_path: Path to the index.db file.
     """
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, build_mode: bool = False) -> None:
         self.db_path = db_path
+        self._build_mode = build_mode
         self._conn: sqlite3.Connection | None = None
         self._vec_conn: Any = None  # apsw.Connection, lazily opened
 
@@ -293,6 +294,9 @@ class IndexStore:
         conn = sqlite3.connect(str(self.db_path))
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA busy_timeout = 5000")
+        # Build targets use atomic_swap — NORMAL is safe and faster.
+        if self._build_mode:
+            conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA foreign_keys = ON")
         conn.row_factory = sqlite3.Row
         self._conn = conn
