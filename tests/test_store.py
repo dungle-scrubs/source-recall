@@ -584,6 +584,24 @@ class TestMigrations:
                 parent_chunk_id TEXT, sub_chunk_index INTEGER,
                 search_quality TEXT NOT NULL DEFAULT 'ast'
             );
+            CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                content, file_path, symbol_name,
+                content='chunks', content_rowid='rowid'
+            );
+            CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+                INSERT INTO chunks_fts(rowid, content, file_path, symbol_name)
+                VALUES (new.rowid, new.content, new.file_path, new.symbol_name);
+            END;
+            CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, content, file_path, symbol_name)
+                VALUES ('delete', old.rowid, old.content, old.file_path, old.symbol_name);
+            END;
+            CREATE TRIGGER chunks_au AFTER UPDATE ON chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, content, file_path, symbol_name)
+                VALUES ('delete', old.rowid, old.content, old.file_path, old.symbol_name);
+                INSERT INTO chunks_fts(rowid, content, file_path, symbol_name)
+                VALUES (new.rowid, new.content, new.file_path, new.symbol_name);
+            END;
             CREATE TABLE file_hashes (
                 file_path TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
                 parse_mode TEXT NOT NULL DEFAULT 'ast', mtime_ns INTEGER
@@ -591,6 +609,14 @@ class TestMigrations:
             CREATE TABLE schema_migrations (
                 version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
                 description TEXT NOT NULL
+            );
+            CREATE TABLE refs (
+                source_chunk_id TEXT NOT NULL, target_symbol TEXT NOT NULL,
+                ref_type TEXT NOT NULL
+            );
+            CREATE TABLE symbol_lookup (
+                symbol_name TEXT NOT NULL, chunk_id TEXT NOT NULL,
+                file_path TEXT NOT NULL
             );
             INSERT INTO meta (key, value) VALUES ('schema_version', '3');
         """)
@@ -609,18 +635,22 @@ class TestMigrations:
         # Columns now exist.
         cols_after = {row[1] for row in s.conn.execute("PRAGMA table_info(chunks)")}
         assert "branches" in cols_after
-        fh_cols_after = {row[1] for row in s.conn.execute("PRAGMA table_info(file_hashes)")}
+        fh_cols_after = {
+            row[1] for row in s.conn.execute("PRAGMA table_info(file_hashes)")
+        }
         assert "branch" in fh_cols_after
 
-        # Schema version bumped.
-        assert s.get_meta("schema_version") == "4"
+        # Schema version bumped to latest.
+        assert s.get_meta("schema_version") == "5"
 
     def test_fresh_schema_has_branch_columns(self, store: IndexStore) -> None:
         """Fresh v4 schema includes branches and branch columns."""
         cols = {row[1] for row in store.conn.execute("PRAGMA table_info(chunks)")}
         assert "branches" in cols
 
-        fh_cols = {row[1] for row in store.conn.execute("PRAGMA table_info(file_hashes)")}
+        fh_cols = {
+            row[1] for row in store.conn.execute("PRAGMA table_info(file_hashes)")
+        }
         assert "branch" in fh_cols
 
 

@@ -255,18 +255,24 @@ class TestBranchAwareCycle:
         subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "config", "user.email", "t@t.com"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
         subprocess.run(
             ["git", "config", "user.name", "T"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
         (repo / "shared.py").write_text("def shared_func():\n    return 1\n")
         (repo / "main_only.py").write_text("def main_only():\n    return 'main'\n")
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "init"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         # Build on main.
@@ -283,7 +289,9 @@ class TestBranchAwareCycle:
         # Create feature branch, add a new file, modify nothing shared.
         subprocess.run(
             ["git", "checkout", "-b", "feature"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
         (repo / "feature_only.py").write_text(
             "def feature_func():\n    return 'feature'\n"
@@ -291,7 +299,9 @@ class TestBranchAwareCycle:
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "feature file"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         # Refresh on feature branch.
@@ -321,12 +331,15 @@ class TestBranchAwareCycle:
         # Switch back to main (try both names).
         result = subprocess.run(
             ["git", "checkout", "main"],
-            cwd=repo, capture_output=True,
+            cwd=repo,
+            capture_output=True,
         )
         if result.returncode != 0:
             subprocess.run(
                 ["git", "checkout", "master"],
-                cwd=repo, capture_output=True, check=True,
+                cwd=repo,
+                capture_output=True,
+                check=True,
             )
 
         idx.refresh()

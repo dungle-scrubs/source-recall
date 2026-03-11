@@ -244,9 +244,7 @@ class TestBranchAwareBuilder:
         assert total > 0
         store.close()
 
-    def test_refresh_after_branch_switch_preserves_chunks(
-        self, tmp_path: Path
-    ) -> None:
+    def test_refresh_after_branch_switch_preserves_chunks(self, tmp_path: Path) -> None:
         """Switching branches and refreshing preserves shared chunks."""
         repo = tmp_path / "repo"
         repo.mkdir()
