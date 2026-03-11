@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 # Schema
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 _DDL = """\
 CREATE TABLE IF NOT EXISTS meta (
@@ -90,7 +90,8 @@ CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
     VALUES ('delete', old.rowid, old.content, old.file_path, old.symbol_name);
 END;
 
-CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
+CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE OF
+    content, file_path, symbol_name ON chunks BEGIN
     INSERT INTO chunks_fts(chunks_fts, rowid, content, file_path, symbol_name)
     VALUES ('delete', old.rowid, old.content, old.file_path, old.symbol_name);
     INSERT INTO chunks_fts(rowid, content, file_path, symbol_name)
@@ -193,6 +194,14 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_chunks_branches
             ON chunks(branches)
         """,
+    ),
+    # Migration 5 is handled specially in run_migrations() because
+    # CREATE TRIGGER contains semicolons inside BEGIN...END that
+    # break the naive split-on-semicolon execution.
+    (
+        5,
+        "narrow chunks_au trigger to FTS-indexed columns only",
+        "SELECT 1",
     ),
 ]
 
@@ -346,6 +355,12 @@ class IndexStore:
                 if version == 4:
                     self._migrate_004_add_columns()
 
+                # Migration 5 recreates the chunks_au trigger with a
+                # column list. CREATE TRIGGER contains semicolons inside
+                # BEGIN...END, so we can't split on ";".
+                if version == 5:
+                    self._migrate_005_narrow_trigger()
+
                 # Use execute (not executescript) to stay within the
                 # savepoint — executescript auto-commits.
                 for stmt in sql.split(";"):
@@ -375,9 +390,7 @@ class IndexStore:
         table_info first. Safe to call on DBs that already have the
         columns (fresh v4 DDL).
         """
-        chunks_cols = {
-            row[1] for row in self.conn.execute("PRAGMA table_info(chunks)")
-        }
+        chunks_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(chunks)")}
         if "branches" not in chunks_cols:
             self.conn.execute(
                 "ALTER TABLE chunks ADD COLUMN branches TEXT NOT NULL DEFAULT ''"
@@ -390,6 +403,25 @@ class IndexStore:
             self.conn.execute(
                 "ALTER TABLE file_hashes ADD COLUMN branch TEXT NOT NULL DEFAULT ''"
             )
+
+    def _migrate_005_narrow_trigger(self) -> None:
+        """Replace chunks_au trigger to only fire on FTS-indexed columns.
+
+        The old trigger fired on ANY UPDATE to chunks, causing unnecessary
+        FTS churn when only the branches column was updated.
+        """
+        self.conn.execute("DROP TRIGGER IF EXISTS chunks_au")
+        # executescript auto-commits, so we use execute with the full
+        # CREATE TRIGGER as a single statement (SQLite allows this).
+        self.conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE OF
+                content, file_path, symbol_name ON chunks BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, content, file_path, symbol_name)
+                VALUES ('delete', old.rowid, old.content, old.file_path, old.symbol_name);
+                INSERT INTO chunks_fts(rowid, content, file_path, symbol_name)
+                VALUES (new.rowid, new.content, new.file_path, new.symbol_name);
+            END"""
+        )
 
     def _get_schema_version(self) -> int:
         """Read current schema version from meta.
@@ -446,9 +478,7 @@ class IndexStore:
 
     # -- Chunk CRUD ---------------------------------------------------------
 
-    def insert_chunks(
-        self, chunks: Sequence[ChunkData], branch: str = ""
-    ) -> None:
+    def insert_chunks(self, chunks: Sequence[ChunkData], branch: str = "") -> None:
         """Insert chunks in bulk, with optional branch tracking.
 
         When branch is non-empty, existing chunks get the branch appended
@@ -461,23 +491,35 @@ class IndexStore:
         if not chunks:
             return
         with self._transaction():
+            # Batch-fetch existing chunk IDs + branches for dedup.
+            existing_branches: dict[str, str] = {}
+            if branch:
+                all_ids = [c.chunk_id for c in chunks]
+                # SQLite max variables is 999 — batch in groups.
+                for i in range(0, len(all_ids), 500):
+                    batch = all_ids[i : i + 500]
+                    placeholders = ",".join("?" * len(batch))
+                    rows = self.conn.execute(
+                        f"SELECT id, branches FROM chunks WHERE id IN ({placeholders})",
+                        batch,
+                    ).fetchall()
+                    for row in rows:
+                        existing_branches[row[0]] = row[1]
+
             for c in chunks:
-                if branch:
-                    existing = self.conn.execute(
-                        "SELECT branches FROM chunks WHERE id = ?", (c.chunk_id,)
-                    ).fetchone()
-                    if existing is not None:
-                        # Chunk exists — append branch if not already present.
-                        current = existing[0]
-                        current_set = set(current.split(",")) if current else set()
-                        if branch not in current_set:
-                            current_set.add(branch)
-                            new_branches = ",".join(sorted(current_set))
-                            self.conn.execute(
-                                "UPDATE chunks SET branches = ? WHERE id = ?",
-                                (new_branches, c.chunk_id),
-                            )
-                        continue  # Skip re-insert — chunk content is identical.
+                if branch and c.chunk_id in existing_branches:
+                    # Chunk exists — append branch if not already present.
+                    # UPDATE branches only (won't trigger FTS re-index).
+                    current = existing_branches[c.chunk_id]
+                    current_set = set(current.split(",")) if current else set()
+                    if branch not in current_set:
+                        current_set.add(branch)
+                        new_branches = ",".join(sorted(current_set))
+                        self.conn.execute(
+                            "UPDATE chunks SET branches = ? WHERE id = ?",
+                            (new_branches, c.chunk_id),
+                        )
+                    continue  # Skip re-insert — chunk content is identical.
 
                 self.conn.execute(
                     """INSERT OR REPLACE INTO chunks
@@ -558,9 +600,7 @@ class IndexStore:
             mtime_ns=row[3],
         )
 
-    def get_all_file_hashes(
-        self, branch: str | None = None
-    ) -> dict[str, FileRecord]:
+    def get_all_file_hashes(self, branch: str | None = None) -> dict[str, FileRecord]:
         """Load file hash records, optionally filtered by branch.
 
         @param branch: Filter to this branch. None = all records.
@@ -1072,15 +1112,17 @@ def _fts_escape(query: str) -> str:
 
     Wraps each token in double quotes to prevent FTS5 syntax
     interpretation (AND/OR/NOT/NEAR operators, column filters).
+    Strips characters that have special meaning in FTS5 even
+    inside quotes: ``"`` ``'`` ``*`` ``^`` ``-``.
 
     @param query: Raw user query.
     @returns: Escaped FTS5 query string.
     """
+    _FTS5_STRIP = str.maketrans("", "", "\"'*^-")
     tokens = query.split()
     escaped = []
     for token in tokens:
-        # Strip characters that break FTS5 even inside quotes.
-        clean = token.replace('"', "").replace("'", "")
+        clean = token.translate(_FTS5_STRIP)
         if clean:
             escaped.append(f'"{clean}"')
     return " ".join(escaped)
