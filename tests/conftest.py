@@ -59,3 +59,8 @@ def clean_index_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         return index_base / f"{repo_name}-{path_hash}"
 
     monkeypatch.setattr(store_mod, "get_index_dir", patched_get_index_dir)
+    monkeypatch.setattr(
+        store_mod,
+        "get_db_path",
+        lambda repo_path: patched_get_index_dir(repo_path) / "index.db",
+    )
