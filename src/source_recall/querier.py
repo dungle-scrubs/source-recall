@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -9,6 +10,8 @@ from typing import TYPE_CHECKING, Any
 from source_recall.config import SRConfig
 from source_recall.models import IndexNotFoundError, IndexStatus, QueryResult
 from source_recall.store import IndexStore, get_db_path
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from source_recall.embedder import Embedder
@@ -243,7 +246,7 @@ class IndexQuerier:
                 query_vec = self.embedder.embed_query(question)
                 vec_results = store.search_vectors(query_vec, top_k=30)
             except Exception:
-                pass  # Vector search failure is non-fatal.
+                logger.warning("Vector search failed", exc_info=True)
 
         # Symbol search if query looks like it references symbols.
         symbol_weight = _compute_symbol_weight(question)
@@ -359,7 +362,7 @@ class IndexQuerier:
                     else:
                         reasons[item["chunk_id"]] = "reranked"
             except Exception:
-                pass  # Reranking failure is non-fatal.
+                logger.warning("Reranking failed", exc_info=True)
 
         # Graph expansion: expand top results along ref edges.
         top_ids = ranked_ids[:5]

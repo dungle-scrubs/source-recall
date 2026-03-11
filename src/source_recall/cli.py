@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from pathlib import Path
 
@@ -142,7 +143,7 @@ def ask(
                         highlight=False,
                     )
             except Exception:
-                pass  # Refresh failure is non-fatal for queries.
+                logging.getLogger(__name__).debug("Auto-refresh failed", exc_info=True)
 
         results = idx.query(question, top_k=top_k)
 
@@ -331,27 +332,24 @@ def clean(
         if not db_path.exists():
             continue
 
-        # Read repo_path from meta.
-        import sqlite3
+        # Read repo_path from meta via IndexStore.
+        from source_recall.store import IndexStore
 
         try:
-            conn = sqlite3.connect(str(db_path))
-            row = conn.execute(
-                "SELECT value FROM meta WHERE key = 'repo_path'"
-            ).fetchone()
-            conn.close()
+            with IndexStore(db_path) as store:
+                stored_path = store.get_meta("repo_path")
 
-            if row is None:
+            if stored_path is None:
                 continue
-            repo_path = Path(row[0])
+            repo_path = Path(stored_path)
             if repo_path.exists():
                 continue
 
             if dry_run:
-                console.print(f"[yellow]Would remove:[/yellow] {d} → {row[0]}")
+                console.print(f"[yellow]Would remove:[/yellow] {d} → {stored_path}")
             else:
                 shutil.rmtree(d)
-                console.print(f"[green]Removed:[/green] {d} → {row[0]}")
+                console.print(f"[green]Removed:[/green] {d} → {stored_path}")
             removed += 1
 
         except Exception:
