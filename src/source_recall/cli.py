@@ -434,6 +434,8 @@ def serve(
         for rp in repo_paths:
             err_console.print(f"  • {rp.name} → {rp}")
 
+    # Set rerank config via env before Index creation.
+    # This is process-scoped (serve blocks until exit), not a leak.
     if rerank:
         import os
 
