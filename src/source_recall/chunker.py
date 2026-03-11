@@ -908,7 +908,8 @@ def _chunk_prose(
     """Split plain text on sentence boundaries within max_chars.
 
     Accumulates sentences until adding the next would exceed max_chars,
-    then emits a chunk and starts a new one.
+    then emits a chunk and starts a new one.  Line numbers are derived
+    from each sentence's position in the original content.
 
     @param file_path: Repo-relative path.
     @param content: Plain text content.
@@ -918,55 +919,68 @@ def _chunk_prose(
     if not content.strip():
         return [], SearchQuality.TEXT_FALLBACK
 
-    sentences = _SENTENCE_END_RE.split(content.strip())
+    # Build (sentence, start_line) pairs by finding each sentence's
+    # position in the original text so line numbers are accurate.
+    raw_sentences = _SENTENCE_END_RE.split(content)
+    sentence_infos: list[tuple[str, int]] = []  # (text, start_line)
+    char_pos = 0
+    for raw in raw_sentences:
+        stripped = raw.strip()
+        if not stripped:
+            char_pos += len(raw)
+            # Account for the whitespace removed by split.
+            continue
+        # Find this sentence's start in original content.
+        idx = content.find(raw.lstrip()[:20], char_pos) if raw.lstrip() else char_pos
+        if idx == -1:
+            idx = char_pos
+        start_line = content[:idx].count("\n") + 1
+        sentence_infos.append((stripped, start_line))
+        char_pos = idx + len(raw)
+
     chunks: list[ChunkData] = []
     current: list[str] = []
     current_len = 0
-    current_start_line = 1
-    lines_so_far = 0
+    chunk_start_line = sentence_infos[0][1] if sentence_infos else 1
+    chunk_end_line = chunk_start_line
 
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-
+    for sentence, start_line in sentence_infos:
         added_len = len(sentence) + (1 if current else 0)
 
         if current and current_len + added_len > max_chars:
             # Emit current chunk.
             text = " ".join(current)
-            end_line = current_start_line + text.count("\n")
             chunks.append(
                 ChunkData(
                     file_path=file_path,
                     symbol_name="",
                     symbol_type=SymbolType.BLOCK,
                     content=text,
-                    start_line=current_start_line,
-                    end_line=end_line,
+                    start_line=chunk_start_line,
+                    end_line=chunk_end_line,
                     search_quality=SearchQuality.TEXT_FALLBACK,
                 )
             )
-            lines_so_far += text.count("\n") + 1
-            current_start_line = lines_so_far + 1
             current = []
             current_len = 0
+            chunk_start_line = start_line
 
         current.append(sentence)
         current_len += added_len
+        # End line is the last line of the current sentence.
+        chunk_end_line = start_line + sentence.count("\n")
 
     # Emit remaining.
     if current:
         text = " ".join(current)
-        end_line = current_start_line + text.count("\n")
         chunks.append(
             ChunkData(
                 file_path=file_path,
                 symbol_name="",
                 symbol_type=SymbolType.BLOCK,
                 content=text,
-                start_line=current_start_line,
-                end_line=end_line,
+                start_line=chunk_start_line,
+                end_line=chunk_end_line,
                 search_quality=SearchQuality.TEXT_FALLBACK,
             )
         )
