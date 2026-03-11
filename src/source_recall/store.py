@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 # Schema
 # ---------------------------------------------------------------------------
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 _DDL = """\
 CREATE TABLE IF NOT EXISTS meta (
@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS chunks (
     parent_chunk_id TEXT,
     sub_chunk_index INTEGER,
     search_quality  TEXT NOT NULL DEFAULT 'ast'
-        CHECK (search_quality IN ('ast', 'regex', 'text_fallback'))
+        CHECK (search_quality IN ('ast', 'regex', 'text_fallback')),
+    branches        TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_file
@@ -101,8 +102,14 @@ CREATE TABLE IF NOT EXISTS file_hashes (
     content_hash TEXT NOT NULL,
     parse_mode   TEXT NOT NULL DEFAULT 'ast'
         CHECK (parse_mode IN ('ast', 'text_fallback', 'regex')),
-    mtime_ns     INTEGER
+    mtime_ns     INTEGER,
+    branch       TEXT NOT NULL DEFAULT ''
 );
+
+CREATE INDEX IF NOT EXISTS idx_file_hashes_branch
+    ON file_hashes(branch, file_path);
+CREATE INDEX IF NOT EXISTS idx_chunks_branches
+    ON chunks(branches);
 
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version     INTEGER PRIMARY KEY,
@@ -172,6 +179,19 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
                 ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_symbol_name ON symbol_lookup(symbol_name)
+        """,
+    ),
+    # Migration 4 uses "alter_columns" key to signal conditional ALTER TABLE.
+    # Handled specially in run_migrations() to check column existence first.
+    (
+        4,
+        "add branch-aware columns for git-object chunking",
+        """
+        CREATE INDEX IF NOT EXISTS idx_file_hashes_branch
+            ON file_hashes(branch, file_path)
+        ;
+        CREATE INDEX IF NOT EXISTS idx_chunks_branches
+            ON chunks(branches)
         """,
     ),
 ]
@@ -311,6 +331,12 @@ class IndexStore:
                 continue
             self.conn.execute(f"SAVEPOINT migration_{version}")
             try:
+                # Migration 4 needs conditional ALTER TABLE — SQLite has
+                # no ADD COLUMN IF NOT EXISTS. Run ALTER only if the
+                # column is missing (handles fresh v4 DDL gracefully).
+                if version == 4:
+                    self._migrate_004_add_columns()
+
                 # Use execute (not executescript) to stay within the
                 # savepoint — executescript auto-commits.
                 for stmt in sql.split(";"):
@@ -332,6 +358,29 @@ class IndexStore:
             except Exception:
                 self.conn.execute(f"ROLLBACK TO migration_{version}")
                 raise
+
+    def _migrate_004_add_columns(self) -> None:
+        """Conditionally add branch-awareness columns for migration v4.
+
+        SQLite lacks ADD COLUMN IF NOT EXISTS, so we check PRAGMA
+        table_info first. Safe to call on DBs that already have the
+        columns (fresh v4 DDL).
+        """
+        chunks_cols = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(chunks)")
+        }
+        if "branches" not in chunks_cols:
+            self.conn.execute(
+                "ALTER TABLE chunks ADD COLUMN branches TEXT NOT NULL DEFAULT ''"
+            )
+
+        fh_cols = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(file_hashes)")
+        }
+        if "branch" not in fh_cols:
+            self.conn.execute(
+                "ALTER TABLE file_hashes ADD COLUMN branch TEXT NOT NULL DEFAULT ''"
+            )
 
     def _get_schema_version(self) -> int:
         """Read current schema version from meta.
@@ -388,21 +437,45 @@ class IndexStore:
 
     # -- Chunk CRUD ---------------------------------------------------------
 
-    def insert_chunks(self, chunks: Sequence[ChunkData]) -> None:
-        """Insert chunks in bulk. FTS updated automatically via triggers.
+    def insert_chunks(
+        self, chunks: Sequence[ChunkData], branch: str = ""
+    ) -> None:
+        """Insert chunks in bulk, with optional branch tracking.
+
+        When branch is non-empty, existing chunks get the branch appended
+        to their comma-separated branches column (dedup-safe). New chunks
+        are inserted with the given branch. FTS updated via triggers.
 
         @param chunks: Sequence of ChunkData to insert.
+        @param branch: Branch name to associate (empty = legacy behavior).
         """
         if not chunks:
             return
         with self._transaction():
-            self.conn.executemany(
-                """INSERT OR REPLACE INTO chunks
-                   (id, file_path, symbol_name, symbol_type, content,
-                    start_line, end_line, parent_chunk_id, sub_chunk_index,
-                    search_quality)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                [
+            for c in chunks:
+                if branch:
+                    existing = self.conn.execute(
+                        "SELECT branches FROM chunks WHERE id = ?", (c.chunk_id,)
+                    ).fetchone()
+                    if existing is not None:
+                        # Chunk exists — append branch if not already present.
+                        current = existing[0]
+                        current_set = set(current.split(",")) if current else set()
+                        if branch not in current_set:
+                            current_set.add(branch)
+                            new_branches = ",".join(sorted(current_set))
+                            self.conn.execute(
+                                "UPDATE chunks SET branches = ? WHERE id = ?",
+                                (new_branches, c.chunk_id),
+                            )
+                        continue  # Skip re-insert — chunk content is identical.
+
+                self.conn.execute(
+                    """INSERT OR REPLACE INTO chunks
+                       (id, file_path, symbol_name, symbol_type, content,
+                        start_line, end_line, parent_chunk_id, sub_chunk_index,
+                        search_quality, branches)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         c.chunk_id,
                         c.file_path,
@@ -414,10 +487,9 @@ class IndexStore:
                         c.parent_chunk_id,
                         c.sub_chunk_index,
                         c.search_quality.value,
-                    )
-                    for c in chunks
-                ],
-            )
+                        branch,
+                    ),
+                )
 
     def delete_chunks_for_file(self, file_path: str) -> None:
         """Delete all chunks belonging to a file. Cascades to FTS via trigger.
@@ -437,20 +509,22 @@ class IndexStore:
 
     # -- File hash CRUD -----------------------------------------------------
 
-    def upsert_file_hash(self, record: FileRecord) -> None:
+    def upsert_file_hash(self, record: FileRecord, branch: str = "") -> None:
         """Insert or update a file hash record.
 
         @param record: FileRecord with hash and parse mode.
+        @param branch: Branch name to associate.
         """
         self.conn.execute(
             """INSERT OR REPLACE INTO file_hashes
-               (file_path, content_hash, parse_mode, mtime_ns)
-               VALUES (?, ?, ?, ?)""",
+               (file_path, content_hash, parse_mode, mtime_ns, branch)
+               VALUES (?, ?, ?, ?, ?)""",
             (
                 record.file_path,
                 record.content_hash,
                 record.parse_mode.value,
                 record.mtime_ns,
+                branch,
             ),
         )
         self.conn.commit()
@@ -475,14 +549,24 @@ class IndexStore:
             mtime_ns=row[3],
         )
 
-    def get_all_file_hashes(self) -> dict[str, FileRecord]:
-        """Load all file hash records.
+    def get_all_file_hashes(
+        self, branch: str | None = None
+    ) -> dict[str, FileRecord]:
+        """Load file hash records, optionally filtered by branch.
 
+        @param branch: Filter to this branch. None = all records.
         @returns: Dict mapping file_path to FileRecord.
         """
-        rows = self.conn.execute(
-            "SELECT file_path, content_hash, parse_mode, mtime_ns FROM file_hashes"
-        ).fetchall()
+        if branch is not None:
+            rows = self.conn.execute(
+                "SELECT file_path, content_hash, parse_mode, mtime_ns "
+                "FROM file_hashes WHERE branch = ?",
+                (branch,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT file_path, content_hash, parse_mode, mtime_ns FROM file_hashes"
+            ).fetchall()
         return {
             row[0]: FileRecord(
                 file_path=row[0],
@@ -529,7 +613,7 @@ class IndexStore:
             """SELECT
                  c.id, c.file_path, c.symbol_name, c.symbol_type,
                  c.content, c.start_line, c.end_line, c.search_quality,
-                 -rank AS score
+                 -rank AS score, c.branches
                FROM chunks_fts
                JOIN chunks c ON c.rowid = chunks_fts.rowid
                WHERE chunks_fts MATCH ?
@@ -549,6 +633,7 @@ class IndexStore:
                 "end_line": row[6],
                 "search_quality": row[7],
                 "score": row[8],
+                "branches": row[9],
             }
             for row in rows
         ]
@@ -562,7 +647,7 @@ class IndexStore:
         """
         rows = self.conn.execute(
             """SELECT id, file_path, symbol_name, symbol_type,
-                      content, start_line, end_line, search_quality
+                      content, start_line, end_line, search_quality, branches
                FROM chunks
                WHERE symbol_name = ? COLLATE NOCASE
                LIMIT ?""",
@@ -580,6 +665,7 @@ class IndexStore:
                 "end_line": row[6],
                 "search_quality": row[7],
                 "score": 100.0,  # Exact matches get max score.
+                "branches": row[8],
             }
             for row in rows
         ]
@@ -674,7 +760,7 @@ class IndexStore:
         """
         rows = self.conn.execute(
             "SELECT sl.chunk_id, sl.file_path, c.symbol_name, c.symbol_type, "
-            "c.content, c.start_line, c.end_line, c.search_quality "
+            "c.content, c.start_line, c.end_line, c.search_quality, c.branches "
             "FROM symbol_lookup sl "
             "JOIN chunks c ON c.id = sl.chunk_id "
             "WHERE sl.symbol_name = ?",
@@ -819,7 +905,7 @@ class IndexStore:
                 """SELECT
                      c.id, c.file_path, c.symbol_name, c.symbol_type,
                      c.content, c.start_line, c.end_line, c.search_quality,
-                     v.distance
+                     v.distance, c.branches
                    FROM vec_chunks v
                    JOIN chunks c ON c.id = v.chunk_id
                    WHERE v.embedding MATCH ?
@@ -840,6 +926,7 @@ class IndexStore:
                 "end_line": row[6],
                 "search_quality": row[7],
                 "distance": row[8],
+                "branches": row[9],
             }
             for row in rows
         ]

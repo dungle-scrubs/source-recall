@@ -562,3 +562,174 @@ class TestMigrations:
         with pytest.raises(SchemaVersionError) as exc_info:
             store.run_migrations()
         assert exc_info.value.on_disk == 999
+
+    def test_migration_004_adds_branch_columns(self, tmp_path: Path) -> None:
+        """Migration v4 adds branches column to chunks and branch to file_hashes."""
+        import sqlite3
+
+        # Simulate a v3 database by creating schema WITHOUT branch columns.
+        db_path = tmp_path / "v3.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.executescript("""
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE chunks (
+                id TEXT PRIMARY KEY, file_path TEXT NOT NULL,
+                symbol_name TEXT NOT NULL DEFAULT '',
+                symbol_type TEXT NOT NULL DEFAULT 'block',
+                content TEXT NOT NULL,
+                start_line INTEGER NOT NULL DEFAULT 0,
+                end_line INTEGER NOT NULL DEFAULT 0,
+                parent_chunk_id TEXT, sub_chunk_index INTEGER,
+                search_quality TEXT NOT NULL DEFAULT 'ast'
+            );
+            CREATE TABLE file_hashes (
+                file_path TEXT PRIMARY KEY, content_hash TEXT NOT NULL,
+                parse_mode TEXT NOT NULL DEFAULT 'ast', mtime_ns INTEGER
+            );
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL,
+                description TEXT NOT NULL
+            );
+            INSERT INTO meta (key, value) VALUES ('schema_version', '3');
+        """)
+        conn.close()
+
+        # Verify columns absent pre-migration.
+        s = IndexStore(db_path)
+        s.open()
+        cols = {row[1] for row in s.conn.execute("PRAGMA table_info(chunks)")}
+        assert "branches" not in cols
+        fh_cols = {row[1] for row in s.conn.execute("PRAGMA table_info(file_hashes)")}
+        assert "branch" not in fh_cols
+
+        s.run_migrations()
+
+        # Columns now exist.
+        cols_after = {row[1] for row in s.conn.execute("PRAGMA table_info(chunks)")}
+        assert "branches" in cols_after
+        fh_cols_after = {row[1] for row in s.conn.execute("PRAGMA table_info(file_hashes)")}
+        assert "branch" in fh_cols_after
+
+        # Schema version bumped.
+        assert s.get_meta("schema_version") == "4"
+
+    def test_fresh_schema_has_branch_columns(self, store: IndexStore) -> None:
+        """Fresh v4 schema includes branches and branch columns."""
+        cols = {row[1] for row in store.conn.execute("PRAGMA table_info(chunks)")}
+        assert "branches" in cols
+
+        fh_cols = {row[1] for row in store.conn.execute("PRAGMA table_info(file_hashes)")}
+        assert "branch" in fh_cols
+
+
+class TestBranchAwareness:
+    """Tests for branch-aware chunk and file_hash operations."""
+
+    def test_insert_chunks_with_branch(self, store: IndexStore) -> None:
+        """insert_chunks sets branches column when branch is provided."""
+        chunks = [
+            ChunkData(
+                file_path="a.py",
+                symbol_name="foo",
+                symbol_type=SymbolType.FUNCTION,
+                content="def foo(): pass",
+                start_line=1,
+                end_line=1,
+            ),
+        ]
+        store.insert_chunks(chunks, branch="main")
+
+        row = store.conn.execute(
+            "SELECT branches FROM chunks WHERE id = ?", (chunks[0].chunk_id,)
+        ).fetchone()
+        assert row[0] == "main"
+
+    def test_insert_chunks_appends_branch(self, store: IndexStore) -> None:
+        """Re-inserting the same chunk with a different branch appends to CSV."""
+        chunk = ChunkData(
+            file_path="a.py",
+            symbol_name="foo",
+            symbol_type=SymbolType.FUNCTION,
+            content="def foo(): pass",
+            start_line=1,
+            end_line=1,
+        )
+        store.insert_chunks([chunk], branch="main")
+        store.insert_chunks([chunk], branch="feature")
+
+        row = store.conn.execute(
+            "SELECT branches FROM chunks WHERE id = ?", (chunk.chunk_id,)
+        ).fetchone()
+        branches = set(row[0].split(","))
+        assert branches == {"main", "feature"}
+
+    def test_insert_chunks_no_duplicate_branch(self, store: IndexStore) -> None:
+        """Re-inserting with the same branch doesn't duplicate in CSV."""
+        chunk = ChunkData(
+            file_path="a.py",
+            symbol_name="foo",
+            symbol_type=SymbolType.FUNCTION,
+            content="def foo(): pass",
+            start_line=1,
+            end_line=1,
+        )
+        store.insert_chunks([chunk], branch="main")
+        store.insert_chunks([chunk], branch="main")
+
+        row = store.conn.execute(
+            "SELECT branches FROM chunks WHERE id = ?", (chunk.chunk_id,)
+        ).fetchone()
+        assert row[0] == "main"
+
+    def test_upsert_file_hash_with_branch(self, store: IndexStore) -> None:
+        """upsert_file_hash stores the branch column."""
+        record = FileRecord(
+            file_path="a.py",
+            content_hash="abc123",
+            parse_mode=ParseMode.AST,
+            mtime_ns=None,
+        )
+        store.upsert_file_hash(record, branch="main")
+
+        row = store.conn.execute(
+            "SELECT branch FROM file_hashes WHERE file_path = 'a.py'"
+        ).fetchone()
+        assert row[0] == "main"
+
+    def test_get_file_hashes_for_branch(self, store: IndexStore) -> None:
+        """get_all_file_hashes can filter by branch."""
+        store.upsert_file_hash(
+            FileRecord("a.py", "hash1", ParseMode.AST, None), branch="main"
+        )
+        store.upsert_file_hash(
+            FileRecord("b.py", "hash2", ParseMode.AST, None), branch="feature"
+        )
+
+        main_hashes = store.get_all_file_hashes(branch="main")
+        assert "a.py" in main_hashes
+        assert "b.py" not in main_hashes
+
+    def test_fts_correct_after_branch_update(self, store: IndexStore) -> None:
+        """FTS index stays correct when branches column is updated."""
+        chunk = ChunkData(
+            file_path="auth.py",
+            symbol_name="validate",
+            symbol_type=SymbolType.FUNCTION,
+            content="def validate(): pass",
+            start_line=1,
+            end_line=1,
+        )
+        store.insert_chunks([chunk], branch="main")
+
+        # Verify FTS works.
+        results = store.fts_search("validate")
+        assert len(results) == 1
+
+        # Add another branch (triggers UPDATE on branches column).
+        store.insert_chunks([chunk], branch="feature")
+
+        # FTS should still work.
+        results = store.fts_search("validate")
+        assert len(results) == 1
