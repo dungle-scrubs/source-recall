@@ -181,25 +181,31 @@ class IndexBuilder:
                 total = len(changed_files)
                 pending_vectors: list[tuple[str, str]] = []
 
-                for i, (rel_path, action) in enumerate(changed_files):
-                    if self.on_progress:
-                        self.on_progress(rel_path, i + 1, total)
+                # Phase 1: Delete old vectors (apsw connection — must
+                # happen outside the sqlite3 batch to avoid write
+                # contention between the two connections in WAL mode).
+                if vec_enabled:
+                    for rel_path, _action in changed_files:
+                        store.delete_vectors_by_file(rel_path)
 
-                    # Common cleanup: remove existing data for this file.
-                    self._remove_file_data(store, rel_path, vec_enabled)
+                # Phase 2: Batch sqlite3 writes (chunks, FTS, refs,
+                # file_hashes) in a single transaction.
+                with store.batch_mode():
+                    for i, (rel_path, action) in enumerate(changed_files):
+                        if self.on_progress:
+                            self.on_progress(rel_path, i + 1, total)
 
-                    if action != "delete":
-                        chunk_ids = self._index_file(store, rel_path, branch=branch)
+                        store.delete_chunks_for_file(rel_path)
+                        store.delete_file_hash(rel_path)
 
-                        if vec_enabled and self.embedder is not None:
-                            for cid, content in chunk_ids:
-                                pending_vectors.append((cid, content))
+                        if action != "delete":
+                            chunk_ids = self._index_file(store, rel_path, branch=branch)
 
-                            if len(pending_vectors) >= self.config.embed_batch_size:
-                                self._flush_vectors(store, pending_vectors)
-                                pending_vectors.clear()
+                            if vec_enabled and self.embedder is not None:
+                                for cid, content in chunk_ids:
+                                    pending_vectors.append((cid, content))
 
-                # Flush remaining vectors.
+                # Phase 3: Insert new vectors (apsw connection).
                 if pending_vectors and vec_enabled and self.embedder is not None:
                     self._flush_vectors(store, pending_vectors)
 
