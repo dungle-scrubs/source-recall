@@ -548,7 +548,7 @@ class IndexStore:
         @param file_path: Repo-relative file path.
         """
         self.conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
-        self.conn.commit()
+        self._auto_commit()
 
     def get_chunk_count(self) -> int:
         """Count total chunks in the index.
@@ -578,7 +578,7 @@ class IndexStore:
                 branch,
             ),
         )
-        self.conn.commit()
+        self._auto_commit()
 
     def get_file_hash(self, file_path: str) -> FileRecord | None:
         """Look up a file hash record.
@@ -632,7 +632,7 @@ class IndexStore:
         @param file_path: Repo-relative file path.
         """
         self.conn.execute("DELETE FROM file_hashes WHERE file_path = ?", (file_path,))
-        self.conn.commit()
+        self._auto_commit()
 
     def get_file_count_by_mode(self) -> dict[str, int]:
         """Count files grouped by parse mode.
@@ -733,7 +733,7 @@ class IndexStore:
             "VALUES (?, ?, ?)",
             [(r.source_chunk_id, r.target_symbol, r.ref_type) for r in refs],
         )
-        self.conn.commit()
+        self._auto_commit()
 
     def get_refs_for_chunk(self, chunk_id: str) -> list[RefData]:
         """Get all outgoing refs from a chunk.
@@ -785,7 +785,7 @@ class IndexStore:
             "VALUES (?, ?, ?)",
             (symbol_name, chunk_id, file_path),
         )
-        self.conn.commit()
+        self._auto_commit()
 
     def insert_symbol_lookups(self, entries: Sequence[tuple[str, str, str]]) -> None:
         """Batch-insert symbol lookup entries.
@@ -799,7 +799,7 @@ class IndexStore:
             "VALUES (?, ?, ?)",
             [(sym, cid, fp) for cid, sym, fp in entries],
         )
-        self.conn.commit()
+        self._auto_commit()
 
     def lookup_symbol(self, symbol_name: str) -> list[dict[str, Any]]:
         """Find chunks that define a symbol.
@@ -827,7 +827,7 @@ class IndexStore:
             "(SELECT id FROM chunks WHERE file_path = ?)",
             (file_path,),
         )
-        self.conn.commit()
+        self._auto_commit()
 
     def delete_symbol_lookups_for_file(self, file_path: str) -> None:
         """Delete all symbol_lookup entries for a file.
@@ -838,7 +838,7 @@ class IndexStore:
             "DELETE FROM symbol_lookup WHERE file_path = ?",
             (file_path,),
         )
-        self.conn.commit()
+        self._auto_commit()
 
     # -- Vector CRUD (sqlite-vec via apsw) ---------------------------------
     #
@@ -1073,8 +1073,41 @@ class IndexStore:
     def _transaction(self) -> Generator[None, None, None]:
         """Context manager for a SQLite transaction.
 
+        Nest-safe: if already inside batch_mode or another _transaction,
+        uses a SAVEPOINT instead of BEGIN/COMMIT.
+
         @returns: Generator that commits on success, rolls back on error.
         """
+        if getattr(self, "_batch", False):
+            # Already inside batch_mode — use savepoint for atomicity.
+            sp = f"sp_{id(self)}_{id(object())}"
+            self.conn.execute(f"SAVEPOINT {sp}")
+            try:
+                yield
+                self.conn.execute(f"RELEASE {sp}")
+            except Exception:
+                self.conn.execute(f"ROLLBACK TO {sp}")
+                raise
+        else:
+            self.conn.execute("BEGIN")
+            try:
+                yield
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+
+    @contextmanager
+    def batch_mode(self) -> Generator[None, None, None]:
+        """Suppress per-method auto-commits for bulk operations.
+
+        Individual write methods (delete_chunks_for_file, upsert_file_hash,
+        etc.) call commit() after each operation. Inside batch_mode, those
+        commits are suppressed and a single commit is issued at the end.
+
+        @returns: Generator that commits on success, rolls back on error.
+        """
+        self._batch = True
         self.conn.execute("BEGIN")
         try:
             yield
@@ -1082,6 +1115,16 @@ class IndexStore:
         except Exception:
             self.conn.execute("ROLLBACK")
             raise
+        finally:
+            self._batch = False
+
+    def _auto_commit(self) -> None:
+        """Commit unless inside batch_mode.
+
+        Called by individual write methods instead of raw conn.commit().
+        """
+        if not getattr(self, "_batch", False):
+            self.conn.commit()
 
     @staticmethod
     def clean_tmp_files(db_path: Path) -> list[Path]:
