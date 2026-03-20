@@ -416,7 +416,7 @@ def list_indexes(
                 modes = dict(mode_rows)
                 ast_files = modes.get("ast", 0)
                 regex_files = modes.get("regex", 0)
-                text_files = modes.get("text", 0)
+                text_files = modes.get("text_fallback", 0)
 
                 # Vector count — query via store's apsw connection
                 # which loads sqlite-vec extension automatically.
