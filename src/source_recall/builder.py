@@ -690,6 +690,131 @@ class IndexBuilder:
         if not self.repo_path.is_dir():
             raise FileDiscoveryError("not_a_directory", str(self.repo_path))
 
+    # -- Git-object helpers -------------------------------------------------
+
+    def _discover_files_git_objects(self) -> list[tuple[str, str]] | None:
+        """Discover files via git ls-tree, returning (path, blob_sha) tuples.
+
+        Uses committed tree state from HEAD. Returns None for non-git repos
+        or repos with no commits (empty HEAD).
+
+        @returns: List of (repo-relative path, blob SHA) or None.
+        """
+        result = _git_cmd(
+            self.repo_path,
+            ["git", "ls-tree", "-r", "--format=%(objectname)\t%(path)", "HEAD"],
+        )
+        if result is None:
+            return None
+
+        entries: list[tuple[str, str]] = []
+        for line in result.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            blob_sha, path = parts
+            if not self._is_excluded(path):
+                entries.append((path, blob_sha))
+        return entries
+
+    def _read_git_blob(self, blob_sha: str) -> str | None:
+        """Read file content from a git blob object.
+
+        Unlike ``_git_cmd``, does NOT strip trailing whitespace — file
+        content must be preserved byte-for-byte. Decodes with
+        ``errors="replace"`` to handle binary/non-UTF8 blobs gracefully
+        (matching how the filesystem path reads files).
+
+        @param blob_sha: 40-char hex SHA of the blob.
+        @returns: File content string, or None if blob doesn't exist.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "cat-file", "blob", blob_sha],
+                cwd=self.repo_path,
+                capture_output=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.decode("utf-8", errors="replace")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+
+    def _detect_dirty_files(self) -> dict[str, str]:
+        """Detect uncommitted files and compute synthetic blob SHAs.
+
+        Covers modified tracked files (M), staged additions (A), and
+        untracked files (?). For each, computes the blob SHA of the
+        working-tree content via ``git hash-object --stdin``.
+
+        @returns: Dict mapping repo-relative path to synthetic blob SHA.
+        """
+        # Cannot use _git_cmd here — it strips leading whitespace from
+        # stdout, destroying the porcelain status columns (e.g. " M" → "M").
+        try:
+            proc = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode != 0:
+                return {}
+            output = proc.stdout
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return {}
+        if not output:
+            return {}
+
+        dirty: dict[str, str] = {}
+        for line in output.split("\n"):
+            if not line or len(line) < 4:
+                continue
+            # Porcelain v1 format: XY <path>
+            # X = index status, Y = working-tree status
+            status = line[:2]
+            path = line[3:]
+            # Skip deleted files — no content to hash.
+            if "D" in status:
+                continue
+            # M (modified), A (added), ? (untracked), R (renamed — path after ->).
+            if any(c in status for c in ("M", "A", "?", "R")):
+                # Handle renames: "R  old -> new"
+                if " -> " in path:
+                    path = path.split(" -> ", 1)[1]
+                full = self.repo_path / path
+                if not full.is_file():
+                    continue
+                try:
+                    content = full.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                # Compute synthetic blob SHA.
+                sha = _git_cmd(
+                    self.repo_path,
+                    ["git", "hash-object", "--stdin"],
+                    stdin=content,
+                )
+                if sha:
+                    dirty[path] = sha
+        return dirty
+
+    def _is_shallow_clone(self) -> bool:
+        """Detect whether this repo is a shallow clone.
+
+        @returns: True if shallow, False otherwise.
+        """
+        result = _git_cmd(
+            self.repo_path,
+            ["git", "rev-parse", "--is-shallow-repository"],
+        )
+        return result == "true"
+
     # -- Branch-aware helpers -----------------------------------------------
 
     def _get_current_branch(self) -> str:
@@ -747,11 +872,14 @@ def _git_remote_hash(repo_path: Path) -> str | None:
     return hashlib.sha256(url.strip().encode()).hexdigest()[:16]
 
 
-def _git_cmd(repo_path: Path, cmd: list[str]) -> str | None:
+def _git_cmd(
+    repo_path: Path, cmd: list[str], *, stdin: str | None = None
+) -> str | None:
     """Run a git command and return stdout.
 
     @param repo_path: Working directory.
     @param cmd: Command and arguments.
+    @param stdin: Optional string to pipe to the command's stdin.
     @returns: stdout string or None on failure.
     """
     try:
@@ -761,6 +889,7 @@ def _git_cmd(repo_path: Path, cmd: list[str]) -> str | None:
             capture_output=True,
             text=True,
             timeout=10,
+            input=stdin,
         )
         if result.returncode != 0:
             return None
