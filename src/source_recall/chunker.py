@@ -779,25 +779,27 @@ def chunk_pdf(file_path: str, pdf_path: Path) -> tuple[list[ChunkData], SearchQu
     chunks: list[ChunkData] = []
     doc = fitz.open(str(pdf_path))
 
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        text = page.get_text().strip()
-        if not text:
-            continue
+    try:
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = page.get_text().strip()
+            if not text:
+                continue
 
-        chunks.append(
-            ChunkData(
-                file_path=file_path,
-                symbol_name=f"Page {page_num + 1}",
-                symbol_type=SymbolType.MODULE,
-                content=text,
-                start_line=page_num + 1,
-                end_line=page_num + 1,
-                search_quality=SearchQuality.AST,
+            chunks.append(
+                ChunkData(
+                    file_path=file_path,
+                    symbol_name=f"Page {page_num + 1}",
+                    symbol_type=SymbolType.MODULE,
+                    content=text,
+                    start_line=page_num + 1,
+                    end_line=page_num + 1,
+                    search_quality=SearchQuality.AST,
+                )
             )
-        )
+    finally:
+        doc.close()
 
-    doc.close()
     return chunks, SearchQuality.AST
 
 
@@ -831,8 +833,12 @@ def _chunk_markdown(
         elif fenced_ranges:
             fenced_ranges[-1] = (fenced_ranges[-1][0], m.end())
 
+    # Discard trailing unclosed fence (prevents mispairing later fences).
+    if fenced_ranges and fenced_ranges[-1][1] == -1:
+        fenced_ranges.pop()
+
     def _in_fence(pos: int) -> bool:
-        return any(s <= pos <= e for s, e in fenced_ranges if e != -1)
+        return any(s <= pos <= e for s, e in fenced_ranges)
 
     # Collect heading positions.
     sections: list[tuple[str, int]] = []  # (heading_text, char_offset)
@@ -919,24 +925,22 @@ def _chunk_prose(
     if not content.strip():
         return [], SearchQuality.TEXT_FALLBACK
 
-    # Build (sentence, start_line) pairs by finding each sentence's
-    # position in the original text so line numbers are accurate.
-    raw_sentences = _SENTENCE_END_RE.split(content)
+    # Build (sentence, start_line) pairs using split positions
+    # directly (no re-searching the content for substrings).
     sentence_infos: list[tuple[str, int]] = []  # (text, start_line)
-    char_pos = 0
-    for raw in raw_sentences:
+
+    # Use finditer to get exact boundary positions, then slice between them.
+    boundaries = [m.start() for m in _SENTENCE_END_RE.finditer(content)]
+    boundaries.append(len(content))
+
+    prev = 0
+    for boundary in boundaries:
+        raw = content[prev:boundary]
         stripped = raw.strip()
-        if not stripped:
-            char_pos += len(raw)
-            # Account for the whitespace removed by split.
-            continue
-        # Find this sentence's start in original content.
-        idx = content.find(raw.lstrip()[:20], char_pos) if raw.lstrip() else char_pos
-        if idx == -1:
-            idx = char_pos
-        start_line = content[:idx].count("\n") + 1
-        sentence_infos.append((stripped, start_line))
-        char_pos = idx + len(raw)
+        if stripped:
+            start_line = content[:prev].count("\n") + 1
+            sentence_infos.append((stripped, start_line))
+        prev = boundary
 
     chunks: list[ChunkData] = []
     current: list[str] = []
@@ -1307,22 +1311,27 @@ def _has_jsx(node: Node) -> bool:
     return _contains_any_node_type(node, jsx_types)
 
 
+_REACT_WRAPPER_RE = re.compile(
+    r"(?:^|\.)(memo|forwardRef|lazy)$"
+)
+
+
 def _has_react_wrapper(node: Node) -> bool:
     """Check if a node contains React.memo/forwardRef/lazy calls.
+
+    Uses word-boundary matching to avoid false positives on names
+    like 'memoize' or 'lazyLoad'.
 
     @param node: tree-sitter Node.
     @returns: True if a React wrapper call is found.
     """
-    _REACT_WRAPPERS = {"memo", "forwardRef", "lazy"}
-
     for child in node.named_children:
         if child.type == "call_expression":
             func = child.child_by_field_name("function")
             if func is not None:
                 text = (func.text or b"").decode("utf-8", errors="replace")
-                for wrapper in _REACT_WRAPPERS:
-                    if wrapper in text:
-                        return True
+                if _REACT_WRAPPER_RE.search(text):
+                    return True
         if _has_react_wrapper(child):
             return True
     return False
