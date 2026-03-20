@@ -135,6 +135,34 @@ class TestNonexistentRepo:
         assert resp.status_code == 404
 
 
+class TestCORSRestriction:
+    def test_cors_rejects_foreign_origin(self, indexed_app: TestClient) -> None:
+        """Preflight from a non-localhost origin should be denied."""
+        resp = indexed_app.options(
+            "/query",
+            headers={
+                "Origin": "https://evil.example.com",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        # A restricted CORS config will NOT echo back the foreign origin.
+        allow_origin = resp.headers.get("access-control-allow-origin", "")
+        assert allow_origin != "*"
+        assert "evil.example.com" not in allow_origin
+
+    def test_cors_allows_localhost_origin(self, indexed_app: TestClient) -> None:
+        """Preflight from localhost should be allowed."""
+        resp = indexed_app.options(
+            "/query",
+            headers={
+                "Origin": "http://127.0.0.1:3000",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        allow_origin = resp.headers.get("access-control-allow-origin", "")
+        assert "127.0.0.1" in allow_origin or allow_origin == "*"
+
+
 class TestMultiRepo:
     def test_query_requires_repo_when_multiple(self, py_app_path: Path) -> None:
         """POST /query without repo returns 400 when multiple repos loaded."""

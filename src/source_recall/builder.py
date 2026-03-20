@@ -215,12 +215,13 @@ class IndexBuilder:
                 # uncommitted rows from the sqlite3 connection.  If you
                 # move vector ops inside batch_mode(), JOINs against the
                 # chunks table will miss the new rows (H5).
+                vec_ok = True
                 if vec_enabled:
                     for rel_path in vec_dirty_files:
                         store.delete_vectors_by_file(rel_path)
 
                 if pending_vectors and vec_enabled and self.embedder is not None:
-                    self._flush_vectors(store, pending_vectors)
+                    vec_ok = self._flush_vectors(store, pending_vectors)
 
                 # Update meta.
                 meta: dict[str, str] = {
@@ -233,6 +234,16 @@ class IndexBuilder:
                     vec_count = store.get_vector_count()
                     coverage = vec_count / chunk_count if chunk_count > 0 else 0.0
                     meta["embed_coverage"] = f"{coverage:.4f}"
+                # Track vector-phase failures so the next refresh can
+                # detect degraded coverage and re-embed (H1 audit fix).
+                if not vec_ok:
+                    dirty_files = ",".join(
+                        rp for rp, action in changed_files if action != "delete"
+                    )
+                    meta["vec_dirty"] = dirty_files
+                elif vec_enabled:
+                    # Clear any previous vec_dirty on success.
+                    meta["vec_dirty"] = ""
                 store.set_meta_batch(meta)
 
         finally:
@@ -457,25 +468,28 @@ class IndexBuilder:
         self,
         store: IndexStore,
         pending: list[tuple[str, str]],
-    ) -> None:
+    ) -> bool:
         """Embed and insert a batch of chunks into vec_chunks.
 
         @param store: IndexStore to write to.
         @param pending: List of (chunk_id, content) to embed.
+        @returns: True if all embeddings succeeded, False on failure.
         """
         if not pending or self.embedder is None:
-            return
+            return True
         chunk_ids = [p[0] for p in pending]
         texts = [p[1] for p in pending]
         try:
             embeddings = self.embedder.embed_chunks(texts)
             store.insert_vectors(chunk_ids, embeddings)
+            return True
         except Exception:
             logger.warning(
                 "Embedding failed for batch of %d chunks — skipping vectors",
                 len(pending),
                 exc_info=True,
             )
+            return False
 
     # -- Change detection ---------------------------------------------------
 

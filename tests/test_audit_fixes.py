@@ -170,6 +170,20 @@ class TestFTSEscapeExtended:
         """Multiple special chars stripped in one pass."""
         assert _fts_escape('"test*" -foo ^bar') == '"test" "foo" "bar"'
 
+    def test_column_set_syntax_neutralized(self) -> None:
+        """FTS5 column set syntax {col1 col2}:term is quoted to literal."""
+        # Braces get split by whitespace, each piece quoted — harmless.
+        result = _fts_escape("{content file_path}:hack")
+        assert '"' in result
+        # No unquoted brace syntax reaches FTS5.
+        for token in result.split():
+            assert token.startswith('"') and token.endswith('"')
+
+    def test_single_column_set_syntax_neutralized(self) -> None:
+        """FTS5 {column}:term without spaces is quoted as literal."""
+        result = _fts_escape("{content}:hack")
+        assert result == '"{content}:hack"'
+
 
 # ---------------------------------------------------------------------------
 # Issue #8: insert_chunks batches existing-ID check
@@ -529,6 +543,26 @@ class TestBatchInsertVectors:
 
         vec2 = emb.embed_chunks(["def foo(): return 42"])
         store.insert_vectors([chunk.chunk_id], vec2)
+        assert store.get_vector_count() == 1
+
+        store.close()
+
+    def test_delete_noop_on_missing_row(self, tmp_path: Path) -> None:
+        """DELETE on a non-existent chunk_id is a no-op, not swallowed error."""
+        db_path = tmp_path / "test.db"
+        store = IndexStore(db_path)
+        store.open()
+        store.create_schema()
+        ok = store.ensure_vec_table(dimensions=64)
+        if not ok:
+            pytest.skip("sqlite-vec not available")
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+
+        # Insert vectors for a chunk_id that has never been inserted before.
+        # The DELETE inside insert_vectors should be a silent no-op.
+        vec = emb.embed_chunks(["def new(): pass"])
+        store.insert_vectors(["never_existed"], vec)
         assert store.get_vector_count() == 1
 
         store.close()

@@ -950,17 +950,12 @@ class IndexStore:
         try:
             for cid, emb in zip(chunk_ids, embeddings, strict=True):
                 blob = struct.pack(f"{len(emb)}f", *emb)
-                try:
-                    vec_conn.execute(
-                        "DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,)
-                    )
-                except Exception:
-                    # Row may not exist yet (first insert) — that's fine.
-                    _store_logger.debug(
-                        "vec_chunks DELETE for %s (may not exist yet)",
-                        cid,
-                        exc_info=True,
-                    )
+                # DELETE on a missing row is a no-op in vec0 — no need
+                # to catch exceptions here.  Real errors (disk, WAL)
+                # should propagate to the outer transaction handler.
+                vec_conn.execute(
+                    "DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,)
+                )
                 vec_conn.execute(
                     "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
                     (cid, blob),
