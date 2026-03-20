@@ -210,8 +210,11 @@ class IndexBuilder:
                                     pending_vectors.append((cid, content))
 
                 # Phase 2: Vector cleanup + insert (apsw connection).
-                # Runs AFTER the sqlite3 batch commits so that a
-                # batch rollback doesn't leave orphaned vector deletes.
+                # MUST run AFTER the sqlite3 batch commits.  The apsw
+                # connection is an independent WAL reader and cannot see
+                # uncommitted rows from the sqlite3 connection.  If you
+                # move vector ops inside batch_mode(), JOINs against the
+                # chunks table will miss the new rows (H5).
                 if vec_enabled:
                     for rel_path in vec_dirty_files:
                         store.delete_vectors_by_file(rel_path)
@@ -420,7 +423,11 @@ class IndexBuilder:
         except Exception:
             return []
 
-        # Use file mtime as hash proxy for PDFs.
+        # Use file mtime as hash proxy for PDFs (avoids reading
+        # entire binary for hashing).  Trade-off: if mtime is restored
+        # (e.g. rsync --times, touch -t) after content changes, the
+        # file won't be detected as changed during incremental refresh.
+        # A full rebuild always catches this (M5).
         try:
             mtime_ns = full.stat().st_mtime_ns
             content_hash = hashlib.sha256(str(mtime_ns).encode()).hexdigest()
