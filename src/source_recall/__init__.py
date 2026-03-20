@@ -118,6 +118,25 @@ class Index:
             self._reranker = None
         return self._reranker
 
+    def close(self) -> None:
+        """Close underlying database connections.
+
+        Safe to call multiple times. Should be called when the Index
+        is no longer needed, or use the context manager instead.
+        """
+        self._close_querier()
+
+    def __enter__(self) -> Index:
+        """Context manager entry.
+
+        @returns: Self.
+        """
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        """Context manager exit — closes connections."""
+        self.close()
+
     def build(self) -> Path:
         """Build the full index with atomic swap.
 
