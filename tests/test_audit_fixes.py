@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from source_recall.models import ChunkData, ConfigError, SymbolType
+from source_recall.embedder import BagOfWordsEmbedder
+from source_recall.models import (
+    ChunkData,
+    ConfigError,
+    FileRecord,
+    ParseMode,
+    SearchQuality,
+    SymbolType,
+)
 from source_recall.store import _FTS5_STRIP, IndexStore, _fts_escape
 
 # ---------------------------------------------------------------------------
@@ -777,3 +786,412 @@ class TestServeNoEnvMutation:
 
         source = inspect.getsource(serve)
         assert 'os.environ[' not in source
+
+
+# ---------------------------------------------------------------------------
+# Audit round 2 — C1, H1-H4, M2-M6, L1, L4
+# ---------------------------------------------------------------------------
+
+
+def _git_init_audit(repo: Path, *, marker: str = "") -> None:
+    """Initialize a git repo with one commit."""
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=repo, capture_output=True, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=repo, capture_output=True, check=True,
+    )
+    (repo / "init.py").write_text(f"# {marker or repo.name}\nx = 1\n")
+    subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", f"init {marker or repo.name}"],
+        cwd=repo, capture_output=True, check=True,
+    )
+
+
+class TestC1VectorAtomicity:
+    """C1: Vectors deferred until after sqlite3 batch commits."""
+
+    def test_refresh_vectors_survive_chunk_update(self, tmp_path: Path) -> None:
+        """After refresh, updated files have both chunks AND vectors."""
+        from source_recall import Index
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init_audit(repo, marker="vec-atomicity")
+        (repo / "app.py").write_text("def hello():\n    return 'world'\n")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=repo, capture_output=True, check=True,
+        )
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        idx = Index(repo, embedder=emb)
+        idx.build()
+
+        s1 = idx.status()
+        assert s1.vector_count > 0
+
+        # Modify the file and commit.
+        (repo / "app.py").write_text("def hello():\n    return 'updated world'\n")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "update"],
+            cwd=repo, capture_output=True, check=True,
+        )
+
+        refreshed = idx.refresh()
+        assert refreshed > 0
+
+        s2 = idx.status()
+        assert s2.vector_count > 0
+        assert s2.chunk_count > 0
+
+
+class TestH1ServerThreadpool:
+    """H1: Server endpoints are sync def (threadpool, not event loop)."""
+
+    def test_query_endpoint_works_from_threadpool(self, py_app_path: Path) -> None:
+        """POST /query works when run as sync def (threadpool)."""
+        from fastapi.testclient import TestClient
+
+        from source_recall import Index
+        from source_recall.server import create_app
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        idx = Index(py_app_path, embedder=emb)
+        idx.build()
+
+        app = create_app(py_app_path, embedder=emb)
+        with TestClient(app) as client:
+            resp = client.post("/query", json={"question": "authenticate"})
+            assert resp.status_code == 200
+            assert len(resp.json()["results"]) > 0
+
+
+class TestH2PdfBranchAwareness:
+    """H2: _index_pdf passes branch parameter."""
+
+    def test_pdf_chunks_have_branch(self, tmp_path: Path) -> None:
+        """PDF chunks include the branch when indexed."""
+        import fitz
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init_audit(repo, marker="pdf-branch")
+
+        pdf_path = repo / "doc.pdf"
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "Test PDF content for branch check")
+        doc.save(str(pdf_path))
+        doc.close()
+
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add pdf"],
+            cwd=repo, capture_output=True, check=True,
+        )
+
+        from source_recall import Index
+        from source_recall.store import get_db_path
+
+        idx = Index(repo)
+        idx.build()
+
+        store = IndexStore(get_db_path(repo))
+        store.open()
+
+        rows = store.conn.execute(
+            "SELECT branches FROM chunks WHERE file_path = 'doc.pdf'"
+        ).fetchall()
+        assert len(rows) > 0
+        for row in rows:
+            assert row[0] != "", "PDF chunk should have branch set"
+
+        store.close()
+
+
+class TestH3PdfSearchQuality:
+    """H3: PDF search quality is TEXT_FALLBACK, not AST."""
+
+    def test_pdf_chunks_are_text_fallback(self) -> None:
+        """chunk_pdf returns TEXT_FALLBACK quality."""
+        from source_recall.chunker import chunk_pdf
+
+        tmp = Path(__file__).parent / "fixtures" / "sample.pdf"
+        chunks, quality = chunk_pdf("test.pdf", tmp)
+
+        assert quality == SearchQuality.TEXT_FALLBACK
+        for chunk in chunks:
+            assert chunk.search_quality == SearchQuality.TEXT_FALLBACK
+
+
+class TestH4QueryRequestValidation:
+    """H4: QueryRequest enforces max_length and top_k bounds."""
+
+    def test_rejects_oversized_question(self, py_app_path: Path) -> None:
+        """POST /query rejects question exceeding 10,000 chars."""
+        from fastapi.testclient import TestClient
+
+        from source_recall import Index
+        from source_recall.server import create_app
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        Index(py_app_path, embedder=emb).build()
+
+        app = create_app(py_app_path, embedder=emb)
+        with TestClient(app) as client:
+            resp = client.post("/query", json={"question": "x" * 10_001})
+            assert resp.status_code == 422
+
+    def test_rejects_invalid_top_k(self, py_app_path: Path) -> None:
+        """POST /query rejects top_k=0 and top_k=101."""
+        from fastapi.testclient import TestClient
+
+        from source_recall import Index
+        from source_recall.server import create_app
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        Index(py_app_path, embedder=emb).build()
+
+        app = create_app(py_app_path, embedder=emb)
+        with TestClient(app) as client:
+            resp = client.post(
+                "/query", json={"question": "test", "top_k": 0}
+            )
+            assert resp.status_code == 422
+
+            resp = client.post(
+                "/query", json={"question": "test", "top_k": 101}
+            )
+            assert resp.status_code == 422
+
+
+class TestM2RefreshRateLimit:
+    """M2: /refresh endpoint is rate-limited."""
+
+    def test_rapid_refresh_returns_429(self, py_app_path: Path) -> None:
+        """POST /refresh twice rapidly returns 429 on second call."""
+        from fastapi.testclient import TestClient
+
+        from source_recall import Index
+        from source_recall.server import create_app
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        Index(py_app_path, embedder=emb).build()
+
+        app = create_app(py_app_path, embedder=emb)
+        with TestClient(app) as client:
+            resp1 = client.post("/refresh")
+            assert resp1.status_code == 200
+
+            resp2 = client.post("/refresh")
+            assert resp2.status_code == 429
+            assert "rate limited" in resp2.json()["detail"].lower()
+
+
+class TestM3BatchModeReentrant:
+    """M3: batch_mode is re-entrant safe."""
+
+    def test_nested_batch_mode_uses_savepoint(self, tmp_path: Path) -> None:
+        """Nested batch_mode uses a savepoint, not a new transaction."""
+        store = IndexStore(tmp_path / "test.db")
+        store.open()
+        store.create_schema()
+
+        chunk = ChunkData(
+            file_path="a.py", symbol_name="outer",
+            symbol_type=SymbolType.FUNCTION, content="def outer(): pass",
+            start_line=1, end_line=1,
+        )
+        chunk_inner = ChunkData(
+            file_path="b.py", symbol_name="inner",
+            symbol_type=SymbolType.FUNCTION, content="def inner(): pass",
+            start_line=1, end_line=1,
+        )
+
+        with store.batch_mode():
+            store.insert_chunks([chunk])
+            with store.batch_mode():
+                store.insert_chunks([chunk_inner])
+            assert store.get_chunk_count() == 2
+
+        assert store.get_chunk_count() == 2
+        store.close()
+
+    def test_nested_batch_inner_rollback_preserves_outer(
+        self, tmp_path: Path
+    ) -> None:
+        """Inner batch failure rolls back only inner work."""
+        store = IndexStore(tmp_path / "test.db")
+        store.open()
+        store.create_schema()
+
+        chunk_outer = ChunkData(
+            file_path="a.py", symbol_name="outer",
+            symbol_type=SymbolType.FUNCTION, content="def outer(): pass",
+            start_line=1, end_line=1,
+        )
+
+        with store.batch_mode():
+            store.insert_chunks([chunk_outer])
+            try:
+                with store.batch_mode():
+                    store.conn.execute("INSERT INTO nonexistent VALUES (1)")
+            except Exception:
+                pass
+
+            assert store.get_chunk_count() == 1
+
+        assert store.get_chunk_count() == 1
+        store.close()
+
+    def test_batch_depth_tracks_nesting(self, tmp_path: Path) -> None:
+        """_batch_depth correctly tracks nesting level."""
+        store = IndexStore(tmp_path / "test.db")
+        store.open()
+        store.create_schema()
+
+        assert store._batch_depth == 0
+        with store.batch_mode():
+            assert store._batch_depth == 1
+            with store.batch_mode():
+                assert store._batch_depth == 2
+            assert store._batch_depth == 1
+        assert store._batch_depth == 0
+        store.close()
+
+
+class TestM4SubChunkSignatureNoDuplication:
+    """M4: Overlap doesn't re-include the function signature."""
+
+    def test_signature_not_duplicated_in_second_chunk(self) -> None:
+        """The overlap region doesn't re-include the function signature."""
+        from source_recall.chunker import _split_into_sub_chunks
+
+        sig = "def big_function(a, b, c):"
+        body_lines = [f"    line_{i} = {i}" for i in range(200)]
+        content = sig + "\n" + "\n".join(body_lines)
+
+        sub_chunks = _split_into_sub_chunks(
+            content, max_chars=500, _symbol_name="big_function"
+        )
+        assert len(sub_chunks) > 1
+
+        second_text = sub_chunks[1][0]
+        sig_occurrences = second_text.count(sig)
+        assert sig_occurrences == 1, (
+            f"Signature appears {sig_occurrences} times in second chunk "
+            f"(expected exactly 1 — prepended, not duplicated via overlap)"
+        )
+
+
+class TestM5IndexContextManager:
+    """M5: Index has close() and context manager."""
+
+    def test_context_manager_closes(self, tmp_path: Path) -> None:
+        """Index used as context manager closes connections on exit."""
+        from source_recall import Index
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n")
+
+        with Index(repo) as idx:
+            idx.build()
+            s = idx.status()
+            assert s.chunk_count > 0
+
+        assert idx._querier is None
+
+    def test_close_is_idempotent(self, tmp_path: Path) -> None:
+        """Calling close() multiple times doesn't raise."""
+        from source_recall import Index
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n")
+
+        idx = Index(repo)
+        idx.build()
+        idx.query("test")
+        idx.close()
+        idx.close()
+
+
+class TestM6SavepointCounterInstance:
+    """M6: _sp_counter is per-instance, not class-level."""
+
+    def test_separate_instances_have_separate_counters(
+        self, tmp_path: Path
+    ) -> None:
+        """Two IndexStore instances don't share savepoint counters."""
+        s1 = IndexStore(tmp_path / "a.db")
+        s1.open()
+        s1.create_schema()
+
+        s2 = IndexStore(tmp_path / "b.db")
+        s2.open()
+        s2.create_schema()
+
+        with s1.batch_mode():
+            with s1._transaction():
+                pass
+        assert s1._sp_counter >= 1
+        assert s2._sp_counter == 0
+
+        s1.close()
+        s2.close()
+
+
+class TestL1MarkdownFencePairing:
+    """L1: Fence pairing matches by marker type."""
+
+    def test_mismatched_fence_types_not_paired(self) -> None:
+        """Opening with ``` and closing with ~~~ doesn't pair."""
+        from source_recall.chunker import chunk_file
+
+        content = (
+            "# Real Heading\n\nSome text.\n\n"
+            "```python\ncode here\n~~~\n\n"
+            "# Inside Fence Heading\n\n```\n\n"
+            "# Outside Heading\n\nMore text.\n"
+        )
+        chunks, _quality = chunk_file("test.md", content)
+        heading_names = [c.symbol_name for c in chunks if c.symbol_name]
+
+        assert "Inside Fence Heading" not in heading_names
+        assert "Real Heading" in heading_names
+        assert "Outside Heading" in heading_names
+
+    def test_nested_backticks_inside_fence(self) -> None:
+        """Shorter backtick sequences inside a longer fence don't mispair."""
+        from source_recall.chunker import chunk_file
+
+        content = (
+            "# Section A\n\n"
+            "````markdown\n```python\nx = 1\n```\n````\n\n"
+            "# Section B\n\nText here.\n"
+        )
+        chunks, _quality = chunk_file("test.md", content)
+        heading_names = [c.symbol_name for c in chunks if c.symbol_name]
+        assert "Section A" in heading_names
+        assert "Section B" in heading_names
+
+
+class TestL4CleanJsonAction:
+    """L4: clean command JSON includes action field."""
+
+    def test_removed_entry_has_action_field(self) -> None:
+        """The clean output structure includes 'action' key."""
+        import inspect
+
+        from source_recall.cli import clean
+
+        source = inspect.getsource(clean)
+        assert '"action"' in source or "'action'" in source
