@@ -185,15 +185,11 @@ class IndexBuilder:
                 # Incremental update.
                 total = len(changed_files)
                 pending_vectors: list[tuple[str, str]] = []
+                # Track files that need vector cleanup (deferred until
+                # after the sqlite3 batch commits — see C1 atomicity).
+                vec_dirty_files: list[str] = []
 
-                # Phase 1: Delete old vectors (apsw connection — must
-                # happen outside the sqlite3 batch to avoid write
-                # contention between the two connections in WAL mode).
-                if vec_enabled:
-                    for rel_path, _action in changed_files:
-                        store.delete_vectors_by_file(rel_path)
-
-                # Phase 2: Batch sqlite3 writes (chunks, FTS, refs,
+                # Phase 1: Batch sqlite3 writes (chunks, FTS, refs,
                 # file_hashes) in a single transaction.
                 with store.batch_mode():
                     for i, (rel_path, action) in enumerate(changed_files):
@@ -203,6 +199,9 @@ class IndexBuilder:
                         store.delete_chunks_for_file(rel_path)
                         store.delete_file_hash(rel_path)
 
+                        if vec_enabled:
+                            vec_dirty_files.append(rel_path)
+
                         if action != "delete":
                             chunk_ids = self._index_file(store, rel_path, branch=branch)
 
@@ -210,7 +209,13 @@ class IndexBuilder:
                                 for cid, content in chunk_ids:
                                     pending_vectors.append((cid, content))
 
-                # Phase 3: Insert new vectors (apsw connection).
+                # Phase 2: Vector cleanup + insert (apsw connection).
+                # Runs AFTER the sqlite3 batch commits so that a
+                # batch rollback doesn't leave orphaned vector deletes.
+                if vec_enabled:
+                    for rel_path in vec_dirty_files:
+                        store.delete_vectors_by_file(rel_path)
+
                 if pending_vectors and vec_enabled and self.embedder is not None:
                     self._flush_vectors(store, pending_vectors)
 
@@ -347,7 +352,7 @@ class IndexBuilder:
 
         # PDF files need binary extraction via pymupdf.
         if full.suffix.lower() == ".pdf":
-            return self._index_pdf(store, rel_path, full)
+            return self._index_pdf(store, rel_path, full, branch=branch)
 
         try:
             content = full.read_text(encoding="utf-8", errors="replace")
@@ -400,13 +405,14 @@ class IndexBuilder:
         return chunk_pairs
 
     def _index_pdf(
-        self, store: IndexStore, rel_path: str, full: Path
+        self, store: IndexStore, rel_path: str, full: Path, branch: str = ""
     ) -> list[tuple[str, str]]:
         """Extract text from a PDF and index its chunks.
 
         @param store: IndexStore to write to.
         @param rel_path: Repo-relative path.
         @param full: Absolute path to the PDF file.
+        @param branch: Branch name for branch-aware indexing.
         @returns: List of (chunk_id, content) tuples for embedding.
         """
         try:
@@ -424,7 +430,7 @@ class IndexBuilder:
 
         chunk_pairs: list[tuple[str, str]] = []
         if chunks:
-            store.insert_chunks(chunks)
+            store.insert_chunks(chunks, branch=branch)
             chunk_pairs = [(c.chunk_id, c.content) for c in chunks]
 
         parse_mode = ParseMode(quality.value)
@@ -434,7 +440,8 @@ class IndexBuilder:
                 content_hash=content_hash,
                 parse_mode=parse_mode,
                 mtime_ns=mtime_ns,
-            )
+            ),
+            branch=branch,
         )
 
         return chunk_pairs
