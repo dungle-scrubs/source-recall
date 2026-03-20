@@ -94,8 +94,32 @@ class IndexBuilder:
             # Detect current branch for branch-aware indexing.
             branch = self._get_current_branch()
 
-            # Discover and index files.
-            files = self._discover_files()
+            # Try git-object discovery for blob-SHA-based indexing.
+            # Falls back to filesystem for non-git repos and shallow clones.
+            use_git_objects = False
+            blob_map: dict[str, str] = {}  # rel_path → blob_sha
+            dirty_map: dict[str, str] = {}  # rel_path → synthetic blob_sha
+
+            if not self._is_shallow_clone():
+                git_entries = self._discover_files_git_objects()
+                if git_entries is not None:
+                    use_git_objects = True
+                    blob_map = {path: sha for path, sha in git_entries}
+                    dirty_map = self._detect_dirty_files()
+                    # Merge dirty files into blob_map (override committed SHAs).
+                    blob_map.update(dirty_map)
+                    # Also add brand-new untracked files.
+                    for path, sha in dirty_map.items():
+                        if path not in blob_map:
+                            blob_map[path] = sha
+
+            # Discover files — filter by size/exclusions.
+            if use_git_objects:
+                # Start from blob_map keys, apply size/exclusion filtering.
+                files = self._filter_files(list(blob_map.keys()))
+            else:
+                files = self._discover_files()
+
             total = len(files)
 
             # Collect chunks for batch embedding.
@@ -104,7 +128,19 @@ class IndexBuilder:
             for i, rel_path in enumerate(files):
                 if self.on_progress:
                     self.on_progress(rel_path, i + 1, total)
-                chunk_ids = self._index_file(store, rel_path, branch=branch)
+
+                if use_git_objects:
+                    blob_sha = blob_map.get(rel_path)
+                    is_dirty = rel_path in dirty_map
+                    chunk_ids = self._index_file(
+                        store,
+                        rel_path,
+                        branch=branch,
+                        blob_sha=blob_sha,
+                        is_dirty=is_dirty,
+                    )
+                else:
+                    chunk_ids = self._index_file(store, rel_path, branch=branch)
 
                 if vec_enabled and self.embedder is not None:
                     for cid, content in chunk_ids:
@@ -163,6 +199,12 @@ class IndexBuilder:
                 # Detect current branch.
                 branch = self._get_current_branch()
 
+                # Try git-object-based refresh for blob-SHA diffing.
+                git_refresh_result = self._try_git_object_refresh(store, branch)
+                if git_refresh_result is not None:
+                    return git_refresh_result
+
+                # Fallback: legacy change detection.
                 changed_files = self._detect_changes(store)
                 if not changed_files:
                     # Still update active_branch even if no files changed.
@@ -250,6 +292,189 @@ class IndexBuilder:
             IndexStore.release_lock(db_path)
 
         return len(changed_files)
+
+    def _try_git_object_refresh(
+        self, store: IndexStore, branch: str
+    ) -> int | None:
+        """Attempt git-object-based refresh using blob-SHA diffing.
+
+        Compares blob SHAs from ``git ls-tree`` against stored
+        ``content_hash`` values. Files with matching SHAs are skipped
+        (only branches CSV updated). Files with different SHAs are
+        re-indexed. Returns None to signal fallback to legacy refresh
+        (non-git repo, shallow clone, etc.).
+
+        @param store: Open IndexStore.
+        @param branch: Current branch name.
+        @returns: Number of changed files, or None to fall back.
+        """
+        if self._is_shallow_clone():
+            return None
+
+        git_entries = self._discover_files_git_objects()
+        if git_entries is None:
+            return None
+
+        blob_map: dict[str, str] = {path: sha for path, sha in git_entries}
+        dirty_map = self._detect_dirty_files()
+        blob_map.update(dirty_map)
+
+        # Filter by size/exclusions.
+        current_files = set(self._filter_files(list(blob_map.keys())))
+        stored_hashes = store.get_all_file_hashes()
+        stored_paths = set(stored_hashes.keys())
+
+        # Classify files into: unchanged, changed, added, deleted.
+        unchanged: list[str] = []
+        changed: list[str] = []
+        added: list[str] = []
+        deleted = stored_paths - current_files
+
+        for rel_path in current_files:
+            blob_sha = blob_map.get(rel_path)
+            stored = stored_hashes.get(rel_path)
+            if stored is None:
+                added.append(rel_path)
+            elif blob_sha and stored.content_hash == blob_sha:
+                unchanged.append(rel_path)
+            else:
+                changed.append(rel_path)
+
+        files_to_reindex = changed + added
+        total_changed = len(files_to_reindex) + len(deleted)
+
+        if total_changed == 0 and unchanged:
+            # Only update branches on unchanged chunks + update meta.
+            for rel_path in unchanged:
+                self._update_branches_only(store, rel_path, branch)
+            store.set_meta_batch({
+                "indexed_at": _now_iso(),
+                "last_commit": _git_head(self.repo_path) or "",
+                "active_branch": branch,
+            })
+            return 0
+
+        if total_changed == 0:
+            store.set_meta_batch({"active_branch": branch})
+            return 0
+
+        # Too many changes → full rebuild.
+        if total_changed > 500:
+            store.close()
+            self._build_locked(get_db_path(self.repo_path))
+            return total_changed
+
+        # Set up vectors.
+        vec_enabled = False
+        if self.embedder is not None:
+            vec_enabled = store.ensure_vec_table(self.embedder.dimensions)
+
+        pending_vectors: list[tuple[str, str]] = []
+        vec_dirty_files: list[str] = []
+
+        # Phase 1: Batch sqlite3 writes.
+        with store.batch_mode():
+            # Delete removed files.
+            for rel_path in deleted:
+                store.delete_chunks_for_file(rel_path)
+                store.delete_file_hash(rel_path)
+                if vec_enabled:
+                    vec_dirty_files.append(rel_path)
+
+            # Re-index changed/added files.
+            total = len(files_to_reindex)
+            for i, rel_path in enumerate(files_to_reindex):
+                if self.on_progress:
+                    self.on_progress(rel_path, i + 1, total)
+
+                store.delete_chunks_for_file(rel_path)
+                store.delete_file_hash(rel_path)
+                if vec_enabled:
+                    vec_dirty_files.append(rel_path)
+
+                blob_sha = blob_map.get(rel_path)
+                is_dirty = rel_path in dirty_map
+                chunk_ids = self._index_file(
+                    store, rel_path, branch=branch,
+                    blob_sha=blob_sha, is_dirty=is_dirty,
+                )
+                if vec_enabled and self.embedder is not None:
+                    for cid, content in chunk_ids:
+                        pending_vectors.append((cid, content))
+
+            # Update branches on unchanged files.
+            for rel_path in unchanged:
+                self._update_branches_only(store, rel_path, branch)
+
+        # Phase 2: Vector cleanup + insert.
+        vec_ok = True
+        if vec_enabled:
+            for rel_path in vec_dirty_files:
+                store.delete_vectors_by_file(rel_path)
+
+        if pending_vectors and vec_enabled and self.embedder is not None:
+            # Filter out chunks that already have vectors — skip redundant
+            # embedding for chunks that existed on a previous branch.
+            existing_vec_ids = store.get_existing_vector_ids(
+                [cid for cid, _ in pending_vectors]
+            )
+            pending_vectors = [
+                (cid, content)
+                for cid, content in pending_vectors
+                if cid not in existing_vec_ids
+            ]
+            if pending_vectors:
+                vec_ok = self._flush_vectors(store, pending_vectors)
+
+        # Update meta.
+        meta: dict[str, str] = {
+            "indexed_at": _now_iso(),
+            "last_commit": _git_head(self.repo_path) or "",
+            "active_branch": branch,
+        }
+        if vec_enabled and self.embedder is not None:
+            chunk_count = store.get_chunk_count()
+            vec_count = store.get_vector_count()
+            coverage = vec_count / chunk_count if chunk_count > 0 else 0.0
+            meta["embed_coverage"] = f"{coverage:.4f}"
+        if not vec_ok:
+            dirty_files = ",".join(files_to_reindex)
+            meta["vec_dirty"] = dirty_files
+        elif vec_enabled:
+            meta["vec_dirty"] = ""
+        store.set_meta_batch(meta)
+
+        return total_changed
+
+    def _update_branches_only(
+        self, store: IndexStore, rel_path: str, branch: str
+    ) -> None:
+        """Update branches CSV on chunks and file_hashes without re-indexing.
+
+        @param store: Open IndexStore.
+        @param rel_path: Repo-relative path.
+        @param branch: Branch name to add.
+        """
+        if not branch:
+            return
+        rows = store.conn.execute(
+            "SELECT id, branches FROM chunks WHERE file_path = ?",
+            (rel_path,),
+        ).fetchall()
+        for row in rows:
+            cid, current = row[0], row[1]
+            current_set = set(current.split(",")) if current else set()
+            if branch not in current_set:
+                current_set.add(branch)
+                new_branches = ",".join(sorted(current_set))
+                store.conn.execute(
+                    "UPDATE chunks SET branches = ? WHERE id = ?",
+                    (new_branches, cid),
+                )
+        # Update file_hashes branch.
+        stored = store.get_file_hash(rel_path)
+        if stored is not None:
+            store.upsert_file_hash(stored, branch=branch)
 
     # -- File cleanup -------------------------------------------------------
 
@@ -353,13 +578,27 @@ class IndexBuilder:
     # -- File indexing ------------------------------------------------------
 
     def _index_file(
-        self, store: IndexStore, rel_path: str, branch: str = ""
+        self,
+        store: IndexStore,
+        rel_path: str,
+        branch: str = "",
+        blob_sha: str | None = None,
+        is_dirty: bool = False,
     ) -> list[tuple[str, str]]:
         """Read, chunk, and store a single file.
+
+        When ``blob_sha`` is provided (git-object mode):
+        - If the stored ``content_hash`` matches ``blob_sha`` and chunks
+          already exist, the file is skipped (no re-read, no re-chunk).
+          Only the ``branches`` CSV column is updated via insert_chunks.
+        - If dirty, content is read from the working tree.
+        - Otherwise, content is read from the git blob.
 
         @param store: IndexStore to write to.
         @param rel_path: Repo-relative path.
         @param branch: Branch name for branch-aware indexing.
+        @param blob_sha: Git blob SHA for content-address comparison.
+        @param is_dirty: True if the file has uncommitted changes.
         @returns: List of (chunk_id, content) tuples for embedding.
         """
         full = self.repo_path / rel_path
@@ -368,13 +607,68 @@ class IndexBuilder:
         if full.suffix.lower() == ".pdf":
             return self._index_pdf(store, rel_path, full, branch=branch)
 
-        try:
-            content = full.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            logger.warning("Skipping unreadable file: %s", rel_path, exc_info=True)
-            return []
+        # --- Blob-SHA fast path: skip re-read if content unchanged ---
+        if blob_sha is not None and not is_dirty:
+            stored = store.get_file_hash(rel_path)
+            if stored is not None and stored.content_hash == blob_sha:
+                # Content identical — just update branches on existing chunks.
+                existing_chunks = store.conn.execute(
+                    "SELECT id FROM chunks WHERE file_path = ?",
+                    (rel_path,),
+                ).fetchall()
+                if existing_chunks and branch:
+                    for row in existing_chunks:
+                        cid = row[0]
+                        br_row = store.conn.execute(
+                            "SELECT branches FROM chunks WHERE id = ?",
+                            (cid,),
+                        ).fetchone()
+                        current = br_row[0] if br_row else ""
+                        current_set = set(current.split(",")) if current else set()
+                        if branch not in current_set:
+                            current_set.add(branch)
+                            new_branches = ",".join(sorted(current_set))
+                            store.conn.execute(
+                                "UPDATE chunks SET branches = ? WHERE id = ?",
+                                (new_branches, cid),
+                            )
+                    store.conn.commit()
+                # Update branch on file_hashes too.
+                store.upsert_file_hash(
+                    FileRecord(
+                        file_path=rel_path,
+                        content_hash=blob_sha,
+                        parse_mode=stored.parse_mode,
+                        mtime_ns=stored.mtime_ns,
+                    ),
+                    branch=branch,
+                )
+                return []  # No new chunks to embed.
 
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        # --- Read content ---
+        if blob_sha is not None and not is_dirty:
+            # Read from git blob.
+            content = self._read_git_blob(blob_sha)
+            if content is None:
+                logger.warning("Failed to read git blob for %s — falling back to disk", rel_path)
+                try:
+                    content = full.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    logger.warning("Skipping unreadable file: %s", rel_path, exc_info=True)
+                    return []
+        else:
+            # Read from working tree (dirty file or no blob_sha).
+            try:
+                content = full.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                logger.warning("Skipping unreadable file: %s", rel_path, exc_info=True)
+                return []
+
+        # Use blob SHA as content_hash when available, else sha256.
+        if blob_sha is not None:
+            content_hash = blob_sha
+        else:
+            content_hash = hashlib.sha256(content.encode()).hexdigest()
 
         # Chunk the file and extract refs.
         chunks, quality, refs = chunk_file_with_refs(
