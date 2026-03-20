@@ -120,6 +120,21 @@ class TestReposEndpoint:
         assert repo["chunk_count"] > 0
 
 
+class TestNonexistentRepo:
+    def test_query_unknown_repo_returns_404(self, indexed_app: TestClient) -> None:
+        """POST /query with unknown repo name returns 404."""
+        resp = indexed_app.post(
+            "/query", json={"question": "test", "repo": "nonexistent"}
+        )
+        assert resp.status_code == 404
+        assert "nonexistent" in resp.json()["detail"]
+
+    def test_status_unknown_repo_returns_404(self, indexed_app: TestClient) -> None:
+        """GET /status with unknown repo name returns 404."""
+        resp = indexed_app.get("/status?repo=nonexistent")
+        assert resp.status_code == 404
+
+
 class TestMultiRepo:
     def test_query_requires_repo_when_multiple(self, py_app_path: Path) -> None:
         """POST /query without repo returns 400 when multiple repos loaded."""
