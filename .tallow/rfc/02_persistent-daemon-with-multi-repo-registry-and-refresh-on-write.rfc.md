@@ -376,7 +376,94 @@ The interval SHOULD be configurable:
 refresh_interval_seconds = 300   # default: 5 minutes
 port = 7249                      # default
 host = "127.0.0.1"              # default, localhost only
+query_timeout_s = 10             # default: per-request timeout
+shutdown_timeout_s = 10          # default: graceful drain window
 ```
+
+### Daemon Reliability
+
+These three concerns are specific to a long-running daemon and
+do not apply to the CLI tool. They prevent data corruption,
+boot loops, and consumer starvation.
+
+#### Graceful Shutdown
+
+launchd sends SIGTERM when stopping the daemon. If the daemon
+is mid-write (inserting vectors, flushing chunks during a
+refresh), an unhandled SIGTERM can corrupt the WAL or leave
+partial state in the index.
+
+The daemon MUST install a SIGTERM handler that:
+
+1. Stops accepting new requests (close the listening socket)
+2. Waits for in-flight `/refresh` and `/query` requests to
+   complete (bounded by `shutdown_timeout_s`, default 10s)
+3. Closes all IndexStore and apsw connections cleanly
+4. Exits with code 0
+
+FastAPI's lifespan shutdown hook handles step 3, but uvicorn
+needs `--timeout-graceful-shutdown` configured to drain
+in-flight requests before the lifespan runs. The launchd plist
+SHOULD set `ExitTimeOut` to match:
+
+```xml
+<key>ExitTimeOut</key>
+<integer>15</integer>
+```
+
+If a refresh is in progress when SIGTERM arrives, the current
+batch SHOULD be committed (not rolled back) so partial progress
+is preserved. The next startup will detect remaining changes
+and continue.
+
+#### Startup Resilience
+
+If one repo has a corrupt index, a missing path, or a schema
+version from a newer source-recall release, the daemon MUST
+start anyway and serve the healthy repos. A single bad repo
+MUST NOT crash the process or trigger a launchd restart loop.
+
+On startup, the daemon MUST:
+
+1. Load the repo registry
+2. For each repo, attempt to open and migrate the index
+3. If a repo fails: log the error, mark it as `state: error`
+   with `error_detail`, and continue to the next repo
+4. Load the embedding model (shared across all repos)
+5. Begin serving — healthy repos return results, errored repos
+   return 503 with the error detail
+
+The `sr daemon status` command and `GET /repos` endpoint MUST
+surface errored repos so the user can diagnose and fix them
+(rebuild, remove, or fix the path).
+
+#### Query Timeout
+
+A pathological query on a large repo (bad FTS match pattern,
+huge result set, slow embedding) can block a uvicorn worker
+thread. In a daemon serving multiple consumers, one slow query
+MUST NOT starve others.
+
+The daemon MUST enforce a per-request timeout:
+
+```toml
+[daemon]
+query_timeout_s = 10    # default: 10 seconds
+```
+
+If a query exceeds the timeout, the daemon MUST return:
+
+```json
+{"detail": "Query timed out after 10.0s", "code": "timeout"}
+```
+
+with HTTP 504. The underlying SQLite query is cancelled via
+`sqlite3.Connection.interrupt()` (stdlib) or the apsw
+equivalent.
+
+The timeout applies to `/query` and `/refresh`. The `/repos`
+and `/health` endpoints are metadata-only and SHOULD NOT need
+timeouts.
 
 ### Consumer Integration
 
