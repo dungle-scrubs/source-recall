@@ -9,6 +9,7 @@ import pytest
 
 from source_recall.builder import IndexBuilder
 from source_recall.config import resolve_config
+from source_recall.embedder import BagOfWordsEmbedder
 from source_recall.models import IndexIdentityError
 from source_recall.store import IndexStore, get_db_path
 
@@ -376,3 +377,109 @@ class TestIdentityVerification:
         builder_b = IndexBuilder(repo_b, config_b)
         with pytest.raises(IndexIdentityError):
             builder_b.refresh()
+
+
+class TestVecFailureTracking:
+    def test_refresh_sets_vec_dirty_on_embed_failure(self, tmp_path: Path) -> None:
+        """When vector embedding fails during refresh, vec_dirty meta is set.
+
+        This allows the next refresh to know vectors are degraded and
+        re-embed those files.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init(repo)
+        (repo / "a.py").write_text("def hello(): pass\n")
+        subprocess.run(
+            ["git", "add", "."], cwd=repo, capture_output=True, check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        # Build with working embedder.
+        emb = BagOfWordsEmbedder(dimensions=64)
+        config = resolve_config(str(repo))
+        builder = IndexBuilder(repo, config, embedder=emb)
+        builder.build()
+
+        # Modify a file so refresh has work to do.
+        (repo / "a.py").write_text("def hello(): return 'world'\n")
+        subprocess.run(
+            ["git", "add", "."], cwd=repo, capture_output=True, check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "update"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        # Create a broken embedder that raises during embed_chunks.
+        class BrokenEmbedder:
+            dimensions = 64
+
+            def embed_chunks(self, texts: list[str]) -> list[list[float]]:
+                raise RuntimeError("GPU on fire")
+
+            def embed_query(self, query: str) -> list[float]:
+                return [0.0] * 64
+
+        broken_builder = IndexBuilder(repo, config, embedder=BrokenEmbedder())
+        broken_builder.refresh()
+
+        # After a failed vector phase, vec_dirty should be set.
+        db_path = get_db_path(repo)
+        with IndexStore(db_path) as store:
+            store.run_migrations()
+            dirty = store.get_meta("vec_dirty")
+            assert dirty is not None, "vec_dirty meta should be set after embed failure"
+
+    def test_successful_refresh_clears_vec_dirty(self, tmp_path: Path) -> None:
+        """A successful refresh clears any previous vec_dirty flag."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init(repo)
+        (repo / "a.py").write_text("def hello(): pass\n")
+        subprocess.run(
+            ["git", "add", "."], cwd=repo, capture_output=True, check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        config = resolve_config(str(repo))
+        builder = IndexBuilder(repo, config, embedder=emb)
+        builder.build()
+
+        # Manually set vec_dirty to simulate previous failure.
+        db_path = get_db_path(repo)
+        with IndexStore(db_path) as store:
+            store.run_migrations()
+            store._set_meta("vec_dirty", "a.py")
+
+        # Modify file and refresh with working embedder.
+        (repo / "a.py").write_text("def hello(): return 42\n")
+        subprocess.run(
+            ["git", "add", "."], cwd=repo, capture_output=True, check=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "fix"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        builder.refresh()
+
+        with IndexStore(db_path) as store:
+            store.run_migrations()
+            dirty = store.get_meta("vec_dirty")
+            assert dirty == "", "vec_dirty should be cleared after successful refresh"
