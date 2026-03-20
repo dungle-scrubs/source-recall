@@ -673,18 +673,12 @@ def serve(
         for rp in repo_paths:
             err_console.print(f"  • {rp.name} → {rp}")
 
-    # Set rerank config via env before Index creation.
-    # This is process-scoped (serve blocks until exit), not a leak.
-    if rerank:
-        import os
-
-        os.environ["SR_RERANK_ENABLED"] = "true"
-
     if no_embed:
         err_console.print("  FTS-only mode (embeddings disabled)")
     else:
         err_console.print("  Loading model (first time may download ~522 MB)...")
 
+    # Build the app with explicit config instead of mutating os.environ.
     if no_embed:
         server_app = create_app(repo_paths, embedder=None)
     else:
