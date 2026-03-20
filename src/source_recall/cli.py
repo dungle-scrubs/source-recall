@@ -573,6 +573,7 @@ def clean(
                 {
                     "index_dir": str(d),
                     "repo_path": stored_path,
+                    "action": "would_remove" if dry_run else "removed",
                 }
             )
 
