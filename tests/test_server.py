@@ -149,3 +149,56 @@ class TestMultiRepo:
             assert len(resp.json()["results"]) > 0
 
         shutil.rmtree(repo2)
+
+    def test_status_requires_repo_when_multiple(self, py_app_path: Path) -> None:
+        """GET /status without repo returns 400 when multiple repos loaded."""
+        import shutil
+
+        from source_recall import Index
+        from source_recall.server import create_app
+
+        repo2 = py_app_path.parent / "repo2"
+        shutil.copytree(py_app_path, repo2)
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        Index(py_app_path, embedder=emb).build()
+        Index(repo2, embedder=emb).build()
+
+        app = create_app([py_app_path, repo2], embedder=emb)
+        with TestClient(app) as client:
+            # Without repo → 400.
+            resp = client.get("/status")
+            assert resp.status_code == 400
+
+            # With repo → 200.
+            resp = client.get(f"/status?repo={py_app_path.name}")
+            assert resp.status_code == 200
+            assert resp.json()["file_count"] > 0
+
+        shutil.rmtree(repo2)
+
+    def test_refresh_requires_repo_when_multiple(self, py_app_path: Path) -> None:
+        """POST /refresh without repo returns 400 when multiple repos loaded."""
+        import shutil
+
+        from source_recall import Index
+        from source_recall.server import create_app
+
+        repo2 = py_app_path.parent / "repo2"
+        shutil.copytree(py_app_path, repo2)
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        Index(py_app_path, embedder=emb).build()
+        Index(repo2, embedder=emb).build()
+
+        app = create_app([py_app_path, repo2], embedder=emb)
+        with TestClient(app) as client:
+            # Without repo → 400.
+            resp = client.post("/refresh")
+            assert resp.status_code == 400
+
+            # With repo → 200.
+            resp = client.post(f"/refresh?repo={py_app_path.name}")
+            assert resp.status_code == 200
+
+        shutil.rmtree(repo2)
