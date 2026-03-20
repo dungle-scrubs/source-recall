@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -81,16 +81,22 @@ class ChunkData:
     search_quality: SearchQuality = SearchQuality.AST
     parent_chunk_id: str | None = None
     sub_chunk_index: int | None = None
+    _chunk_id_cache: str | None = field(
+        default=None, init=False, repr=False, compare=False, hash=False
+    )
 
     @property
     def chunk_id(self) -> str:
         """Deterministic, collision-resistant chunk ID.
 
         Uses length-prefixed fields to prevent separator collisions
-        (e.g. paths containing colons).
+        (e.g. paths containing colons).  Cached after first computation.
 
         @returns: 32-char hex digest.
         """
+        if self._chunk_id_cache is not None:
+            return self._chunk_id_cache
+
         import hashlib
 
         content_hash = hashlib.sha256(self.content.encode()).hexdigest()
@@ -99,7 +105,10 @@ class ChunkData:
             f"|{len(self.symbol_name)}:{self.symbol_name}"
             f"|{content_hash}"
         )
-        return hashlib.sha256(raw.encode()).hexdigest()[:32]
+        result = hashlib.sha256(raw.encode()).hexdigest()[:32]
+        # Bypass frozen restriction to cache.
+        object.__setattr__(self, "_chunk_id_cache", result)
+        return result
 
 
 @dataclass(frozen=True, slots=True)
