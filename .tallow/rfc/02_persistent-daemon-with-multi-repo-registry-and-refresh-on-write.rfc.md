@@ -180,6 +180,7 @@ New and modified endpoints:
 | `POST` | `/query` | Unchanged — add optional `repo` filter |
 | `POST` | `/refresh` | Unchanged — accepts optional `repo` |
 | `POST` | `/refresh` | Extended: `{"files": ["src/a.py"]}` for targeted refresh |
+| `GET` | `/repos/{name}/status` | Per-repo index status with progress |
 
 When `repo` is omitted from `/query`, the daemon SHOULD search
 all registered repos and return results tagged with the repo name.
@@ -220,6 +221,103 @@ When a repo is added (via API or config), the daemon MUST:
 
 The full index build SHOULD run in a background thread/process
 so it doesn't block queries on other repos.
+
+### Index Progress
+
+The daemon MUST expose per-repo index status and progress so
+consumers can surface it to users (tallow footer widget, ears
+status, afk job logs).
+
+#### Endpoint: `GET /repos/{name}/status`
+
+```json
+{
+  "name": "marrow",
+  "path": "/Users/marcus/dev/marrow",
+  "state": "indexing",
+  "index": {
+    "files_total": 758,
+    "files_indexed": 342,
+    "chunks": 4210,
+    "vectors": 4210,
+    "progress_pct": 45.1,
+    "elapsed_s": 48.2,
+    "eta_s": 58.6
+  },
+  "last_indexed_at": "2026-03-20T10:39:25Z",
+  "last_refreshed_at": "2026-03-20T11:15:02Z",
+  "vec_dirty": false
+}
+```
+
+The `state` field MUST be one of:
+
+| State | Meaning |
+|-------|---------|
+| `ready` | Index is current, queries return results |
+| `indexing` | Full build in progress (first index or rebuild) |
+| `refreshing` | Incremental refresh in progress |
+| `error` | Indexing failed — `error_detail` field explains why |
+| `unindexed` | Repo registered but no index exists yet |
+
+During `indexing` or `refreshing`, the `index` object MUST
+include `files_total`, `files_indexed`, and `progress_pct`.
+`eta_s` is OPTIONAL — the daemon SHOULD compute it from the
+rolling average per-file time.
+
+The `GET /repos` endpoint (listing all repos) SHOULD include
+a summary `state` per repo so consumers can get a quick
+overview without polling each one:
+
+```json
+{
+  "repos": [
+    {"name": "marrow", "state": "ready", "chunks": 8849},
+    {"name": "tallow", "state": "indexing", "progress_pct": 45.1},
+    {"name": "afk", "state": "ready", "chunks": 2100}
+  ]
+}
+```
+
+#### SSE Stream: `GET /repos/{name}/progress`
+
+For consumers that want live updates (tallow footer, web
+dashboards), the daemon SHOULD offer a Server-Sent Events
+stream:
+
+```
+GET /repos/marrow/progress
+Accept: text/event-stream
+
+data: {"files_indexed": 342, "files_total": 758, "progress_pct": 45.1}
+data: {"files_indexed": 343, "files_total": 758, "progress_pct": 45.3}
+...
+data: {"state": "ready", "chunks": 8849, "vectors": 8849}
+```
+
+The stream MUST close when the operation completes (state
+transitions to `ready` or `error`). Consumers that don't
+need live updates can poll `/repos/{name}/status` instead.
+
+#### Consumer Usage
+
+**tallow extension** — polls `/repos/{name}/status` or
+subscribes to the SSE stream. Renders in the TUI footer:
+
+```
+ sr: marrow ✓  tallow ⟳ 45%  afk ✓
+```
+
+When a repo is indexing, the agent MAY be informed via system
+prompt that search results for that repo could be incomplete.
+
+**ears** — checks `state` field at startup. If the configured
+codebase is `indexing`, logs a warning and falls back to
+ChromaDB until the daemon reports `ready`.
+
+**afk** — checks `state` before querying during the doc phase.
+If `indexing`, the job can either wait (with a bounded timeout)
+or skip the source-recall query and note it in the job log.
 
 ### Process Management
 
@@ -411,23 +509,28 @@ window is too long for human edits.
 
 **Deliverable:** `sr daemon start` survives reboots.
 
-### Phase 3: Targeted refresh and background refresh
+### Phase 3: Index progress and targeted refresh
 
+- Add `GET /repos/{name}/status` endpoint with progress fields
+- Add `GET /repos/{name}/progress` SSE stream
+- Extend `GET /repos` with per-repo summary state
 - Extend `/refresh` with `files` parameter
 - Add periodic background refresh loop (configurable interval)
 - `vec_dirty` integration — re-embed degraded files on next
   periodic refresh
 
-**Deliverable:** Indexes stay current via periodic + targeted refresh.
+**Deliverable:** Indexes stay current, consumers can observe progress.
 
 ### Phase 4: tallow extension
 
 - tallow-plugins extension that registers `sr_search` tool
 - Post-write hook fires targeted refresh
+- Footer widget showing per-repo index state (✓ ready, ⟳ 45%)
 - System prompt injection for agent awareness
 - Graceful fallback when daemon is down
 
-**Deliverable:** tallow agents can `sr_search` instead of grep.
+**Deliverable:** tallow agents can `sr_search` instead of grep,
+with live index status in the footer.
 
 ### Phase 5: Cross-repo query
 
