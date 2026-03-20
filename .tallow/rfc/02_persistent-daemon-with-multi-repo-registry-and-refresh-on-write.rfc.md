@@ -142,8 +142,10 @@ The registry MUST support:
 - Removing repos via API or config edit
 - Per-repo overrides (`no_embed`, `exclude_patterns`)
 
-The daemon SHOULD resolve `~` and symlinks at load time and
-store the canonical absolute path internally.
+The daemon MUST resolve `~` via `Path.expanduser()` and resolve
+symlinks via `Path.resolve()` at load time, storing the canonical
+absolute path internally. Config files use `~` for portability;
+internal state uses absolute paths for correctness.
 
 ### CLI Commands
 
@@ -167,6 +169,11 @@ sr ask "auth flow"       # searches all repos, returns with repo context
 `sr serve` SHOULD remain as an alias / compatibility mode that
 starts the daemon in the foreground without launchd.
 
+`sr ask` SHOULD become a thin HTTP client that queries the
+running daemon. If the daemon is not running, it SHOULD fall
+back to the current in-process behavior (load model, query,
+exit) so the CLI always works — just slower without the daemon.
+
 ### HTTP API Changes
 
 New and modified endpoints:
@@ -178,8 +185,7 @@ New and modified endpoints:
 | `POST` | `/repos` | Add a repo: `{"path": "/abs/path"}` |
 | `DELETE` | `/repos/{name}` | Remove a repo |
 | `POST` | `/query` | Unchanged — add optional `repo` filter |
-| `POST` | `/refresh` | Unchanged — accepts optional `repo` |
-| `POST` | `/refresh` | Extended: `{"files": ["src/a.py"]}` for targeted refresh |
+| `POST` | `/refresh` | Incremental re-index; optional `repo` and `files` fields |
 | `GET` | `/repos/{name}/status` | Per-repo index status with progress |
 
 When `repo` is omitted from `/query`, the daemon SHOULD search
@@ -258,7 +264,7 @@ The `state` field MUST be one of:
 | `indexing` | Full build in progress (first index or rebuild) |
 | `refreshing` | Incremental refresh in progress |
 | `error` | Indexing failed — `error_detail` field explains why |
-| `unindexed` | Repo registered but no index exists yet |
+| `queued` | Repo registered, auto-index queued but not yet started |
 
 During `indexing` or `refreshing`, the `index` object MUST
 include `files_total`, `files_indexed`, and `progress_pct`.
@@ -362,12 +368,57 @@ or skip the source-recall query and note it in the job log.
 2. Verify the process exited
 3. Leave the plist in place for next start
 
+### Refresh Serialization
+
+The existing `IndexBuilder` uses a PID-file lock for
+multi-process isolation (prevents two `sr index` commands from
+colliding). In a single-process daemon handling concurrent HTTP
+requests, this lock causes problems:
+
+- Two consumers fire `POST /refresh` for the same repo → the
+  second caller gets `IndexLockError` after 5s timeout
+- Periodic refresh is running when a targeted refresh arrives →
+  same collision
+
+The daemon MUST own refresh serialization internally via a
+per-repo `asyncio.Lock` (or threading lock). All refresh
+requests — targeted, periodic, and auto-index — go through
+this lock. The behavior when a refresh is already in progress:
+
+- **Targeted refresh** — queue the file list. When the current
+  refresh completes, merge all queued file lists and run one
+  combined refresh. This coalesces rapid-fire writes from an
+  agent editing multiple files.
+- **Periodic refresh** — skip if a refresh is already running
+  for that repo. The next cycle will catch any remaining changes.
+- **Auto-index (full build)** — blocks targeted/periodic until
+  complete. Full builds are rare (only on first registration).
+
+The PID-file lock SHOULD remain for external `sr index` CLI
+calls that run outside the daemon process. The daemon MUST
+acquire the PID lock before starting any refresh to prevent
+collision with external builds. If the PID lock is held by an
+external process, the daemon's refresh SHOULD retry after a
+delay rather than failing the HTTP request.
+
+### Config File Safety
+
+The `POST /repos` endpoint writes to `repos.toml`. To prevent
+a read-during-write race with the config watcher, all writes
+MUST use atomic write (write to a temporary file in the same
+directory, then `os.rename`). This guarantees the watcher
+always reads a complete file.
+
 ### Periodic Background Refresh
 
 In addition to refresh-on-write, the daemon SHOULD run a
 periodic refresh cycle (default: every 5 minutes) that checks
 all registered repos for changes. This catches changes made by
 humans (git pull, manual edits) that no agent signaled.
+
+If a periodic refresh takes longer than the interval, the next
+cycle MUST be skipped (not queued). This prevents unbounded
+refresh backlogs on slow repos.
 
 The interval SHOULD be configurable:
 
@@ -411,6 +462,12 @@ SHOULD set `ExitTimeOut` to match:
 <integer>15</integer>
 ```
 
+The 5s gap between `shutdown_timeout_s` (10s) and `ExitTimeOut`
+(15s) is intentional: uvicorn drains in-flight requests during
+the shutdown timeout, then FastAPI's lifespan shutdown hook runs
+to close DB connections. The extra 5s ensures launchd doesn't
+SIGKILL the process before lifespan cleanup completes.
+
 If a refresh is in progress when SIGTERM arrives, the current
 batch SHOULD be committed (not rolled back) so partial progress
 is preserved. The next startup will detect remaining changes
@@ -430,12 +487,18 @@ On startup, the daemon MUST:
 3. If a repo fails: log the error, mark it as `state: error`
    with `error_detail`, and continue to the next repo
 4. Load the embedding model (shared across all repos)
-5. Begin serving — healthy repos return results, errored repos
+5. If the model fails to load (corrupt cache, disk full,
+   missing weights): log the error and start in FTS-only
+   degraded mode. The `/health` endpoint MUST report
+   `"mode": "fts_only"` so consumers know vector search
+   is unavailable. Queries still work via BM25.
+6. Begin serving — healthy repos return results, errored repos
    return 503 with the error detail
 
 The `sr daemon status` command and `GET /repos` endpoint MUST
-surface errored repos so the user can diagnose and fix them
-(rebuild, remove, or fix the path).
+surface errored repos and the daemon mode (`hybrid` or
+`fts_only`) so the user can diagnose and fix them (rebuild,
+remove, fix the path, or clear the HuggingFace cache).
 
 #### Query Timeout
 
@@ -444,12 +507,8 @@ huge result set, slow embedding) can block a uvicorn worker
 thread. In a daemon serving multiple consumers, one slow query
 MUST NOT starve others.
 
-The daemon MUST enforce a per-request timeout:
-
-```toml
-[daemon]
-query_timeout_s = 10    # default: 10 seconds
-```
+The daemon MUST enforce a per-request timeout (configured via
+`query_timeout_s` in the `[daemon]` config block above).
 
 If a query exceeds the timeout, the daemon MUST return:
 
@@ -646,12 +705,7 @@ with live index status in the footer.
    semantic and `sr_symbols` for exact symbol lookup)? One tool
    is simpler for the agent; two tools give it more control.
 
-4. **Index build during daemon startup** — if a configured repo
-   has no index yet, should the daemon block startup until it's
-   built, or start serving other repos immediately and build in
-   the background? Background is better UX but more complex.
-
-5. **Config hot-reload vs restart** — should the daemon watch
+4. **Config hot-reload vs restart** — should the daemon watch
    `repos.toml` for changes and auto-reload, or require
    `sr daemon reload`? Hot-reload is convenient but adds
    complexity and a class of bugs. A manual reload signal
