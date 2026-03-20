@@ -794,13 +794,13 @@ def chunk_pdf(file_path: str, pdf_path: Path) -> tuple[list[ChunkData], SearchQu
                     content=text,
                     start_line=page_num + 1,
                     end_line=page_num + 1,
-                    search_quality=SearchQuality.AST,
+                    search_quality=SearchQuality.TEXT_FALLBACK,
                 )
             )
     finally:
         doc.close()
 
-    return chunks, SearchQuality.AST
+    return chunks, SearchQuality.TEXT_FALLBACK
 
 
 # ---------------------------------------------------------------------------
@@ -826,19 +826,31 @@ def _chunk_markdown(
     @returns: (chunks, quality).
     """
     # Find headings that are NOT inside fenced code blocks.
+    # Pair fences by matching opener/closer marker type and length
+    # (``` only closes ```, not ~~~), with proper state tracking.
     fenced_ranges: list[tuple[int, int]] = []
+    open_fence: tuple[str, int] | None = None  # (marker_char, start_pos)
     for m in _FENCE_RE.finditer(content):
-        if len(fenced_ranges) % 2 == 0:
-            fenced_ranges.append((m.start(), -1))
-        elif fenced_ranges:
-            fenced_ranges[-1] = (fenced_ranges[-1][0], m.end())
+        marker = m.group(1)
+        marker_char = marker[0]  # '`' or '~'
+        if open_fence is None:
+            # Opening a new fence.
+            open_fence = (marker_char, m.start())
+        elif marker_char == open_fence[0] and len(marker) >= len(marker):
+            # Matching closer — same character type.
+            fenced_ranges.append((open_fence[1], m.end()))
+            open_fence = None
+        # Mismatched closer (e.g. ~~~ inside ```) — ignore it.
 
-    # Discard trailing unclosed fence (prevents mispairing later fences).
-    if fenced_ranges and fenced_ranges[-1][1] == -1:
-        fenced_ranges.pop()
+    # Build sorted start positions for O(log n) bisect lookup.
+    _fence_starts = [s for s, _e in fenced_ranges]
 
     def _in_fence(pos: int) -> bool:
-        return any(s <= pos <= e for s, e in fenced_ranges)
+        idx = bisect.bisect_right(_fence_starts, pos) - 1
+        if idx < 0:
+            return False
+        s, e = fenced_ranges[idx]
+        return s <= pos <= e
 
     # Collect heading positions.
     sections: list[tuple[str, int]] = []  # (heading_text, char_offset)
@@ -1122,7 +1134,9 @@ def _split_into_sub_chunks(
 ) -> list[tuple[str, int, int]]:
     """Split content into sub-chunks with overlap.
 
-    Prepends the function/class signature to each sub-chunk.
+    Prepends the function/class signature to each sub-chunk after the
+    first.  Overlap rewind never crosses back into the signature area
+    to avoid duplicating signature content.
 
     @param content: Full chunk text.
     @param max_chars: Character limit per sub-chunk.
@@ -1133,6 +1147,7 @@ def _split_into_sub_chunks(
 
     # Extract signature (first line or first few lines ending with : or {).
     signature = _extract_signature(lines)
+    sig_line_count = signature.count("\n") + 1
     sig_len = len(signature) + 1  # +1 for newline.
 
     effective_max = max_chars - sig_len
@@ -1170,9 +1185,11 @@ def _split_into_sub_chunks(
         result.append((text, start_i, end_i))
         chunk_idx += 1
 
-        # Apply overlap — rewind by _SUB_CHUNK_OVERLAP lines.
+        # Apply overlap — rewind by _SUB_CHUNK_OVERLAP lines, but never
+        # back into the signature area (which is prepended separately).
         if i < len(lines):
-            i = max(start_i + 1, i - _SUB_CHUNK_OVERLAP)
+            min_rewind = max(start_i + 1, sig_line_count)
+            i = max(min_rewind, i - _SUB_CHUNK_OVERLAP)
 
     return result
 

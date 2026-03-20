@@ -89,7 +89,7 @@ class TestPdfChunker:
 
         chunks, quality = chunk_pdf("docs/sample.pdf", pdf_path)
 
-        assert quality == SearchQuality.AST
+        assert quality == SearchQuality.TEXT_FALLBACK
         # 2 pages with text, 1 empty page → 2 chunks.
         assert len(chunks) == 2
         assert "authentication" in chunks[0].content
