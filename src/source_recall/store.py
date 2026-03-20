@@ -279,6 +279,13 @@ def _release_lock(lock_path: Path) -> None:
 class IndexStore:
     """Manages SQLite connections, schema, and CRUD for a single index.
 
+    **Threading model (M2):** The sqlite3 connection uses
+    ``check_same_thread=False`` so the FastAPI threadpool can share
+    one store.  WAL mode + ``busy_timeout`` handle concurrent readers.
+    Concurrent *writers* are serialised by the PID-file lock in
+    ``IndexBuilder``; do not call write methods from multiple threads
+    without external synchronisation.
+
     @param db_path: Path to the index.db file.
     """
 
@@ -935,22 +942,33 @@ class IndexStore:
 
         import struct
 
-        # vec0 virtual tables don't support DELETE ... WHERE IN (...),
-        # so delete-then-insert must be per-row.
-        for cid, emb in zip(chunk_ids, embeddings, strict=True):
-            blob = struct.pack(f"{len(emb)}f", *emb)
-            try:
-                vec_conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
-            except Exception:
-                # Row may not exist yet (first insert) — that's fine.
-                # Log anything unexpected for debugging.
-                _store_logger.debug(
-                    "vec_chunks DELETE for %s (may not exist yet)", cid, exc_info=True
+        # Wrap in an explicit transaction so a crash mid-batch doesn't
+        # leave partial vector state (H1).  vec0 virtual tables don't
+        # support DELETE ... WHERE IN (...), so delete-then-insert is
+        # per-row, but all rows commit or roll back together.
+        vec_conn.execute("BEGIN")
+        try:
+            for cid, emb in zip(chunk_ids, embeddings, strict=True):
+                blob = struct.pack(f"{len(emb)}f", *emb)
+                try:
+                    vec_conn.execute(
+                        "DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,)
+                    )
+                except Exception:
+                    # Row may not exist yet (first insert) — that's fine.
+                    _store_logger.debug(
+                        "vec_chunks DELETE for %s (may not exist yet)",
+                        cid,
+                        exc_info=True,
+                    )
+                vec_conn.execute(
+                    "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
+                    (cid, blob),
                 )
-            vec_conn.execute(
-                "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
-                (cid, blob),
-            )
+            vec_conn.execute("COMMIT")
+        except Exception:
+            vec_conn.execute("ROLLBACK")
+            raise
 
     def search_vectors(
         self,
