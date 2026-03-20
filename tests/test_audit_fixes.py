@@ -328,11 +328,11 @@ class TestDeadCodeRemoved:
 
         assert not hasattr(IndexBuilder, "_read_content_via_git")
 
-    def test_no_is_shallow_clone(self) -> None:
-        """_is_shallow_clone was removed from IndexBuilder."""
+    def test_is_shallow_clone_exists(self) -> None:
+        """_is_shallow_clone is used by git-object indexing."""
         from source_recall.builder import IndexBuilder
 
-        assert not hasattr(IndexBuilder, "_is_shallow_clone")
+        assert hasattr(IndexBuilder, "_is_shallow_clone")
 
 
 # ---------------------------------------------------------------------------

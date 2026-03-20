@@ -1037,6 +1037,38 @@ class IndexStore:
             (file_path,),
         )
 
+    def get_existing_vector_ids(self, chunk_ids: list[str]) -> set[str]:
+        """Return the subset of chunk IDs that already have vectors.
+
+        Used by the builder to skip redundant embedding for chunks that
+        already exist from a previous branch build.
+
+        @param chunk_ids: Chunk IDs to check.
+        @returns: Set of chunk IDs that have vectors in vec_chunks.
+        """
+        if not chunk_ids:
+            return set()
+        vec_conn = self._get_vec_conn()
+        if vec_conn is None:
+            return set()
+        if not self.has_vec_table():
+            return set()
+
+        result: set[str] = set()
+        # Batch in groups of 500 (SQLite variable limit).
+        for i in range(0, len(chunk_ids), 500):
+            batch = chunk_ids[i : i + 500]
+            placeholders = ",".join("?" * len(batch))
+            rows = list(
+                vec_conn.execute(
+                    f"SELECT chunk_id FROM vec_chunks WHERE chunk_id IN ({placeholders})",
+                    batch,
+                )
+            )
+            for row in rows:
+                result.add(row[0])
+        return result
+
     def get_vector_count(self) -> int:
         """Count rows in vec_chunks.
 
