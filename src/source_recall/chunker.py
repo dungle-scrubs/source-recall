@@ -829,18 +829,22 @@ def _chunk_markdown(
     # Pair fences by matching opener/closer marker type and length
     # (``` only closes ```, not ~~~), with proper state tracking.
     fenced_ranges: list[tuple[int, int]] = []
-    open_fence: tuple[str, int] | None = None  # (marker_char, start_pos)
+    open_fence: tuple[str, int, int] | None = None  # (marker_char, start_pos, marker_len)
     for m in _FENCE_RE.finditer(content):
         marker = m.group(1)
         marker_char = marker[0]  # '`' or '~'
         if open_fence is None:
             # Opening a new fence.
-            open_fence = (marker_char, m.start())
-        elif marker_char == open_fence[0] and len(marker) >= len(marker):
-            # Matching closer — same character type.
+            open_fence = (marker_char, m.start(), len(marker))
+        elif marker_char == open_fence[0] and len(marker) >= open_fence[2]:
+            # Matching closer — same character type, at least as long.
             fenced_ranges.append((open_fence[1], m.end()))
             open_fence = None
-        # Mismatched closer (e.g. ~~~ inside ```) — ignore it.
+        # Mismatched closer (e.g. ~~~ inside ```, or shorter fence) — ignore.
+
+    # Unclosed fence — treat remaining content as fenced (M8).
+    if open_fence is not None:
+        fenced_ranges.append((open_fence[1], len(content)))
 
     # Build sorted start positions for O(log n) bisect lookup.
     _fence_starts = [s for s, _e in fenced_ranges]
@@ -1014,16 +1018,21 @@ def _chunk_text_fallback(
     @param max_chars: Sub-chunk threshold.
     @returns: (chunks, quality).
     """
-    blocks = re.split(r"\n\s*\n", content)
-    chunks: list[ChunkData] = []
-    current_line = 1
+    # Split on blank lines, keeping the separators so we can count
+    # their actual newlines instead of assuming +2 (M4).
+    boundary_re = re.compile(r"\n\s*\n")
+    matches = list(boundary_re.finditer(content))
+    block_starts = [0] + [m.end() for m in matches]
+    block_ends = [m.start() for m in matches] + [len(content)]
 
-    for block in blocks:
-        text = block.strip()
+    chunks: list[ChunkData] = []
+
+    for start_pos, end_pos in zip(block_starts, block_ends):
+        text = content[start_pos:end_pos].strip()
         if not text:
-            current_line += block.count("\n") + 1
             continue
 
+        start_line = content[:start_pos].count("\n") + 1
         line_count = text.count("\n") + 1
         _add_chunk(
             chunks,
@@ -1031,12 +1040,11 @@ def _chunk_text_fallback(
             "",
             SymbolType.BLOCK,
             text,
-            current_line,
-            current_line + line_count - 1,
+            start_line,
+            start_line + line_count - 1,
             SearchQuality.TEXT_FALLBACK,
             max_chars,
         )
-        current_line += block.count("\n") + 2  # +2 for the blank line separator.
 
     if not chunks and content.strip():
         _add_chunk(
@@ -1197,9 +1205,11 @@ def _split_into_sub_chunks(
 def _extract_signature(lines: list[str]) -> str:
     """Extract the function/class signature from the first lines.
 
-    Collects the opening declaration (def/class/function) and any
-    continuation lines that are part of the parameter list or type
-    annotation.  Stops at the body (docstring, statements, etc.).
+    Uses parenthesis-depth tracking to distinguish parameter-list
+    continuations from body statements.  A line like ``x = {`` inside
+    a function body is never included; only lines that are part of the
+    declaration (open parens, type annotations, arrow functions) are
+    collected.
 
     @param lines: All lines of the chunk.
     @returns: Signature string (may be multi-line).
@@ -1207,15 +1217,36 @@ def _extract_signature(lines: list[str]) -> str:
     if not lines:
         return ""
 
-    # For Python: lines ending with ':'
-    # For TS/JS: lines ending with '{' or '=>'
     sig_lines: list[str] = [lines[0]]
-    for line in lines[1:5]:  # Check first 5 lines.
+    first = lines[0].rstrip()
+
+    # Track parenthesis depth to detect parameter lists.
+    paren_depth = first.count("(") - first.count(")")
+
+    # If the first line already completes the signature (balanced parens
+    # and ends with a body opener), there's nothing more to collect.
+    if paren_depth <= 0 and first.endswith((":", "{")):
+        return "\n".join(sig_lines)
+
+    for line in lines[1:5]:
         stripped = line.rstrip()
-        if stripped.endswith((":", "{", "=>", "(", ",")):
+        if not stripped:
+            break
+        lstripped = stripped.lstrip()
+        # Stop at docstrings.
+        if lstripped.startswith(('"""', "'''", 'r"""', "r'''")):
+            break
+
+        paren_depth += stripped.count("(") - stripped.count(")")
+
+        if paren_depth > 0:
+            # Inside parameter list — always include.
             sig_lines.append(line)
-        elif stripped.endswith(")") or stripped.endswith(") ->"):
-            # Closing paren of parameter list.
+        elif stripped.endswith((":", "{", "=>")):
+            # Closing line of signature (e.g. `) -> bool:`).
+            sig_lines.append(line)
+            break
+        elif stripped.endswith(")") or stripped.endswith("->"):
             sig_lines.append(line)
             break
         else:
@@ -1423,6 +1454,9 @@ def _build_line_index(
     def _lookup(line: int) -> str | None:
         idx = bisect.bisect_right(starts, line) - 1
         if idx < 0:
+            # Line is before any chunk (e.g. import in preamble) —
+            # attribute to first chunk.  May mis-attribute refs in
+            # files with large preambles before the first definition (L7).
             return fallback_id
         c = sorted_chunks[idx]
         if c.start_line <= line <= c.end_line:
