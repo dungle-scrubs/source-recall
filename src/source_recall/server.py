@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -174,6 +175,7 @@ def create_app(
 
     # Rate limiter: minimum seconds between /refresh calls per repo.
     _REFRESH_MIN_INTERVAL = 10.0
+    _refresh_lock = threading.Lock()  # Guards _last_refresh (H3).
     _last_refresh: dict[str, float] = {}  # repo_name → monotonic timestamp
 
     @asynccontextmanager
@@ -198,10 +200,24 @@ def create_app(
         )
         yield
 
+        # Shutdown: close all Index connections (H2).
+        for entry in state["indexes"].values():
+            entry["index"].close()
+
     app = FastAPI(
         title="source-recall",
         description="Code search and retrieval server.",
         lifespan=lifespan,
+    )
+
+    # Allow cross-origin requests from browser-based coding tools (M3).
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
     def _resolve_index(repo: str | None) -> Any:
@@ -327,17 +343,18 @@ def create_app(
         """
         idx = _resolve_index(repo)
 
-        # Rate limit per repo.
+        # Rate limit per repo (thread-safe — H3).
         key = repo or "_default"
         now = time.monotonic()
-        last = _last_refresh.get(key, 0.0)
-        if now - last < _REFRESH_MIN_INTERVAL:
-            remaining = round(_REFRESH_MIN_INTERVAL - (now - last), 1)
-            raise HTTPException(
-                status_code=429,
-                detail=f"Refresh rate limited. Retry in {remaining}s.",
-            )
-        _last_refresh[key] = now
+        with _refresh_lock:
+            last = _last_refresh.get(key, 0.0)
+            if now - last < _REFRESH_MIN_INTERVAL:
+                remaining = round(_REFRESH_MIN_INTERVAL - (now - last), 1)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Refresh rate limited. Retry in {remaining}s.",
+                )
+            _last_refresh[key] = now
 
         t0 = now
         count = idx.refresh()
