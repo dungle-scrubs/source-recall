@@ -253,14 +253,22 @@ def _acquire_lock(lock_path: Path, timeout: float = 0) -> None:
 def _release_lock(lock_path: Path) -> None:
     """Release the PID-file lock.
 
+    Only deletes the lock file if it belongs to this process.
+    If the file is corrupt or unreadable, leaves it intact rather
+    than risk deleting a lock held by another process.
+
     @param lock_path: Path to the lock file.
     """
     try:
         data = json.loads(lock_path.read_text())
         if data.get("pid") == os.getpid():
             lock_path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass  # Already gone — nothing to release.
     except Exception:
-        lock_path.unlink(missing_ok=True)
+        _store_logger.warning(
+            "Could not read lock file %s — leaving intact", lock_path
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +281,8 @@ class IndexStore:
 
     @param db_path: Path to the index.db file.
     """
+
+    _sp_counter: int = 0  # Monotonic savepoint name counter.
 
     def __init__(self, db_path: Path, *, build_mode: bool = False) -> None:
         self.db_path = db_path
@@ -926,8 +936,14 @@ class IndexStore:
         # so delete-then-insert must be per-row.
         for cid, emb in zip(chunk_ids, embeddings, strict=True):
             blob = struct.pack(f"{len(emb)}f", *emb)
-            with contextlib.suppress(Exception):
+            try:
                 vec_conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
+            except Exception:
+                # Row may not exist yet (first insert) — that's fine.
+                # Log anything unexpected for debugging.
+                _store_logger.debug(
+                    "vec_chunks DELETE for %s (may not exist yet)", cid, exc_info=True
+                )
             vec_conn.execute(
                 "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
                 (cid, blob),
@@ -1092,7 +1108,8 @@ class IndexStore:
         """
         if getattr(self, "_batch", False):
             # Already inside batch_mode — use savepoint for atomicity.
-            sp = f"sp_{id(self)}_{id(object())}"
+            IndexStore._sp_counter += 1
+            sp = f"sp_{IndexStore._sp_counter}"
             self.conn.execute(f"SAVEPOINT {sp}")
             try:
                 yield
