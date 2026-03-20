@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from source_recall.models import _SENTINEL
 
@@ -25,14 +25,14 @@ logger = logging.getLogger(__name__)
 class QueryRequest(BaseModel):
     """Search query request.
 
-    @param question: Natural language or symbol query.
-    @param top_k: Max results (default: config value).
+    @param question: Natural language or symbol query (max 10,000 chars).
+    @param top_k: Max results (1-100, default: config value).
     @param repo: Repo name to query (required when multiple repos served).
     @param branch: Filter to this branch. None = active branch.
     """
 
-    question: str
-    top_k: int | None = None
+    question: str = Field(..., max_length=10_000)
+    top_k: int | None = Field(default=None, gt=0, le=100)
     repo: str | None = None
     branch: str | None = None
 
@@ -172,6 +172,10 @@ def create_app(
     # Shared state — populated during lifespan startup.
     state: dict[str, Any] = {"indexes": {}, "started_at": 0.0}
 
+    # Rate limiter: minimum seconds between /refresh calls per repo.
+    _REFRESH_MIN_INTERVAL = 10.0
+    _last_refresh: dict[str, float] = {}  # repo_name → monotonic timestamp
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         """Load embedder and open indexes on server start."""
@@ -223,7 +227,7 @@ def create_app(
         return indexes[repo]["index"]
 
     @app.get("/health", response_model=HealthResponse)
-    async def health() -> HealthResponse:
+    def health() -> HealthResponse:
         """Liveness check — returns ok if indexes are loaded.
 
         @returns: Health status with repo list and uptime.
@@ -235,7 +239,7 @@ def create_app(
         )
 
     @app.get("/repos", response_model=ReposResponse)
-    async def repos() -> ReposResponse:
+    def repos() -> ReposResponse:
         """List all loaded repos with stats.
 
         @returns: Repo details.
@@ -255,8 +259,11 @@ def create_app(
         return ReposResponse(repos=items)
 
     @app.post("/query", response_model=QueryResponse)
-    async def query(req: QueryRequest) -> QueryResponse:
+    def query(req: QueryRequest) -> QueryResponse:
         """Search an index.
+
+        Runs in a threadpool (sync def) to avoid blocking the event
+        loop during SQLite queries, embedding, and reranking.
 
         @param req: Query request with question, optional top_k and repo.
         @returns: Ranked results with query latency.
@@ -287,7 +294,7 @@ def create_app(
         )
 
     @app.get("/status", response_model=StatusResponse)
-    async def status(repo: str | None = None) -> StatusResponse:
+    def status(repo: str | None = None) -> StatusResponse:
         """Get index status.
 
         @param repo: Repo name (optional if single repo).
@@ -307,15 +314,32 @@ def create_app(
         )
 
     @app.post("/refresh", response_model=RefreshResponse)
-    async def refresh(repo: str | None = None) -> RefreshResponse:
+    def refresh(repo: str | None = None) -> RefreshResponse:
         """Incrementally refresh an index.
+
+        Rate-limited to one call per repo every 10 seconds.
+        Runs in a threadpool (sync def) to avoid blocking the event
+        loop during re-indexing.
 
         @param repo: Repo name (optional if single repo).
         @returns: Number of files updated with latency.
+        @raises HTTPException: 429 if called too frequently.
         """
         idx = _resolve_index(repo)
 
-        t0 = time.monotonic()
+        # Rate limit per repo.
+        key = repo or "_default"
+        now = time.monotonic()
+        last = _last_refresh.get(key, 0.0)
+        if now - last < _REFRESH_MIN_INTERVAL:
+            remaining = round(_REFRESH_MIN_INTERVAL - (now - last), 1)
+            raise HTTPException(
+                status_code=429,
+                detail=f"Refresh rate limited. Retry in {remaining}s.",
+            )
+        _last_refresh[key] = now
+
+        t0 = now
         count = idx.refresh()
         elapsed_ms = (time.monotonic() - t0) * 1000
 
