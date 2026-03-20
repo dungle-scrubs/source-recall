@@ -865,6 +865,10 @@ def _chunk_markdown(
     chunks: list[ChunkData] = []
 
     # Content before first heading.
+    # Markdown is heading-split, not AST-parsed. Use REGEX quality
+    # so the querier applies the correct scoring multiplier.
+    _md_quality = SearchQuality.REGEX
+
     if sections:
         preamble = content[: sections[0][1]].strip()
         if preamble:
@@ -877,7 +881,7 @@ def _chunk_markdown(
                 preamble,
                 1,
                 line_count,
-                SearchQuality.AST,
+                _md_quality,
                 max_chars,
             )
 
@@ -898,7 +902,7 @@ def _chunk_markdown(
             body,
             start_line,
             end_line,
-            SearchQuality.AST,
+            _md_quality,
             max_chars,
         )
 
@@ -912,11 +916,11 @@ def _chunk_markdown(
             content.strip(),
             1,
             content.count("\n") + 1,
-            SearchQuality.AST,
+            _md_quality,
             max_chars,
         )
 
-    return chunks, SearchQuality.AST
+    return chunks, _md_quality
 
 
 # ---------------------------------------------------------------------------

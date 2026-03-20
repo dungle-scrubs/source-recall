@@ -9,6 +9,15 @@ from source_recall.models import SearchQuality, SymbolType
 
 
 class TestMarkdownChunker:
+    def test_markdown_quality_is_not_ast(self) -> None:
+        """Markdown chunks should not claim AST quality — they're heading-split."""
+        md = "# Title\nSome content.\n"
+        chunks, quality = chunk_file("docs/README.md", md)
+        assert quality != SearchQuality.AST
+        # Individual chunks should also not claim AST.
+        for c in chunks:
+            assert c.search_quality != SearchQuality.AST
+
     def test_splits_on_headings(self) -> None:
         """Each heading starts a new chunk with heading as symbol_name."""
         md = (
@@ -23,7 +32,7 @@ class TestMarkdownChunker:
         )
         chunks, quality = chunk_file("docs/README.md", md)
 
-        assert quality == SearchQuality.AST
+        assert quality == SearchQuality.REGEX
         assert len(chunks) == 3
 
         assert chunks[0].symbol_name == "Introduction"
