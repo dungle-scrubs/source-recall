@@ -381,7 +381,8 @@ requests, this lock causes problems:
   same collision
 
 The daemon MUST own refresh serialization internally via a
-per-repo `asyncio.Lock` (or threading lock). All refresh
+per-repo `threading.Lock` (FastAPI sync endpoints run in a
+threadpool, so `asyncio.Lock` would not work). All refresh
 requests — targeted, periodic, and auto-index — go through
 this lock. The behavior when a refresh is already in progress:
 
