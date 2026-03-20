@@ -282,13 +282,13 @@ class IndexStore:
     @param db_path: Path to the index.db file.
     """
 
-    _sp_counter: int = 0  # Monotonic savepoint name counter.
-
     def __init__(self, db_path: Path, *, build_mode: bool = False) -> None:
         self.db_path = db_path
         self._build_mode = build_mode
         self._conn: sqlite3.Connection | None = None
         self._vec_conn: Any = None  # apsw.Connection, lazily opened
+        self._batch_depth: int = 0
+        self._sp_counter: int = 0  # Per-instance savepoint counter.
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -301,7 +301,10 @@ class IndexStore:
             return self._conn
 
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self.db_path))
+        # check_same_thread=False is safe here: WAL mode + busy_timeout
+        # handle concurrent access, and the server runs sync endpoints in
+        # a threadpool that may differ from the lifespan startup thread.
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA busy_timeout = 5000")
         # Build targets use atomic_swap — NORMAL is safe and faster.
@@ -1106,10 +1109,10 @@ class IndexStore:
 
         @returns: Generator that commits on success, rolls back on error.
         """
-        if getattr(self, "_batch", False):
+        if self._batch_depth > 0:
             # Already inside batch_mode — use savepoint for atomicity.
-            IndexStore._sp_counter += 1
-            sp = f"sp_{IndexStore._sp_counter}"
+            self._sp_counter += 1
+            sp = f"sp_{self._sp_counter}"
             self.conn.execute(f"SAVEPOINT {sp}")
             try:
                 yield
@@ -1134,25 +1137,43 @@ class IndexStore:
         etc.) call commit() after each operation. Inside batch_mode, those
         commits are suppressed and a single commit is issued at the end.
 
+        Re-entrant: nested batch_mode calls use savepoints instead of
+        a new BEGIN/COMMIT, so the outermost batch controls the commit.
+
         @returns: Generator that commits on success, rolls back on error.
         """
-        self._batch = True
-        self.conn.execute("BEGIN")
-        try:
-            yield
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
-        finally:
-            self._batch = False
+        self._batch_depth += 1
+        if self._batch_depth == 1:
+            # Outermost batch — open a real transaction.
+            self.conn.execute("BEGIN")
+            try:
+                yield
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+            finally:
+                self._batch_depth = 0
+        else:
+            # Nested batch — use savepoint for atomicity.
+            self._sp_counter += 1
+            sp = f"batch_{self._sp_counter}"
+            self.conn.execute(f"SAVEPOINT {sp}")
+            try:
+                yield
+                self.conn.execute(f"RELEASE {sp}")
+            except Exception:
+                self.conn.execute(f"ROLLBACK TO {sp}")
+                raise
+            finally:
+                self._batch_depth -= 1
 
     def _auto_commit(self) -> None:
         """Commit unless inside batch_mode.
 
         Called by individual write methods instead of raw conn.commit().
         """
-        if not getattr(self, "_batch", False):
+        if self._batch_depth == 0:
             self.conn.commit()
 
     @staticmethod
