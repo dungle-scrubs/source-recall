@@ -8,20 +8,30 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    # Pinned exactly — C ABI breaks across minor versions.
+    # See AGENTS.md "tree-sitter pins are exact".
     "tree-sitter==0.25.2",
     "tree-sitter-language-pack==0.13.0",
     "typer>=0.15.0",
     "rich>=13.0.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
+    # L4: Pre-1.0 — vec0 virtual-table API may change.
+    # Pinned exactly; monitor for 1.0 release.
     "sqlite-vec==0.1.6",
-    "sentence-transformers>=3.0.0",
-    "onnxruntime>=1.18.0",
-    "einops>=0.8.0",
+    # L5: Minor upgrades may change embedding behavior. Stored vectors
+    # could become incompatible with new query vectors.  Consider
+    # storing the library version in meta for compat checking.
+    "sentence-transformers>=3.0.0,<4.0.0",
+    "onnxruntime>=1.18.0,<2.0.0",
+    "einops>=0.8.0,<1.0.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.32.0",
     "pymupdf>=1.24.0",
-    "apsw>=3.52.0.0",
+    # L6: apsw bundles its own SQLite.  A major upgrade could bundle a
+    # version incompatible with stdlib sqlite3 (both access the same
+    # WAL file).  Pin conservatively.
+    "apsw>=3.49.0.0,<4.0.0.0",
 ]
 
 [dependency-groups]
@@ -34,7 +44,7 @@ dev = [
 sr = "source_recall.cli:app"
 
 [build-system]
-requires = ["uv_build>=0.9.26,<0.10.0"]
+requires = ["uv_build>=0.9.26,<0.11.0"]
 build-backend = "uv_build"
 
 [tool.ruff]

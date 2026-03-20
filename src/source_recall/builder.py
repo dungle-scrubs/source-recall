@@ -61,78 +61,84 @@ class IndexBuilder:
         IndexStore.acquire_lock(db_path, timeout=5)
 
         try:
-            # Clean stale tmp files from previous crashed builds.
-            IndexStore.clean_tmp_files(db_path)
-
-            # Build into a temp file.
-            tmp_path = db_path.parent / f"{db_path.name}.tmp.{os.getpid()}"
-            tmp_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with IndexStore(tmp_path, build_mode=True) as store:
-                store.create_schema()
-
-                # Set up vector table if embedder is available.
-                vec_enabled = False
-                if self.embedder is not None:
-                    vec_enabled = store.ensure_vec_table(self.embedder.dimensions)
-                    if not vec_enabled:
-                        logger.warning(
-                            "sqlite-vec unavailable — building FTS-only index"
-                        )
-
-                # Detect current branch for branch-aware indexing.
-                branch = self._get_current_branch()
-
-                # Discover and index files.
-                files = self._discover_files()
-                total = len(files)
-
-                # Collect chunks for batch embedding.
-                pending_vectors: list[tuple[str, str]] = []  # (chunk_id, content)
-
-                for i, rel_path in enumerate(files):
-                    if self.on_progress:
-                        self.on_progress(rel_path, i + 1, total)
-                    chunk_ids = self._index_file(store, rel_path, branch=branch)
-
-                    if vec_enabled and self.embedder is not None:
-                        for cid, content in chunk_ids:
-                            pending_vectors.append((cid, content))
-
-                        # Batch embed when we have enough.
-                        if len(pending_vectors) >= self.config.embed_batch_size:
-                            self._flush_vectors(store, pending_vectors)
-                            pending_vectors.clear()
-
-                # Flush remaining vectors.
-                if pending_vectors and vec_enabled and self.embedder is not None:
-                    self._flush_vectors(store, pending_vectors)
-
-                # Write meta.
-                meta = {
-                    "repo_path": str(self.repo_path),
-                    "indexed_at": _now_iso(),
-                    "last_commit": _git_head(self.repo_path) or "",
-                    "repo_root_commit": _git_root_commit(self.repo_path) or "",
-                    "repo_remote_url_hash": _git_remote_hash(self.repo_path) or "",
-                    "active_branch": branch,
-                }
-                if vec_enabled and self.embedder is not None:
-                    meta["embed_model"] = type(self.embedder).__name__
-                    meta["embed_dimensions"] = str(self.embedder.dimensions)
-                    chunk_count = store.get_chunk_count()
-                    vec_count = store.get_vector_count()
-                    coverage = vec_count / chunk_count if chunk_count > 0 else 0.0
-                    meta["embed_coverage"] = f"{coverage:.4f}"
-                store.set_meta_batch(meta)
-
-            # Atomic swap (after store is closed by context manager).
-            IndexStore.atomic_swap(tmp_path, db_path)
-
+            self._build_locked(db_path)
         finally:
             IndexStore.release_lock(db_path)
 
         return db_path
+
+    def _build_locked(self, db_path: Path) -> None:
+        """Build logic that assumes the caller already holds the lock.
+
+        @param db_path: Path to the final index.db.
+        """
+        # Clean stale tmp files from previous crashed builds.
+        IndexStore.clean_tmp_files(db_path)
+
+        # Build into a temp file.
+        tmp_path = db_path.parent / f"{db_path.name}.tmp.{os.getpid()}"
+        tmp_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with IndexStore(tmp_path, build_mode=True) as store:
+            store.create_schema()
+
+            # Set up vector table if embedder is available.
+            vec_enabled = False
+            if self.embedder is not None:
+                vec_enabled = store.ensure_vec_table(self.embedder.dimensions)
+                if not vec_enabled:
+                    logger.warning(
+                        "sqlite-vec unavailable — building FTS-only index"
+                    )
+
+            # Detect current branch for branch-aware indexing.
+            branch = self._get_current_branch()
+
+            # Discover and index files.
+            files = self._discover_files()
+            total = len(files)
+
+            # Collect chunks for batch embedding.
+            pending_vectors: list[tuple[str, str]] = []  # (chunk_id, content)
+
+            for i, rel_path in enumerate(files):
+                if self.on_progress:
+                    self.on_progress(rel_path, i + 1, total)
+                chunk_ids = self._index_file(store, rel_path, branch=branch)
+
+                if vec_enabled and self.embedder is not None:
+                    for cid, content in chunk_ids:
+                        pending_vectors.append((cid, content))
+
+                    # Batch embed when we have enough.
+                    if len(pending_vectors) >= self.config.embed_batch_size:
+                        self._flush_vectors(store, pending_vectors)
+                        pending_vectors.clear()
+
+            # Flush remaining vectors.
+            if pending_vectors and vec_enabled and self.embedder is not None:
+                self._flush_vectors(store, pending_vectors)
+
+            # Write meta.
+            meta = {
+                "repo_path": str(self.repo_path),
+                "indexed_at": _now_iso(),
+                "last_commit": _git_head(self.repo_path) or "",
+                "repo_root_commit": _git_root_commit(self.repo_path) or "",
+                "repo_remote_url_hash": _git_remote_hash(self.repo_path) or "",
+                "active_branch": branch,
+            }
+            if vec_enabled and self.embedder is not None:
+                meta["embed_model"] = type(self.embedder).__name__
+                meta["embed_dimensions"] = str(self.embedder.dimensions)
+                chunk_count = store.get_chunk_count()
+                vec_count = store.get_vector_count()
+                coverage = vec_count / chunk_count if chunk_count > 0 else 0.0
+                meta["embed_coverage"] = f"{coverage:.4f}"
+            store.set_meta_batch(meta)
+
+        # Atomic swap (after store is closed by context manager).
+        IndexStore.atomic_swap(tmp_path, db_path)
 
     def refresh(self) -> int:
         """Incremental refresh: only re-index changed files.
@@ -165,11 +171,10 @@ class IndexBuilder:
 
                 # If too many changes, full rebuild is more efficient.
                 if len(changed_files) > 500:
-                    # Close store (via context manager exit) before rebuild.
-                    # build() acquires its own lock, so release ours first.
+                    # Close store before rebuild, but keep the lock held
+                    # to prevent a race with concurrent builders.
                     store.close()
-                    IndexStore.release_lock(db_path)
-                    self.build()
+                    self._build_locked(db_path)
                     return len(changed_files)
 
                 # Set up vectors for refresh if embedder available.
@@ -180,15 +185,11 @@ class IndexBuilder:
                 # Incremental update.
                 total = len(changed_files)
                 pending_vectors: list[tuple[str, str]] = []
+                # Track files that need vector cleanup (deferred until
+                # after the sqlite3 batch commits — see C1 atomicity).
+                vec_dirty_files: list[str] = []
 
-                # Phase 1: Delete old vectors (apsw connection — must
-                # happen outside the sqlite3 batch to avoid write
-                # contention between the two connections in WAL mode).
-                if vec_enabled:
-                    for rel_path, _action in changed_files:
-                        store.delete_vectors_by_file(rel_path)
-
-                # Phase 2: Batch sqlite3 writes (chunks, FTS, refs,
+                # Phase 1: Batch sqlite3 writes (chunks, FTS, refs,
                 # file_hashes) in a single transaction.
                 with store.batch_mode():
                     for i, (rel_path, action) in enumerate(changed_files):
@@ -198,6 +199,9 @@ class IndexBuilder:
                         store.delete_chunks_for_file(rel_path)
                         store.delete_file_hash(rel_path)
 
+                        if vec_enabled:
+                            vec_dirty_files.append(rel_path)
+
                         if action != "delete":
                             chunk_ids = self._index_file(store, rel_path, branch=branch)
 
@@ -205,7 +209,16 @@ class IndexBuilder:
                                 for cid, content in chunk_ids:
                                     pending_vectors.append((cid, content))
 
-                # Phase 3: Insert new vectors (apsw connection).
+                # Phase 2: Vector cleanup + insert (apsw connection).
+                # MUST run AFTER the sqlite3 batch commits.  The apsw
+                # connection is an independent WAL reader and cannot see
+                # uncommitted rows from the sqlite3 connection.  If you
+                # move vector ops inside batch_mode(), JOINs against the
+                # chunks table will miss the new rows (H5).
+                if vec_enabled:
+                    for rel_path in vec_dirty_files:
+                        store.delete_vectors_by_file(rel_path)
+
                 if pending_vectors and vec_enabled and self.embedder is not None:
                     self._flush_vectors(store, pending_vectors)
 
@@ -342,11 +355,12 @@ class IndexBuilder:
 
         # PDF files need binary extraction via pymupdf.
         if full.suffix.lower() == ".pdf":
-            return self._index_pdf(store, rel_path, full)
+            return self._index_pdf(store, rel_path, full, branch=branch)
 
         try:
             content = full.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            logger.warning("Skipping unreadable file: %s", rel_path, exc_info=True)
             return []
 
         content_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -394,13 +408,14 @@ class IndexBuilder:
         return chunk_pairs
 
     def _index_pdf(
-        self, store: IndexStore, rel_path: str, full: Path
+        self, store: IndexStore, rel_path: str, full: Path, branch: str = ""
     ) -> list[tuple[str, str]]:
         """Extract text from a PDF and index its chunks.
 
         @param store: IndexStore to write to.
         @param rel_path: Repo-relative path.
         @param full: Absolute path to the PDF file.
+        @param branch: Branch name for branch-aware indexing.
         @returns: List of (chunk_id, content) tuples for embedding.
         """
         try:
@@ -408,7 +423,11 @@ class IndexBuilder:
         except Exception:
             return []
 
-        # Use file mtime as hash proxy for PDFs.
+        # Use file mtime as hash proxy for PDFs (avoids reading
+        # entire binary for hashing).  Trade-off: if mtime is restored
+        # (e.g. rsync --times, touch -t) after content changes, the
+        # file won't be detected as changed during incremental refresh.
+        # A full rebuild always catches this (M5).
         try:
             mtime_ns = full.stat().st_mtime_ns
             content_hash = hashlib.sha256(str(mtime_ns).encode()).hexdigest()
@@ -418,7 +437,7 @@ class IndexBuilder:
 
         chunk_pairs: list[tuple[str, str]] = []
         if chunks:
-            store.insert_chunks(chunks)
+            store.insert_chunks(chunks, branch=branch)
             chunk_pairs = [(c.chunk_id, c.content) for c in chunks]
 
         parse_mode = ParseMode(quality.value)
@@ -428,7 +447,8 @@ class IndexBuilder:
                 content_hash=content_hash,
                 parse_mode=parse_mode,
                 mtime_ns=mtime_ns,
-            )
+            ),
+            branch=branch,
         )
 
         return chunk_pairs
@@ -473,11 +493,13 @@ class IndexBuilder:
 
         if git_changed is not None:
             changes: list[tuple[str, str]] = []
+            seen: set[str] = set()  # O(1) dedup instead of O(n) list scan.
             for rel_path in git_changed:
                 full = self.repo_path / rel_path
                 if not full.exists():
-                    if rel_path in stored_hashes:
+                    if rel_path in stored_hashes and rel_path not in seen:
                         changes.append((rel_path, "delete"))
+                        seen.add(rel_path)
                     continue
 
                 # Check if content actually changed.
@@ -489,18 +511,22 @@ class IndexBuilder:
 
                 stored = stored_hashes.get(rel_path)
                 if stored is None or stored.content_hash != new_hash:
-                    changes.append((rel_path, "update"))
+                    if rel_path not in seen:
+                        changes.append((rel_path, "update"))
+                        seen.add(rel_path)
 
             # Also check for newly added files not in stored hashes.
             current_files = set(self._discover_files())
             for rel_path in current_files - set(stored_hashes.keys()):
-                if (rel_path, "update") not in changes:
+                if rel_path not in seen:
                     changes.append((rel_path, "update"))
+                    seen.add(rel_path)
 
             # Check for deleted files.
             for rel_path in set(stored_hashes.keys()) - current_files:
-                if (rel_path, "delete") not in changes:
+                if rel_path not in seen:
                     changes.append((rel_path, "delete"))
+                    seen.add(rel_path)
 
             return changes
 

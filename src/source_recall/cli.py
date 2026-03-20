@@ -6,10 +6,14 @@ import json
 import logging
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
 from rich.syntax import Syntax
+
+if TYPE_CHECKING:
+    from source_recall.models import IndexStatus
 
 app = typer.Typer(
     name="sr",
@@ -416,7 +420,7 @@ def list_indexes(
                 modes = dict(mode_rows)
                 ast_files = modes.get("ast", 0)
                 regex_files = modes.get("regex", 0)
-                text_files = modes.get("text", 0)
+                text_files = modes.get("text_fallback", 0)
 
                 # Vector count — query via store's apsw connection
                 # which loads sqlite-vec extension automatically.
@@ -573,6 +577,7 @@ def clean(
                 {
                     "index_dir": str(d),
                     "repo_path": stored_path,
+                    "action": "would_remove" if dry_run else "removed",
                 }
             )
 
@@ -673,18 +678,12 @@ def serve(
         for rp in repo_paths:
             err_console.print(f"  • {rp.name} → {rp}")
 
-    # Set rerank config via env before Index creation.
-    # This is process-scoped (serve blocks until exit), not a leak.
-    if rerank:
-        import os
-
-        os.environ["SR_RERANK_ENABLED"] = "true"
-
     if no_embed:
         err_console.print("  FTS-only mode (embeddings disabled)")
     else:
         err_console.print("  Loading model (first time may download ~522 MB)...")
 
+    # Build the app with explicit config instead of mutating os.environ.
     if no_embed:
         server_app = create_app(repo_paths, embedder=None)
     else:
@@ -701,7 +700,7 @@ def serve(
 # ---------------------------------------------------------------------------
 
 
-def _status_to_dict(s: object) -> dict[str, object]:
+def _status_to_dict(s: IndexStatus) -> dict[str, object]:
     """Convert an IndexStatus to a JSON-serializable dict.
 
     Adds computed fields like vector_coverage_pct and human-readable size.
@@ -710,37 +709,37 @@ def _status_to_dict(s: object) -> dict[str, object]:
     @returns: Dict with all status fields plus computed helpers.
     """
     vec_pct = (
-        round(s.vector_count / s.chunk_count * 100, 1)  # type: ignore[union-attr]
-        if s.chunk_count > 0  # type: ignore[union-attr]
+        round(s.vector_count / s.chunk_count * 100, 1)
+        if s.chunk_count > 0
         else 0
     )
     return {
-        "repo_path": s.repo_path,  # type: ignore[union-attr]
-        "db_path": s.db_path,  # type: ignore[union-attr]
-        "db_size_bytes": s.db_size_bytes,  # type: ignore[union-attr]
-        "db_size_human": _format_bytes(s.db_size_bytes),  # type: ignore[union-attr]
-        "indexed_at": s.indexed_at,  # type: ignore[union-attr]
-        "last_commit": s.last_commit,  # type: ignore[union-attr]
-        "file_count": s.file_count,  # type: ignore[union-attr]
-        "chunk_count": s.chunk_count,  # type: ignore[union-attr]
-        "ast_files": s.ast_files,  # type: ignore[union-attr]
-        "regex_files": s.regex_files,  # type: ignore[union-attr]
-        "text_fallback_files": s.text_fallback_files,  # type: ignore[union-attr]
-        "vector_count": s.vector_count,  # type: ignore[union-attr]
+        "repo_path": s.repo_path,
+        "db_path": s.db_path,
+        "db_size_bytes": s.db_size_bytes,
+        "db_size_human": _format_bytes(s.db_size_bytes),
+        "indexed_at": s.indexed_at,
+        "last_commit": s.last_commit,
+        "file_count": s.file_count,
+        "chunk_count": s.chunk_count,
+        "ast_files": s.ast_files,
+        "regex_files": s.regex_files,
+        "text_fallback_files": s.text_fallback_files,
+        "vector_count": s.vector_count,
         "vector_coverage_pct": vec_pct,
-        "embed_model": s.embed_model,  # type: ignore[union-attr]
-        "embed_dimensions": s.embed_dimensions,  # type: ignore[union-attr]
+        "embed_model": s.embed_model,
+        "embed_dimensions": s.embed_dimensions,
     }
 
 
-def _format_bytes(n: int) -> str:
+def _format_bytes(n: int | float) -> str:
     """Format bytes as human-readable size.
 
-    @param n: Number of bytes.
+    @param n: Number of bytes (int from stat, float during conversion).
     @returns: Formatted string (e.g. '12.4 MB').
     """
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
-            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} {unit}"
         n /= 1024
     return f"{n:.1f} TB"

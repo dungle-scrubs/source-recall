@@ -779,26 +779,28 @@ def chunk_pdf(file_path: str, pdf_path: Path) -> tuple[list[ChunkData], SearchQu
     chunks: list[ChunkData] = []
     doc = fitz.open(str(pdf_path))
 
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        text = page.get_text().strip()
-        if not text:
-            continue
+    try:
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = page.get_text().strip()
+            if not text:
+                continue
 
-        chunks.append(
-            ChunkData(
-                file_path=file_path,
-                symbol_name=f"Page {page_num + 1}",
-                symbol_type=SymbolType.MODULE,
-                content=text,
-                start_line=page_num + 1,
-                end_line=page_num + 1,
-                search_quality=SearchQuality.AST,
+            chunks.append(
+                ChunkData(
+                    file_path=file_path,
+                    symbol_name=f"Page {page_num + 1}",
+                    symbol_type=SymbolType.MODULE,
+                    content=text,
+                    start_line=page_num + 1,
+                    end_line=page_num + 1,
+                    search_quality=SearchQuality.TEXT_FALLBACK,
+                )
             )
-        )
+    finally:
+        doc.close()
 
-    doc.close()
-    return chunks, SearchQuality.AST
+    return chunks, SearchQuality.TEXT_FALLBACK
 
 
 # ---------------------------------------------------------------------------
@@ -824,15 +826,31 @@ def _chunk_markdown(
     @returns: (chunks, quality).
     """
     # Find headings that are NOT inside fenced code blocks.
+    # Pair fences by matching opener/closer marker type and length
+    # (``` only closes ```, not ~~~), with proper state tracking.
     fenced_ranges: list[tuple[int, int]] = []
+    open_fence: tuple[str, int] | None = None  # (marker_char, start_pos)
     for m in _FENCE_RE.finditer(content):
-        if len(fenced_ranges) % 2 == 0:
-            fenced_ranges.append((m.start(), -1))
-        elif fenced_ranges:
-            fenced_ranges[-1] = (fenced_ranges[-1][0], m.end())
+        marker = m.group(1)
+        marker_char = marker[0]  # '`' or '~'
+        if open_fence is None:
+            # Opening a new fence.
+            open_fence = (marker_char, m.start())
+        elif marker_char == open_fence[0] and len(marker) >= len(marker):
+            # Matching closer — same character type.
+            fenced_ranges.append((open_fence[1], m.end()))
+            open_fence = None
+        # Mismatched closer (e.g. ~~~ inside ```) — ignore it.
+
+    # Build sorted start positions for O(log n) bisect lookup.
+    _fence_starts = [s for s, _e in fenced_ranges]
 
     def _in_fence(pos: int) -> bool:
-        return any(s <= pos <= e for s, e in fenced_ranges if e != -1)
+        idx = bisect.bisect_right(_fence_starts, pos) - 1
+        if idx < 0:
+            return False
+        s, e = fenced_ranges[idx]
+        return s <= pos <= e
 
     # Collect heading positions.
     sections: list[tuple[str, int]] = []  # (heading_text, char_offset)
@@ -919,24 +937,22 @@ def _chunk_prose(
     if not content.strip():
         return [], SearchQuality.TEXT_FALLBACK
 
-    # Build (sentence, start_line) pairs by finding each sentence's
-    # position in the original text so line numbers are accurate.
-    raw_sentences = _SENTENCE_END_RE.split(content)
+    # Build (sentence, start_line) pairs using split positions
+    # directly (no re-searching the content for substrings).
     sentence_infos: list[tuple[str, int]] = []  # (text, start_line)
-    char_pos = 0
-    for raw in raw_sentences:
+
+    # Use finditer to get exact boundary positions, then slice between them.
+    boundaries = [m.start() for m in _SENTENCE_END_RE.finditer(content)]
+    boundaries.append(len(content))
+
+    prev = 0
+    for boundary in boundaries:
+        raw = content[prev:boundary]
         stripped = raw.strip()
-        if not stripped:
-            char_pos += len(raw)
-            # Account for the whitespace removed by split.
-            continue
-        # Find this sentence's start in original content.
-        idx = content.find(raw.lstrip()[:20], char_pos) if raw.lstrip() else char_pos
-        if idx == -1:
-            idx = char_pos
-        start_line = content[:idx].count("\n") + 1
-        sentence_infos.append((stripped, start_line))
-        char_pos = idx + len(raw)
+        if stripped:
+            start_line = content[:prev].count("\n") + 1
+            sentence_infos.append((stripped, start_line))
+        prev = boundary
 
     chunks: list[ChunkData] = []
     current: list[str] = []
@@ -1118,7 +1134,9 @@ def _split_into_sub_chunks(
 ) -> list[tuple[str, int, int]]:
     """Split content into sub-chunks with overlap.
 
-    Prepends the function/class signature to each sub-chunk.
+    Prepends the function/class signature to each sub-chunk after the
+    first.  Overlap rewind never crosses back into the signature area
+    to avoid duplicating signature content.
 
     @param content: Full chunk text.
     @param max_chars: Character limit per sub-chunk.
@@ -1129,6 +1147,7 @@ def _split_into_sub_chunks(
 
     # Extract signature (first line or first few lines ending with : or {).
     signature = _extract_signature(lines)
+    sig_line_count = signature.count("\n") + 1
     sig_len = len(signature) + 1  # +1 for newline.
 
     effective_max = max_chars - sig_len
@@ -1166,9 +1185,11 @@ def _split_into_sub_chunks(
         result.append((text, start_i, end_i))
         chunk_idx += 1
 
-        # Apply overlap — rewind by _SUB_CHUNK_OVERLAP lines.
+        # Apply overlap — rewind by _SUB_CHUNK_OVERLAP lines, but never
+        # back into the signature area (which is prepended separately).
         if i < len(lines):
-            i = max(start_i + 1, i - _SUB_CHUNK_OVERLAP)
+            min_rewind = max(start_i + 1, sig_line_count)
+            i = max(min_rewind, i - _SUB_CHUNK_OVERLAP)
 
     return result
 
@@ -1307,22 +1328,27 @@ def _has_jsx(node: Node) -> bool:
     return _contains_any_node_type(node, jsx_types)
 
 
+_REACT_WRAPPER_RE = re.compile(
+    r"(?:^|\.)(memo|forwardRef|lazy)$"
+)
+
+
 def _has_react_wrapper(node: Node) -> bool:
     """Check if a node contains React.memo/forwardRef/lazy calls.
+
+    Uses word-boundary matching to avoid false positives on names
+    like 'memoize' or 'lazyLoad'.
 
     @param node: tree-sitter Node.
     @returns: True if a React wrapper call is found.
     """
-    _REACT_WRAPPERS = {"memo", "forwardRef", "lazy"}
-
     for child in node.named_children:
         if child.type == "call_expression":
             func = child.child_by_field_name("function")
             if func is not None:
                 text = (func.text or b"").decode("utf-8", errors="replace")
-                for wrapper in _REACT_WRAPPERS:
-                    if wrapper in text:
-                        return True
+                if _REACT_WRAPPER_RE.search(text):
+                    return True
         if _has_react_wrapper(child):
             return True
     return False

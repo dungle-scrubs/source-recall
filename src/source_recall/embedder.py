@@ -51,6 +51,12 @@ class Embedder(Protocol):
 
 _CODERANK_MODEL = "nomic-ai/CodeRankEmbed"
 _CODERANK_DIMENSIONS = 768
+# Pin to a known-good revision to limit supply-chain risk from
+# trust_remote_code=True.  Bump only after auditing the diff.
+# Risk: if the HuggingFace CDN is compromised at this exact
+# revision, the pin alone won't help.  Consider adding a SHA-256
+# checksum verification of downloaded model files as defense-in-depth (M1).
+_CODERANK_REVISION = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
 _QUERY_PREFIX = "Represent this query for searching relevant code: "
 
 
@@ -89,6 +95,7 @@ class CodeRankEmbedder:
         self._model = SentenceTransformer(
             _CODERANK_MODEL,
             trust_remote_code=True,
+            revision=_CODERANK_REVISION,
             device="cpu",
         )
         # The model defaults to 8192 tokens — attention is O(n²) so

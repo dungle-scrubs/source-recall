@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -110,13 +111,23 @@ def resolve_config(
         toml_path = Path(repo_path) / ".source-recall.toml"
         toml_values = _load_toml(toml_path)
 
-    # TOML provides defaults that env vars and overrides can beat.
-    # pydantic-settings reads env vars automatically.
-    merged = {**toml_values, **overrides}
+    # Determine which fields are explicitly set via SR_ env vars.
+    # pydantic-settings init kwargs beat env vars, so we must exclude
+    # TOML values for fields that have an env var set — otherwise TOML
+    # would incorrectly override the env var.
+    env_prefix = "SR_"
+    env_keys = {
+        name
+        for name in SRConfig.model_fields
+        if f"{env_prefix}{name.upper()}" in os.environ
+    }
 
-    # Filter out None values so pydantic defaults aren't overridden by None.
-    merged = {k: v for k, v in merged.items() if v is not None}
+    # Layer: start with TOML (lowest), exclude fields set by env vars,
+    # then apply explicit overrides (highest).
+    merged = {k: v for k, v in toml_values.items() if k not in env_keys}
+    merged.update({k: v for k, v in overrides.items() if v is not None})
 
+    # SRConfig reads SR_ env vars automatically via pydantic-settings.
     return SRConfig(**merged)
 
 

@@ -74,6 +74,7 @@ class Index:
             self._embedder = embedder  # type: ignore[assignment]
 
         self._reranker: object = _SENTINEL  # Lazy-loaded.
+        self._querier: object | None = None  # Cached IndexQuerier.
 
     @staticmethod
     def _create_default_embedder() -> Embedder | None:
@@ -117,6 +118,25 @@ class Index:
             self._reranker = None
         return self._reranker
 
+    def close(self) -> None:
+        """Close underlying database connections.
+
+        Safe to call multiple times. Should be called when the Index
+        is no longer needed, or use the context manager instead.
+        """
+        self._close_querier()
+
+    def __enter__(self) -> Index:
+        """Context manager entry.
+
+        @returns: Self.
+        """
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        """Context manager exit — closes connections."""
+        self.close()
+
     def build(self) -> Path:
         """Build the full index with atomic swap.
 
@@ -124,6 +144,8 @@ class Index:
         """
         from source_recall.builder import IndexBuilder
 
+        # Invalidate cached querier — the DB will be replaced.
+        self._close_querier()
         builder = IndexBuilder(
             self.repo_path, self.config, self._on_progress, self._embedder
         )
@@ -136,10 +158,36 @@ class Index:
         """
         from source_recall.builder import IndexBuilder
 
+        # Invalidate cached querier — the DB may change.
+        self._close_querier()
         builder = IndexBuilder(
             self.repo_path, self.config, self._on_progress, self._embedder
         )
         return builder.refresh()
+
+    def _close_querier(self) -> None:
+        """Close and discard the cached querier."""
+        if self._querier is not None:
+            self._querier.close()  # type: ignore[union-attr]
+            self._querier = None
+
+    def _get_querier(self) -> object:
+        """Get or create a cached IndexQuerier.
+
+        Reuses the same querier (and DB connection) across queries
+        to avoid per-query migration checks and connection overhead.
+
+        @returns: IndexQuerier instance.
+        """
+        if self._querier is not None:
+            return self._querier
+
+        from source_recall.querier import IndexQuerier
+
+        self._querier = IndexQuerier(
+            self.repo_path, self.config, self._embedder, self._get_reranker()
+        )
+        return self._querier
 
     def query(
         self,
@@ -155,25 +203,13 @@ class Index:
         @param branch: Filter to this branch. None = active branch.
         @returns: Ranked list of QueryResult.
         """
-        from source_recall.querier import IndexQuerier
-
-        querier = IndexQuerier(
-            self.repo_path, self.config, self._embedder, self._get_reranker()
-        )
-        try:
-            return querier.query(question, top_k=top_k, branch=branch)
-        finally:
-            querier.close()
+        querier = self._get_querier()
+        return querier.query(question, top_k=top_k, branch=branch)  # type: ignore[union-attr]
 
     def status(self) -> IndexStatus:
         """Get index status information.
 
         @returns: IndexStatus with all metrics.
         """
-        from source_recall.querier import IndexQuerier
-
-        querier = IndexQuerier(self.repo_path, self.config)
-        try:
-            return querier.status()
-        finally:
-            querier.close()
+        querier = self._get_querier()
+        return querier.status()  # type: ignore[union-attr]
