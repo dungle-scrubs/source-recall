@@ -1468,3 +1468,39 @@ class TestM8UnclosedFence:
         heading_names = [c.symbol_name for c in chunks if c.symbol_name]
         assert "Before" in heading_names
         assert "Not A Real Heading" not in heading_names
+
+
+# ---------------------------------------------------------------------------
+# H2: Vector flush must happen after batch_mode commits
+# ---------------------------------------------------------------------------
+
+
+class TestVectorFlushOrdering:
+    def test_vectors_flushed_after_batch_commits(self, tmp_path: Path) -> None:
+        """All vector flushes happen after batch_mode commits (H2 audit fix).
+
+        The apsw connection can't see uncommitted sqlite3 rows.  If
+        _flush_vectors runs inside batch_mode, the vec_chunks JOIN against
+        chunks would miss new rows.  Verify vectors are searchable after
+        a full build by checking every chunk has a matching vector.
+        """
+        import shutil
+
+        from source_recall import Index
+
+        src = Path(__file__).parent / "fixtures" / "py-app"
+        repo = tmp_path / "vec_flush_repo"
+        shutil.copytree(src, repo)
+
+        # Use a tiny batch size to force mid-build flushes.
+        embedder = BagOfWordsEmbedder(dimensions=64)
+        idx = Index(repo, embedder=embedder, embed_batch_size=2)
+        idx.build()
+
+        s = idx.status()
+        assert s.chunk_count > 0
+        # Every chunk should have a vector.
+        assert s.vector_count == s.chunk_count, (
+            f"Vector count ({s.vector_count}) != chunk count ({s.chunk_count}). "
+            "Vectors may have been flushed before chunks were committed."
+        )
