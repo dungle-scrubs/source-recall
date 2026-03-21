@@ -261,6 +261,38 @@ class TestDuplicateChunkInsert:
         store.insert_chunks([chunk])  # Same exact data → same chunk_id.
         assert store.get_chunk_count() == 1  # Not 2.
 
+    def test_reinsert_without_branch_skips_fts_churn(self, store: IndexStore) -> None:
+        """Re-inserting identical chunk without branch skips INSERT OR REPLACE.
+
+        INSERT OR REPLACE fires DELETE + INSERT triggers, generating FTS
+        tombstones even when content is unchanged.  The fix: detect existing
+        identical chunks and skip the re-insert entirely (H1 audit fix).
+        """
+        chunk = ChunkData(
+            file_path="a.py",
+            symbol_name="foo",
+            symbol_type=SymbolType.FUNCTION,
+            content="def foo(): pass",
+            start_line=1,
+            end_line=1,
+        )
+        store.insert_chunks([chunk])
+
+        # FTS shadow table row count before re-insert — tombstones grow this.
+        fts_data_before = store.conn.execute(
+            "SELECT COUNT(*) FROM chunks_fts_data"
+        ).fetchone()[0]
+
+        # Re-insert same chunk without branch — should be a no-op.
+        store.insert_chunks([chunk])
+
+        # FTS shadow table should not grow (no DELETE+INSERT tombstone pair).
+        fts_data_after = store.conn.execute(
+            "SELECT COUNT(*) FROM chunks_fts_data"
+        ).fetchone()[0]
+        assert fts_data_after == fts_data_before
+        assert store.get_chunk_count() == 1
+
 
 class TestFileHashes:
     def test_upsert_and_get(self, store: IndexStore) -> None:
