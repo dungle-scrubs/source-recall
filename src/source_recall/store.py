@@ -589,10 +589,26 @@ class IndexStore:
                 )
 
     def delete_chunks_for_file(self, file_path: str) -> None:
-        """Delete all chunks belonging to a file. Cascades to FTS via trigger.
+        """Delete all chunks belonging to a file.
+
+        Explicitly removes refs and symbol_lookup entries before deleting
+        chunks.  The foreign key CASCADE is kept as defense-in-depth, but
+        this explicit cleanup ensures correctness even if a connection
+        forgets ``PRAGMA foreign_keys = ON`` (H-2 fix).
+
+        FTS is updated automatically via the ``chunks_ad`` trigger.
 
         @param file_path: Repo-relative file path.
         """
+        self.conn.execute(
+            "DELETE FROM refs WHERE source_chunk_id IN "
+            "(SELECT id FROM chunks WHERE file_path = ?)",
+            (file_path,),
+        )
+        self.conn.execute(
+            "DELETE FROM symbol_lookup WHERE file_path = ?",
+            (file_path,),
+        )
         self.conn.execute("DELETE FROM chunks WHERE file_path = ?", (file_path,))
         self._auto_commit()
 
