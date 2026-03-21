@@ -32,6 +32,7 @@ dependencies = [
     # version incompatible with stdlib sqlite3 (both access the same
     # WAL file).  Pin conservatively.
     "apsw>=3.49.0.0,<4.0.0.0",
+    "httpx>=0.28.1",
 ]
 
 [dependency-groups]
