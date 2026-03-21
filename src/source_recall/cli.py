@@ -1,4 +1,4 @@
-"""CLI: sr index, sr ask, sr status, sr list, sr clean, sr config show."""
+"""CLI: sr index, sr ask, sr status, sr list, sr clean, sr config show, sr daemon."""
 
 from __future__ import annotations
 
@@ -146,6 +146,60 @@ def index(
 # ---------------------------------------------------------------------------
 
 
+_DEFAULT_DAEMON_URL = "http://127.0.0.1:7249"
+
+
+def _daemon_url() -> str:
+    """Get the daemon base URL.
+
+    @returns: Base URL string.
+    """
+    import os
+
+    return os.environ.get("SR_DAEMON_URL", _DEFAULT_DAEMON_URL)
+
+
+def _try_daemon_query(
+    question: str,
+    *,
+    top_k: int | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+) -> object | None:
+    """Attempt to query the daemon. Returns response or None if down.
+
+    @param question: Search query.
+    @param top_k: Max results.
+    @param repo: Repo name filter.
+    @param branch: Branch filter.
+    @returns: httpx.Response or None if daemon unreachable.
+    """
+    import httpx
+
+    url = f"{_daemon_url()}/query"
+    payload: dict[str, object] = {"question": question}
+    if top_k:
+        payload["top_k"] = top_k
+    if repo:
+        payload["repo"] = repo
+    if branch:
+        payload["branch"] = branch
+
+    try:
+        resp = httpx.post(url, json=payload, timeout=10)
+        # Return any successful response or a daemon-side error that
+        # the caller should handle (not silently fall back).
+        if resp.status_code == 200:
+            return resp
+        # Daemon is up but returned an error — bubble it instead of
+        # falling back to in-process with wrong repo context.
+        if resp.status_code in (400, 404, 503):
+            return resp
+    except Exception:
+        pass
+    return None
+
+
 @app.command()
 def ask(
     question: str = typer.Argument(..., help="Search query."),
@@ -157,8 +211,14 @@ def ask(
     no_embed: bool = typer.Option(
         False, "--no-embed", help="Skip vector search (FTS-only)."
     ),
+    repo: str = typer.Option(
+        None, "--repo", "-r", help="Query a specific repo (daemon mode)."
+    ),
 ) -> None:
     """Search the index for relevant code.
+
+    Tries the daemon first (D-006). Falls back to in-process if the
+    daemon is not running.
 
     Returns ranked code chunks matching the query using FTS5 full-text
     search and (optionally) vector similarity. Results include file paths,
@@ -174,8 +234,70 @@ def ask(
       sr ask 'authentication middleware'\n
       sr ask 'database connection' --json | jq '.[0].content'\n
       sr ask 'error handling' --files\n
-      sr ask 'parse config' ~/dev/myproject -k 20
+      sr ask 'parse config' ~/dev/myproject -k 20\n
+      sr ask 'auth flow' --repo marrow   # daemon multi-repo
     """
+    # D-006: Try daemon first.
+    daemon_resp = _try_daemon_query(question, top_k=top_k, repo=repo)
+    if daemon_resp is not None:
+        # Handle daemon-side errors before assuming success.
+        status_code = daemon_resp.status_code  # type: ignore[union-attr]
+        if status_code != 200:
+            data = daemon_resp.json()  # type: ignore[union-attr]
+            detail = data.get("detail", f"Daemon error (HTTP {status_code})")
+            err_console.print(f"[red]Error:[/red] {detail}")
+            raise typer.Exit(1)
+
+        data = daemon_resp.json()  # type: ignore[union-attr]
+        results_data = data.get("results", [])
+
+        if not results_data:
+            if json_output:
+                print("[]")
+            else:
+                err_console.print("[yellow]No results found.[/yellow]")
+            return
+
+        if json_output:
+            print(json.dumps(results_data, indent=2))
+        elif files_only:
+            seen: set[str] = set()
+            for r in results_data:
+                fp = r["file_path"]
+                if fp not in seen:
+                    print(fp)
+                    seen.add(fp)
+        elif plain:
+            for r in results_data:
+                prefix = f"[{r.get('repo_name', '')}] " if r.get("repo_name") else ""
+                print(f"--- {prefix}{r['file_path']}")
+                if r.get("symbol_name"):
+                    print(f"    {r['symbol_name']} ({r['symbol_type']})")
+                print(r["content"])
+                print()
+        else:
+            # Convert to QueryResult-like dicts for _rich_output.
+            from source_recall.models import QueryResult
+
+            qr_list = [
+                QueryResult(
+                    chunk_id=r["chunk_id"],
+                    file_path=r["file_path"],
+                    symbol_name=r.get("symbol_name", ""),
+                    symbol_type=r.get("symbol_type", ""),
+                    content=r["content"],
+                    score=r["score"],
+                    start_line=r["start_line"],
+                    end_line=r["end_line"],
+                    search_quality=r.get("search_quality", ""),
+                    match_reason=r.get("match_reason", ""),
+                )
+                for r in results_data
+            ]
+            _rich_output(qr_list)
+        return
+
+    # Fallback: in-process query.
     from source_recall import Index
 
     repo_path = Path(path).resolve()
@@ -212,11 +334,11 @@ def ask(
     if json_output:
         print(json.dumps([r.to_dict() for r in results], indent=2))
     elif files_only:
-        seen: set[str] = set()
+        seen_local: set[str] = set()
         for r in results:
-            if r.file_path not in seen:
+            if r.file_path not in seen_local:
                 print(r.file_path)
-                seen.add(r.file_path)
+                seen_local.add(r.file_path)
     elif plain:
         for r in results:
             print(f"--- {r.file_path}")
@@ -696,6 +818,411 @@ def serve(
 
 
 # ---------------------------------------------------------------------------
+# Daemon subcommands
+# ---------------------------------------------------------------------------
+
+daemon_app = typer.Typer(
+    name="daemon",
+    help="Manage the source-recall daemon (multi-repo background server).",
+    no_args_is_help=True,
+)
+app.add_typer(daemon_app, name="daemon")
+
+
+def uvicorn_run(app: object, **kwargs: object) -> None:
+    """Thin wrapper around uvicorn.run for testability.
+
+    @param app: ASGI application.
+    @param kwargs: Forwarded to uvicorn.run.
+    """
+    import uvicorn
+
+    uvicorn.run(app, **kwargs)  # type: ignore[arg-type]
+
+
+@daemon_app.command("run")
+def daemon_run(
+    config: str = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to repos.toml (default: ~/.config/source-recall/repos.toml).",
+    ),
+    no_embed: bool = typer.Option(
+        False, "--no-embed", help="Disable vector search (FTS-only)."
+    ),
+) -> None:
+    """Start the daemon in the foreground.
+
+    Loads repos from repos.toml and starts the HTTP server.
+    All registered repos are served immediately.
+
+    Examples:\n
+      sr daemon run                          # Default config\n
+      sr daemon run --config ./repos.toml    # Custom config\n
+      sr daemon run --no-embed               # FTS-only mode
+    """
+    from source_recall.daemon import create_daemon_app
+    from source_recall.daemon_config import DaemonConfig
+
+    config_path = Path(config) if config else DaemonConfig.default_config_path()
+
+    try:
+        cfg = DaemonConfig.from_toml(config_path)
+    except Exception as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+    err_console.print("[bold]Starting source-recall daemon[/bold]")
+    err_console.print(f"  Config: {config_path}")
+    err_console.print(f"  Repos:  {len(cfg.repos)}")
+
+    if no_embed:
+        err_console.print("  Mode:   FTS-only")
+        daemon_fapp = create_daemon_app(cfg, embedder=None)
+    else:
+        err_console.print("  Mode:   full (loading model...)")
+        daemon_fapp = create_daemon_app(cfg)
+
+    err_console.print(f"  Listen:  [cyan]http://{cfg.host}:{cfg.port}[/cyan]")
+    err_console.print()
+
+    uvicorn_run(
+        daemon_fapp,
+        host=cfg.host,
+        port=cfg.port,
+        log_level="warning",
+        timeout_graceful_shutdown=cfg.shutdown_timeout_s,
+    )
+
+
+def _write_and_load_plist(config: object) -> Path:
+    """Write plist and bootstrap via launchctl. Mockable in tests.
+
+    @param config: DaemonConfig instance.
+    @returns: Path to the plist file.
+    """
+    from source_recall.launchd import install_plist
+
+    return install_plist(config)  # type: ignore[arg-type]
+
+
+def _wait_for_health(url: str, timeout: float = 30.0) -> bool:
+    """Poll /health until ok or timeout.
+
+    @param url: Daemon base URL.
+    @param timeout: Max seconds to wait.
+    @returns: True if healthy within timeout.
+    """
+    import time
+
+    import httpx
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(f"{url}/health", timeout=2)
+            if resp.status_code == 200 and resp.json().get("ok"):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+@daemon_app.command("start")
+def daemon_start(
+    config: str = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to repos.toml.",
+    ),
+) -> None:
+    """Start the daemon via launchd (background).
+
+    Writes a launchd plist and bootstraps the service.
+    The daemon auto-restarts on crash or reboot.
+
+    Examples:\n
+      sr daemon start\n
+      sr daemon start --config ./repos.toml
+    """
+    from source_recall.daemon_config import DaemonConfig
+
+    config_path = Path(config) if config else DaemonConfig.default_config_path()
+
+    try:
+        cfg = DaemonConfig.from_toml(config_path)
+    except Exception as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+    err_console.print("[bold]Starting daemon via launchd...[/bold]")
+
+    try:
+        plist_path = _write_and_load_plist(cfg)
+    except Exception as e:
+        err_console.print(f"[red]Error:[/red] Failed to load plist: {e}")
+        raise typer.Exit(1) from e
+
+    url = f"http://{cfg.host}:{cfg.port}"
+    err_console.print(f"  Plist: {plist_path}")
+    err_console.print(f"  Waiting for health at {url}...")
+
+    if _wait_for_health(url):
+        console.print("[green]✓[/green] Daemon started.")
+    else:
+        err_console.print(
+            "[yellow]⚠[/yellow] Daemon launched but health check timed out. "
+            "Check logs: sr daemon logs"
+        )
+
+
+@daemon_app.command("stop")
+def daemon_stop() -> None:
+    """Stop the daemon (unload launchd plist).
+
+    Examples:\n
+      sr daemon stop
+    """
+    from source_recall.launchd import unload_plist
+
+    err_console.print("Stopping daemon...")
+    try:
+        unload_plist()
+        console.print("[green]✓[/green] Daemon stopped.")
+    except Exception as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+
+@daemon_app.command("status")
+def daemon_status() -> None:
+    """Show daemon status and repo summary.
+
+    Probes /health on the running daemon. Falls back to
+    launchctl state if daemon is unreachable.
+
+    Examples:\n
+      sr daemon status
+    """
+    try:
+        resp = _daemon_get("/health")
+        data = resp.json()  # type: ignore[union-attr]
+        if data.get("ok"):
+            console.print(
+                f"[green]●[/green] Daemon running "
+                f"(uptime {data['uptime_s']}s, {len(data['repos'])} repos)"
+            )
+            for name in data["repos"]:
+                console.print(f"  • {name}")
+        else:
+            console.print("[yellow]●[/yellow] Daemon running but no repos ready")
+    except ConnectionError:
+        from source_recall.launchd import is_loaded
+
+        if is_loaded():
+            err_console.print(
+                "[yellow]●[/yellow] Plist loaded but daemon not responding"
+            )
+        else:
+            err_console.print("[red]●[/red] Daemon not running")
+        raise typer.Exit(1) from None
+
+
+@daemon_app.command("logs")
+def daemon_logs(
+    lines: int = typer.Option(50, "--lines", "-n", help="Number of lines to show."),
+) -> None:
+    """Show daemon log output.
+
+    Examples:\n
+      sr daemon logs\n
+      sr daemon logs -n 100
+    """
+    from source_recall.launchd import LOG_PATH
+
+    if not LOG_PATH.exists():
+        err_console.print("[dim]No log file found.[/dim]")
+        return
+
+    import subprocess
+
+    result = subprocess.run(
+        ["tail", f"-{lines}", str(LOG_PATH)],
+        capture_output=True,
+        text=True,
+    )
+    if result.stdout:
+        console.print(result.stdout, end="")
+
+
+# ---------------------------------------------------------------------------
+# Daemon HTTP client helpers
+# ---------------------------------------------------------------------------
+
+
+def _daemon_get(path: str) -> object:
+    """GET request to the daemon.
+
+    @param path: URL path (e.g. '/repos').
+    @returns: httpx.Response.
+    @raises ConnectionError: If daemon is unreachable.
+    """
+    import httpx
+
+    try:
+        return httpx.get(f"{_daemon_url()}{path}", timeout=10)
+    except httpx.ConnectError as e:
+        raise ConnectionError(f"Daemon not running at {_daemon_url()}") from e
+
+
+def _daemon_post(path: str, **kwargs: object) -> object:
+    """POST request to the daemon.
+
+    @param path: URL path.
+    @param kwargs: Forwarded to httpx.post.
+    @returns: httpx.Response.
+    @raises ConnectionError: If daemon is unreachable.
+    """
+    import httpx
+
+    try:
+        return httpx.post(f"{_daemon_url()}{path}", timeout=10, **kwargs)  # type: ignore[arg-type]
+    except httpx.ConnectError as e:
+        raise ConnectionError(f"Daemon not running at {_daemon_url()}") from e
+
+
+def _daemon_delete(path: str) -> object:
+    """DELETE request to the daemon.
+
+    @param path: URL path.
+    @returns: httpx.Response.
+    @raises ConnectionError: If daemon is unreachable.
+    """
+    import httpx
+
+    try:
+        return httpx.delete(f"{_daemon_url()}{path}", timeout=10)
+    except httpx.ConnectError as e:
+        raise ConnectionError(f"Daemon not running at {_daemon_url()}") from e
+
+
+# ---------------------------------------------------------------------------
+# sr add / sr remove / sr repos
+# ---------------------------------------------------------------------------
+
+
+@app.command("add")
+def add_repo(
+    path: str = typer.Argument(..., help="Path to the repository to add."),
+    name: str = typer.Option(None, "--name", "-n", help="Custom display name."),
+) -> None:
+    """Add a repository to the daemon.
+
+    Sends POST /repos to the running daemon. The repo will be
+    queued for indexing immediately.
+
+    Examples:\n
+      sr add ~/dev/myproject\n
+      sr add ~/dev/myproject --name my-proj
+    """
+    payload: dict[str, str] = {"path": str(Path(path).resolve())}
+    if name:
+        payload["name"] = name
+
+    try:
+        resp = _daemon_post("/repos", json=payload)
+    except ConnectionError as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+    if resp.status_code == 201:  # type: ignore[union-attr]
+        data = resp.json()  # type: ignore[union-attr]
+        console.print(
+            f"[green]✓[/green] Added [cyan]{data['name']}[/cyan] ({data['state']})"
+        )
+    else:
+        detail = resp.json().get("detail", "Unknown error")  # type: ignore[union-attr]
+        err_console.print(f"[red]Error:[/red] {detail}")
+        raise typer.Exit(1)
+
+
+@app.command("remove")
+def remove_repo(
+    name: str = typer.Argument(..., help="Name of the repo to remove."),
+) -> None:
+    """Remove a repository from the daemon.
+
+    Sends DELETE /repos/{name} to the running daemon.
+
+    Examples:\n
+      sr remove myproject
+    """
+    try:
+        resp = _daemon_delete(f"/repos/{name}")
+    except ConnectionError as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1) from e
+
+    if resp.status_code == 200:  # type: ignore[union-attr]
+        console.print(f"[green]✓[/green] Removed [cyan]{name}[/cyan]")
+    else:
+        detail = resp.json().get("detail", "Unknown error")  # type: ignore[union-attr]
+        err_console.print(f"[red]Error:[/red] {detail}")
+        raise typer.Exit(1)
+
+
+@app.command("repos")
+def list_daemon_repos() -> None:
+    """List repos registered in the daemon.
+
+    Queries GET /repos on the running daemon and displays
+    each repo with its current state.
+
+    Examples:\n
+      sr repos
+    """
+    try:
+        resp = _daemon_get("/repos")
+    except ConnectionError:
+        err_console.print("[red]Error:[/red] Daemon not running.")
+        raise typer.Exit(1) from None
+
+    if resp.status_code != 200:  # type: ignore[union-attr]
+        err_console.print(f"[red]Error:[/red] Unexpected status {resp.status_code}")  # type: ignore[union-attr]
+        raise typer.Exit(1)
+
+    data = resp.json()  # type: ignore[union-attr]
+    repos_list = data.get("repos", [])
+
+    if not repos_list:
+        console.print("[dim]No repos registered.[/dim]")
+        return
+
+    from rich.table import Table
+
+    table = Table(title="Daemon Repos", show_lines=False)
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("State", justify="center")
+    table.add_column("Path", style="dim")
+
+    state_icons = {
+        "ready": "[green]✓[/green]",
+        "indexing": "[yellow]⟳[/yellow]",
+        "queued": "[dim]…[/dim]",
+        "error": "[red]✗[/red]",
+    }
+
+    for r in repos_list:
+        icon = state_icons.get(r["state"], r["state"])
+        table.add_row(r["name"], icon, r["path"])
+
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -708,11 +1235,7 @@ def _status_to_dict(s: IndexStatus) -> dict[str, object]:
     @param s: IndexStatus instance.
     @returns: Dict with all status fields plus computed helpers.
     """
-    vec_pct = (
-        round(s.vector_count / s.chunk_count * 100, 1)
-        if s.chunk_count > 0
-        else 0
-    )
+    vec_pct = round(s.vector_count / s.chunk_count * 100, 1) if s.chunk_count > 0 else 0
     return {
         "repo_path": s.repo_path,
         "db_path": s.db_path,
