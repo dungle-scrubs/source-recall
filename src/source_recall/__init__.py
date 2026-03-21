@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -75,6 +76,7 @@ class Index:
 
         self._reranker: object = _SENTINEL  # Lazy-loaded.
         self._querier: object | None = None  # Cached IndexQuerier.
+        self._querier_lock = threading.Lock()  # Guards _querier access (H-1).
 
     @staticmethod
     def _create_default_embedder() -> Embedder | None:
@@ -169,16 +171,20 @@ class Index:
         return builder.refresh(files=files)
 
     def _close_querier(self) -> None:
-        """Close and discard the cached querier."""
-        if self._querier is not None:
-            self._querier.close()  # type: ignore[union-attr]
-            self._querier = None
+        """Close and discard the cached querier.
 
-    def _get_querier(self) -> object:
-        """Get or create a cached IndexQuerier.
+        Thread-safe: acquires ``_querier_lock`` to prevent closing
+        a querier while another thread is using it (H-1 fix).
+        """
+        with self._querier_lock:
+            if self._querier is not None:
+                self._querier.close()  # type: ignore[union-attr]
+                self._querier = None
 
-        Reuses the same querier (and DB connection) across queries
-        to avoid per-query migration checks and connection overhead.
+    def _ensure_querier(self) -> object:
+        """Create a querier if one doesn't exist.
+
+        Caller MUST already hold ``_querier_lock``.
 
         @returns: IndexQuerier instance.
         """
@@ -201,18 +207,24 @@ class Index:
     ) -> list[QueryResult]:
         """Search the index.
 
+        Thread-safe: holds ``_querier_lock`` for the entire query so
+        a concurrent ``refresh()`` cannot close the connection mid-flight
+        (H-1 fix).
+
         @param question: Natural language or symbol query.
         @param top_k: Override number of results.
         @param branch: Filter to this branch. None = active branch.
         @returns: Ranked list of QueryResult.
         """
-        querier = self._get_querier()
-        return querier.query(question, top_k=top_k, branch=branch)  # type: ignore[union-attr]
+        with self._querier_lock:
+            querier = self._ensure_querier()
+            return querier.query(question, top_k=top_k, branch=branch)  # type: ignore[union-attr]
 
     def status(self) -> IndexStatus:
         """Get index status information.
 
         @returns: IndexStatus with all metrics.
         """
-        querier = self._get_querier()
-        return querier.status()  # type: ignore[union-attr]
+        with self._querier_lock:
+            querier = self._ensure_querier()
+            return querier.status()  # type: ignore[union-attr]
