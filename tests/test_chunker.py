@@ -258,3 +258,21 @@ class TestErrorNodeDensity:
         code = "export %%% broken {{{{ syntax !!! @@@\n" * 20
         chunks, quality = chunk_file("broken.ts", code)
         assert quality == SearchQuality.TEXT_FALLBACK
+
+
+class TestParserCache:
+    def test_parser_reused_for_same_language(self) -> None:
+        """Parsers are cached per language to avoid allocation overhead (M5)."""
+        from source_recall.chunker import _get_cached_parser
+
+        p1 = _get_cached_parser("python")
+        p2 = _get_cached_parser("python")
+        assert p1 is p2
+
+    def test_different_languages_get_different_parsers(self) -> None:
+        """Different language keys produce distinct parser instances."""
+        from source_recall.chunker import _get_cached_parser
+
+        py = _get_cached_parser("python")
+        ts = _get_cached_parser("typescript")
+        assert py is not ts
