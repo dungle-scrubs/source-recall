@@ -54,7 +54,7 @@ def clean_index_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         import hashlib
 
         real = str(repo_path.resolve())
-        path_hash = hashlib.sha256(real.encode()).hexdigest()[:12]
+        path_hash = hashlib.sha256(real.encode()).hexdigest()[:16]
         repo_name = repo_path.resolve().name
         return index_base / f"{repo_name}-{path_hash}"
 

@@ -95,12 +95,18 @@ class DaemonConfig(BaseModel):
     def _toml_escape(s: str) -> str:
         """Escape a string for TOML basic string value.
 
-        Handles backslashes, double quotes, and control characters.
+        Handles backslashes, double quotes, and control characters
+        that are forbidden as literals inside TOML basic strings.
 
         @param s: Raw string.
         @returns: Escaped string safe for use inside TOML double quotes.
         """
-        return s.replace("\\", "\\\\").replace('"', '\\"')
+        s = s.replace("\\", "\\\\")
+        s = s.replace('"', '\\"')
+        s = s.replace("\n", "\\n")
+        s = s.replace("\r", "\\r")
+        s = s.replace("\t", "\\t")
+        return s
 
     def to_toml(self) -> str:
         """Serialize this config to TOML format.

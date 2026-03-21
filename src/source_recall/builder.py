@@ -236,9 +236,20 @@ class IndexBuilder:
                 # Incremental update.
                 total = len(changed_files)
                 pending_vectors: list[tuple[str, str]] = []
-                # Track files that need vector cleanup (deferred until
-                # after the sqlite3 batch commits — see C1 atomicity).
-                vec_dirty_files: list[str] = []
+                # Collect OLD chunk IDs before Phase 1 deletes them.
+                # delete_vectors_by_file queries the chunks table, but
+                # after Phase 1 the old chunks are gone — the subquery
+                # would return new chunk IDs (or nothing for deletes),
+                # leaving old vectors orphaned.  Capture IDs now while
+                # the old chunks still exist.
+                old_vec_chunk_ids: list[str] = []
+                if vec_enabled:
+                    for rel_path, _action in changed_files:
+                        rows = store.conn.execute(
+                            "SELECT id FROM chunks WHERE file_path = ?",
+                            (rel_path,),
+                        ).fetchall()
+                        old_vec_chunk_ids.extend(row[0] for row in rows)
 
                 # Phase 1: Batch sqlite3 writes (chunks, FTS, refs,
                 # file_hashes) in a single transaction.
@@ -249,9 +260,6 @@ class IndexBuilder:
 
                         store.delete_chunks_for_file(rel_path)
                         store.delete_file_hash(rel_path)
-
-                        if vec_enabled:
-                            vec_dirty_files.append(rel_path)
 
                         if action != "delete":
                             chunk_ids = self._index_file(store, rel_path, branch=branch)
@@ -267,9 +275,8 @@ class IndexBuilder:
                 # move vector ops inside batch_mode(), JOINs against the
                 # chunks table will miss the new rows (H5).
                 vec_ok = True
-                if vec_enabled:
-                    for rel_path in vec_dirty_files:
-                        store.delete_vectors_by_file(rel_path)
+                if vec_enabled and old_vec_chunk_ids:
+                    store.delete_vectors_by_ids(old_vec_chunk_ids)
 
                 if pending_vectors and vec_enabled and self.embedder is not None:
                     vec_ok = self._flush_vectors(store, pending_vectors)
@@ -379,7 +386,17 @@ class IndexBuilder:
             vec_enabled = store.ensure_vec_table(self.embedder.dimensions)
 
         pending_vectors: list[tuple[str, str]] = []
-        vec_dirty_files: list[str] = []
+
+        # Collect OLD chunk IDs before Phase 1 deletes them (C-1 fix).
+        old_vec_chunk_ids: list[str] = []
+        if vec_enabled:
+            all_dirty_paths = list(deleted) + files_to_reindex
+            for rel_path in all_dirty_paths:
+                rows = store.conn.execute(
+                    "SELECT id FROM chunks WHERE file_path = ?",
+                    (rel_path,),
+                ).fetchall()
+                old_vec_chunk_ids.extend(row[0] for row in rows)
 
         # Phase 1: Batch sqlite3 writes.
         with store.batch_mode():
@@ -387,8 +404,6 @@ class IndexBuilder:
             for rel_path in deleted:
                 store.delete_chunks_for_file(rel_path)
                 store.delete_file_hash(rel_path)
-                if vec_enabled:
-                    vec_dirty_files.append(rel_path)
 
             # Re-index changed/added files.
             total = len(files_to_reindex)
@@ -398,8 +413,6 @@ class IndexBuilder:
 
                 store.delete_chunks_for_file(rel_path)
                 store.delete_file_hash(rel_path)
-                if vec_enabled:
-                    vec_dirty_files.append(rel_path)
 
                 blob_sha = blob_map.get(rel_path)
                 is_dirty = rel_path in dirty_map
@@ -420,9 +433,8 @@ class IndexBuilder:
 
         # Phase 2: Vector cleanup + insert.
         vec_ok = True
-        if vec_enabled:
-            for rel_path in vec_dirty_files:
-                store.delete_vectors_by_file(rel_path)
+        if vec_enabled and old_vec_chunk_ids:
+            store.delete_vectors_by_ids(old_vec_chunk_ids)
 
         if pending_vectors and vec_enabled and self.embedder is not None:
             # Filter out chunks that already have vectors — skip redundant
@@ -744,14 +756,15 @@ class IndexBuilder:
         except Exception:
             return []
 
-        # Use file mtime as hash proxy for PDFs (avoids reading
-        # entire binary for hashing).  Trade-off: if mtime is restored
-        # (e.g. rsync --times, touch -t) after content changes, the
-        # file won't be detected as changed during incremental refresh.
-        # A full rebuild always catches this (M5).
+        # Hash the first 64 KB of the PDF binary for change detection.
+        # This catches content changes even when mtime is restored
+        # (e.g. rsync --times, touch -t) while avoiding reading the
+        # entire file for large PDFs (M-4 fix).
         try:
             mtime_ns = full.stat().st_mtime_ns
-            content_hash = hashlib.sha256(str(mtime_ns).encode()).hexdigest()
+            with open(full, "rb") as f:
+                head = f.read(65536)
+            content_hash = hashlib.sha256(head).hexdigest()
         except OSError:
             content_hash = hashlib.sha256(b"pdf").hexdigest()
             mtime_ns = None

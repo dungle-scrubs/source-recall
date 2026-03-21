@@ -486,6 +486,42 @@ def _chunk_python(
     root = tree.root_node
     chunks: list[ChunkData] = []
 
+    # Collect preamble: all top-level nodes before the first
+    # function/class definition.  This ensures import statements and
+    # module-level setup code get their own chunk, preventing
+    # mis-attribution of refs to the first function (M-5 fix).
+    first_def_line: int | None = None
+    for node in root.children:
+        if not node.is_named:
+            continue
+        ntype = node.type
+        if ntype == "decorated_definition":
+            inner = _py_unwrap_decorated(node)
+            if inner is not None and inner.type in {
+                "function_definition",
+                "class_definition",
+            }:
+                first_def_line = node.start_point[0]
+                break
+        elif ntype in {"function_definition", "class_definition"}:
+            first_def_line = node.start_point[0]
+            break
+
+    if first_def_line is not None and first_def_line > 0:
+        preamble = "\n".join(content.split("\n")[:first_def_line]).strip()
+        if preamble and len(preamble) > 20:
+            _add_chunk(
+                chunks,
+                file_path,
+                "",
+                SymbolType.MODULE,
+                preamble,
+                1,
+                first_def_line,
+                SearchQuality.AST,
+                max_chars,
+            )
+
     for node in root.children:
         if not node.is_named:
             continue

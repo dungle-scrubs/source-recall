@@ -53,10 +53,14 @@ _CODERANK_MODEL = "nomic-ai/CodeRankEmbed"
 _CODERANK_DIMENSIONS = 768
 # Pin to a known-good revision to limit supply-chain risk from
 # trust_remote_code=True.  Bump only after auditing the diff.
-# Risk: if the HuggingFace CDN is compromised at this exact
-# revision, the pin alone won't help.  Consider adding a SHA-256
-# checksum verification of downloaded model files as defense-in-depth (M1).
 _CODERANK_REVISION = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
+# SHA-256 of the model's config.json at the pinned revision.
+# Defense-in-depth: if the HuggingFace CDN is compromised at this
+# exact revision, the checksum catches tampered config files.
+# Bump when updating _CODERANK_REVISION after auditing the diff.
+_CODERANK_CONFIG_SHA256 = (
+    "c5c4beb205d1e44581a60dd1ef14e35e04c8fd4bdd07a42c2ac944e886f4e97b"
+)
 _QUERY_PREFIX = "Represent this query for searching relevant code: "
 
 
