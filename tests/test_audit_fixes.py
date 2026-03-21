@@ -743,8 +743,8 @@ class TestRefreshBuildLockGap:
 class TestReleaseLockSafety:
     """H3: _release_lock doesn't delete another process's lock."""
 
-    def test_corrupt_lock_not_deleted(self, tmp_path: Path) -> None:
-        """Corrupt lock file is left intact, not unconditionally deleted."""
+    def test_corrupt_lock_not_deleted_when_recent(self, tmp_path: Path) -> None:
+        """Recent corrupt lock file is left intact — another process may own it."""
         lock_path = tmp_path / "index.lock"
         lock_path.write_text("not-json{{{")
 
@@ -753,6 +753,22 @@ class TestReleaseLockSafety:
         _release_lock(lock_path)
         # File should still exist — not deleted.
         assert lock_path.exists()
+
+    def test_corrupt_lock_deleted_when_stale(self, tmp_path: Path) -> None:
+        """Corrupt lock older than 60s is cleaned up (H3 audit fix)."""
+        import os
+        import time
+
+        lock_path = tmp_path / "index.lock"
+        lock_path.write_text("not-json{{{")
+        # Backdate mtime by 120 seconds.
+        old_time = time.time() - 120
+        os.utime(lock_path, (old_time, old_time))
+
+        from source_recall.store import _release_lock
+
+        _release_lock(lock_path)
+        assert not lock_path.exists()
 
     def test_own_lock_deleted(self, tmp_path: Path) -> None:
         """Lock belonging to current process is properly deleted."""

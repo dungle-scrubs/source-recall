@@ -254,8 +254,9 @@ def _release_lock(lock_path: Path) -> None:
     """Release the PID-file lock.
 
     Only deletes the lock file if it belongs to this process.
-    If the file is corrupt or unreadable, leaves it intact rather
-    than risk deleting a lock held by another process.
+    If the file is corrupt or unreadable but older than 60 seconds,
+    removes it as stale (H3 audit fix).  Recent corrupt files are
+    left intact to avoid deleting another process's lock.
 
     @param lock_path: Path to the lock file.
     """
@@ -266,9 +267,26 @@ def _release_lock(lock_path: Path) -> None:
     except FileNotFoundError:
         pass  # Already gone — nothing to release.
     except Exception:
-        _store_logger.warning(
-            "Could not read lock file %s — leaving intact", lock_path
-        )
+        # Corrupt lock — check age before deciding.
+        try:
+            age_s = time.time() - lock_path.stat().st_mtime
+            if age_s > 60:
+                _store_logger.warning(
+                    "Removing corrupt lock file %s (%.0fs old)", lock_path, age_s
+                )
+                lock_path.unlink(missing_ok=True)
+            else:
+                _store_logger.warning(
+                    "Could not read lock file %s — leaving intact (%.0fs old)",
+                    lock_path,
+                    age_s,
+                )
+        except FileNotFoundError:
+            pass  # Vanished between read and stat — fine.
+        except Exception:
+            _store_logger.warning(
+                "Could not read lock file %s — leaving intact", lock_path
+            )
 
 
 # ---------------------------------------------------------------------------
