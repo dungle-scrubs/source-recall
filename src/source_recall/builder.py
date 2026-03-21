@@ -144,14 +144,15 @@ class IndexBuilder:
                     for cid, content in chunk_ids:
                         pending_vectors.append((cid, content))
 
-                    # Batch embed when we have enough.
-                    if len(pending_vectors) >= self.config.embed_batch_size:
-                        self._flush_vectors(store, pending_vectors)
-                        pending_vectors.clear()
-
-            # Flush remaining vectors.
+            # Flush ALL vectors after the sqlite3 batch commits (H2).
+            # The apsw vec connection is an independent WAL reader and
+            # cannot write while the sqlite3 connection holds an open
+            # write transaction.  Flushing inside batch_mode() causes
+            # apsw.BusyError and silently drops vectors.
             if pending_vectors and vec_enabled and self.embedder is not None:
-                self._flush_vectors(store, pending_vectors)
+                for i in range(0, len(pending_vectors), self.config.embed_batch_size):
+                    batch = pending_vectors[i : i + self.config.embed_batch_size]
+                    self._flush_vectors(store, batch)
 
             # Write meta.
             meta = {

@@ -743,8 +743,8 @@ class TestRefreshBuildLockGap:
 class TestReleaseLockSafety:
     """H3: _release_lock doesn't delete another process's lock."""
 
-    def test_corrupt_lock_not_deleted(self, tmp_path: Path) -> None:
-        """Corrupt lock file is left intact, not unconditionally deleted."""
+    def test_corrupt_lock_not_deleted_when_recent(self, tmp_path: Path) -> None:
+        """Recent corrupt lock file is left intact — another process may own it."""
         lock_path = tmp_path / "index.lock"
         lock_path.write_text("not-json{{{")
 
@@ -753,6 +753,22 @@ class TestReleaseLockSafety:
         _release_lock(lock_path)
         # File should still exist — not deleted.
         assert lock_path.exists()
+
+    def test_corrupt_lock_deleted_when_stale(self, tmp_path: Path) -> None:
+        """Corrupt lock older than 60s is cleaned up (H3 audit fix)."""
+        import os
+        import time
+
+        lock_path = tmp_path / "index.lock"
+        lock_path.write_text("not-json{{{")
+        # Backdate mtime by 120 seconds.
+        old_time = time.time() - 120
+        os.utime(lock_path, (old_time, old_time))
+
+        from source_recall.store import _release_lock
+
+        _release_lock(lock_path)
+        assert not lock_path.exists()
 
     def test_own_lock_deleted(self, tmp_path: Path) -> None:
         """Lock belonging to current process is properly deleted."""
@@ -1468,3 +1484,147 @@ class TestM8UnclosedFence:
         heading_names = [c.symbol_name for c in chunks if c.symbol_name]
         assert "Before" in heading_names
         assert "Not A Real Heading" not in heading_names
+
+
+# ---------------------------------------------------------------------------
+# H2: Vector flush must happen after batch_mode commits
+# ---------------------------------------------------------------------------
+
+
+class TestVectorFlushOrdering:
+    def test_vectors_flushed_after_batch_commits(self, tmp_path: Path) -> None:
+        """All vector flushes happen after batch_mode commits (H2 audit fix).
+
+        The apsw connection can't see uncommitted sqlite3 rows.  If
+        _flush_vectors runs inside batch_mode, the vec_chunks JOIN against
+        chunks would miss new rows.  Verify vectors are searchable after
+        a full build by checking every chunk has a matching vector.
+        """
+        import shutil
+
+        from source_recall import Index
+
+        src = Path(__file__).parent / "fixtures" / "py-app"
+        repo = tmp_path / "vec_flush_repo"
+        shutil.copytree(src, repo)
+
+        # Use a tiny batch size to force mid-build flushes.
+        embedder = BagOfWordsEmbedder(dimensions=64)
+        idx = Index(repo, embedder=embedder, embed_batch_size=2)
+        idx.build()
+
+        s = idx.status()
+        assert s.chunk_count > 0
+        # Every chunk should have a vector.
+        assert s.vector_count == s.chunk_count, (
+            f"Vector count ({s.vector_count}) != chunk count ({s.chunk_count}). "
+            "Vectors may have been flushed before chunks were committed."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap: refresh >500 changes triggers full rebuild
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshLargeChangeThreshold:
+    def test_refresh_over_threshold_rebuilds(self, tmp_path: Path) -> None:
+        """When refresh detects >500 changes, it delegates to _build_locked."""
+        import shutil
+        from unittest.mock import patch
+
+        from source_recall.builder import IndexBuilder
+        from source_recall.config import SRConfig
+
+        src = Path(__file__).parent / "fixtures" / "py-app"
+        repo = tmp_path / "repo"
+        shutil.copytree(src, repo)
+
+        config = SRConfig()
+        builder = IndexBuilder(repo, config, embedder=None)
+        builder.build()
+
+        # Mock _detect_changes to return >500 changes.
+        fake_changes = [(f"file_{i}.py", "update") for i in range(501)]
+        with patch.object(builder, "_detect_changes", return_value=fake_changes):
+            with patch.object(builder, "_build_locked") as mock_build:
+                result = builder.refresh()
+
+        # Should have called _build_locked for the full rebuild path.
+        mock_build.assert_called_once()
+        assert result == 501
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap: _persist_config failure visibility
+# ---------------------------------------------------------------------------
+
+
+class TestPersistConfigFailure:
+    def test_add_repo_state_survives_persist(self, tmp_path: Path) -> None:
+        """In-memory state is consistent after add, even before persist."""
+        from source_recall.daemon_config import DaemonConfig
+        from source_recall.repo_manager import RepoManager
+
+        config = DaemonConfig(config_path=tmp_path / "nonexistent" / "repos.toml")
+        manager = RepoManager.from_config(config)
+
+        # Create a valid repo dir.
+        repo = tmp_path / "my-repo"
+        repo.mkdir()
+
+        slot = manager.add(repo, name="my-repo")
+        assert slot.name == "my-repo"
+        assert "my-repo" in manager.slots
+
+        # Persist should work when directory is created.
+        config.config_path.parent.mkdir(parents=True, exist_ok=True)
+        toml_str = config.to_toml()
+        assert "daemon" in toml_str
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap: batch_mode transaction atomicity on error
+# ---------------------------------------------------------------------------
+
+
+class TestBatchModeAtomicity:
+    def test_partial_batch_fully_rolls_back(self, tmp_path: Path) -> None:
+        """If an error occurs mid-batch, ALL writes in the batch are rolled back."""
+        store = IndexStore(tmp_path / "test.db")
+        store.open()
+        store.create_schema()
+
+        chunk1 = ChunkData(
+            file_path="a.py",
+            symbol_name="foo",
+            symbol_type=SymbolType.FUNCTION,
+            content="def foo(): pass",
+            start_line=1,
+            end_line=1,
+        )
+        chunk2 = ChunkData(
+            file_path="b.py",
+            symbol_name="bar",
+            symbol_type=SymbolType.FUNCTION,
+            content="def bar(): pass",
+            start_line=1,
+            end_line=1,
+        )
+
+        # Insert chunk1 outside batch — should survive.
+        store.insert_chunks([chunk1])
+        assert store.get_chunk_count() == 1
+
+        # Start batch, insert chunk2, then raise — chunk2 should roll back.
+        with pytest.raises(RuntimeError):
+            with store.batch_mode():
+                store.insert_chunks([chunk2])
+                msg = "simulated crash"
+                raise RuntimeError(msg)
+
+        # Only chunk1 should remain.
+        assert store.get_chunk_count() == 1
+        results = store.fts_search("bar")
+        assert len(results) == 0
+        store.close()

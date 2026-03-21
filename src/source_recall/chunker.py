@@ -1264,6 +1264,28 @@ def _extract_signature(lines: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
+_parser_cache: dict[str, Any] = {}
+
+
+def _get_cached_parser(language: str) -> Any:
+    """Return a cached tree-sitter parser for the given language (M5).
+
+    Avoids per-file parser allocation overhead on large repos.
+
+    @param language: tree-sitter language key.
+    @returns: Parser instance (reused across calls).
+    """
+    cached = _parser_cache.get(language)
+    if cached is not None:
+        return cached
+
+    from tree_sitter_language_pack import get_parser
+
+    parser = get_parser(language)
+    _parser_cache[language] = parser
+    return parser
+
+
 def _parse_with_fallback(
     _file_path: str, content: str, language: str
 ) -> tuple[Any, SearchQuality]:
@@ -1274,9 +1296,7 @@ def _parse_with_fallback(
     @param language: tree-sitter language key.
     @returns: (tree, quality). Tree may be None if fallback.
     """
-    from tree_sitter_language_pack import get_parser
-
-    parser = get_parser(language)
+    parser = _get_cached_parser(language)
     tree = parser.parse(content.encode("utf-8"))
 
     # Check error node density.

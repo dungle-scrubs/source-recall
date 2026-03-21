@@ -254,8 +254,9 @@ def _release_lock(lock_path: Path) -> None:
     """Release the PID-file lock.
 
     Only deletes the lock file if it belongs to this process.
-    If the file is corrupt or unreadable, leaves it intact rather
-    than risk deleting a lock held by another process.
+    If the file is corrupt or unreadable but older than 60 seconds,
+    removes it as stale (H3 audit fix).  Recent corrupt files are
+    left intact to avoid deleting another process's lock.
 
     @param lock_path: Path to the lock file.
     """
@@ -266,9 +267,26 @@ def _release_lock(lock_path: Path) -> None:
     except FileNotFoundError:
         pass  # Already gone — nothing to release.
     except Exception:
-        _store_logger.warning(
-            "Could not read lock file %s — leaving intact", lock_path
-        )
+        # Corrupt lock — check age before deciding.
+        try:
+            age_s = time.time() - lock_path.stat().st_mtime
+            if age_s > 60:
+                _store_logger.warning(
+                    "Removing corrupt lock file %s (%.0fs old)", lock_path, age_s
+                )
+                lock_path.unlink(missing_ok=True)
+            else:
+                _store_logger.warning(
+                    "Could not read lock file %s — leaving intact (%.0fs old)",
+                    lock_path,
+                    age_s,
+                )
+        except FileNotFoundError:
+            pass  # Vanished between read and stat — fine.
+        except Exception:
+            _store_logger.warning(
+                "Could not read lock file %s — leaving intact", lock_path
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -516,33 +534,37 @@ class IndexStore:
             return
         with self._transaction():
             # Batch-fetch existing chunk IDs + branches for dedup.
+            # Always fetch — even without branch — to skip re-inserts of
+            # identical chunks.  INSERT OR REPLACE fires DELETE+INSERT
+            # triggers, generating FTS tombstones even when content is
+            # unchanged (H1 audit fix).
             existing_branches: dict[str, str] = {}
-            if branch:
-                all_ids = [c.chunk_id for c in chunks]
-                # SQLite max variables is 999 — batch in groups.
-                for i in range(0, len(all_ids), 500):
-                    batch = all_ids[i : i + 500]
-                    placeholders = ",".join("?" * len(batch))
-                    rows = self.conn.execute(
-                        f"SELECT id, branches FROM chunks WHERE id IN ({placeholders})",
-                        batch,
-                    ).fetchall()
-                    for row in rows:
-                        existing_branches[row[0]] = row[1]
+            all_ids = [c.chunk_id for c in chunks]
+            # SQLite max variables is 999 — batch in groups.
+            for i in range(0, len(all_ids), 500):
+                batch = all_ids[i : i + 500]
+                placeholders = ",".join("?" * len(batch))
+                rows = self.conn.execute(
+                    f"SELECT id, branches FROM chunks WHERE id IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    existing_branches[row[0]] = row[1]
 
             for c in chunks:
-                if branch and c.chunk_id in existing_branches:
-                    # Chunk exists — append branch if not already present.
-                    # UPDATE branches only (won't trigger FTS re-index).
-                    current = existing_branches[c.chunk_id]
-                    current_set = set(current.split(",")) if current else set()
-                    if branch not in current_set:
-                        current_set.add(branch)
-                        new_branches = ",".join(sorted(current_set))
-                        self.conn.execute(
-                            "UPDATE chunks SET branches = ? WHERE id = ?",
-                            (new_branches, c.chunk_id),
-                        )
+                if c.chunk_id in existing_branches:
+                    if branch:
+                        # Chunk exists — append branch if not already present.
+                        # UPDATE branches only (won't trigger FTS re-index).
+                        current = existing_branches[c.chunk_id]
+                        current_set = set(current.split(",")) if current else set()
+                        if branch not in current_set:
+                            current_set.add(branch)
+                            new_branches = ",".join(sorted(current_set))
+                            self.conn.execute(
+                                "UPDATE chunks SET branches = ? WHERE id = ?",
+                                (new_branches, c.chunk_id),
+                            )
                     continue  # Skip re-insert — chunk content is identical.
 
                 self.conn.execute(
