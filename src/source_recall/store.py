@@ -379,9 +379,16 @@ class IndexStore:
     def run_migrations(self) -> None:
         """Run any pending migrations, each in a savepoint.
 
+        Must not be called inside ``batch_mode()`` — the SAVEPOINT/RELEASE
+        semantics assume they are the outermost transaction boundary.
+
         @raises SchemaVersionError: If the on-disk version is newer than
             this code supports.
+        @raises AssertionError: If called inside batch_mode.
         """
+        assert self._batch_depth == 0, (
+            "run_migrations must not be called inside batch_mode"
+        )
         current = self._get_schema_version()
         if current > _SCHEMA_VERSION:
             raise SchemaVersionError(on_disk=current, expected=_SCHEMA_VERSION)
@@ -1305,7 +1312,7 @@ class IndexStore:
 # ---------------------------------------------------------------------------
 
 
-_FTS5_STRIP = str.maketrans("", "", "\"'*^-")
+_FTS5_STRIP = str.maketrans("", "", "\"'*^")
 
 
 def _fts_escape(query: str) -> str:

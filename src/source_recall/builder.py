@@ -756,14 +756,15 @@ class IndexBuilder:
         except Exception:
             return []
 
-        # Use file mtime as hash proxy for PDFs (avoids reading
-        # entire binary for hashing).  Trade-off: if mtime is restored
-        # (e.g. rsync --times, touch -t) after content changes, the
-        # file won't be detected as changed during incremental refresh.
-        # A full rebuild always catches this (M5).
+        # Hash the first 64 KB of the PDF binary for change detection.
+        # This catches content changes even when mtime is restored
+        # (e.g. rsync --times, touch -t) while avoiding reading the
+        # entire file for large PDFs (M-4 fix).
         try:
             mtime_ns = full.stat().st_mtime_ns
-            content_hash = hashlib.sha256(str(mtime_ns).encode()).hexdigest()
+            with open(full, "rb") as f:
+                head = f.read(65536)
+            content_hash = hashlib.sha256(head).hexdigest()
         except OSError:
             content_hash = hashlib.sha256(b"pdf").hexdigest()
             mtime_ns = None
