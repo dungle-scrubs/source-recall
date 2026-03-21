@@ -180,10 +180,27 @@ class BagOfWordsEmbedder:
         """
         return self._bow(query)
 
+    @staticmethod
+    def _word_bucket(word: str, dim: int) -> int:
+        """Deterministic bucket index for a word.
+
+        Uses MD5 (fast, deterministic) instead of Python's hash()
+        which is randomized per process (PYTHONHASHSEED).
+
+        @param word: Lowercased word.
+        @param dim: Vector dimensionality.
+        @returns: Bucket index in [0, dim).
+        """
+        import hashlib
+
+        digest = hashlib.md5(word.encode()).digest()  # noqa: S324
+        # First 4 bytes as unsigned int.
+        return int.from_bytes(digest[:4], "little") % dim
+
     def _bow(self, text: str) -> list[float]:
         """Convert text to a bag-of-words vector.
 
-        Each word hashes to a bucket; collisions accumulate.
+        Each word hashes to a deterministic bucket; collisions accumulate.
         The result is L2-normalized.
 
         @param text: Input text.
@@ -191,7 +208,7 @@ class BagOfWordsEmbedder:
         """
         vec = [0.0] * self._dim
         for word in text.lower().split():
-            idx = hash(word) % self._dim
+            idx = self._word_bucket(word, self._dim)
             vec[idx] += 1.0
         # L2 normalize.
         norm = sum(v * v for v in vec) ** 0.5
