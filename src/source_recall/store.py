@@ -1059,6 +1059,28 @@ class IndexStore:
             (file_path,),
         )
 
+    def delete_vectors_by_ids(self, chunk_ids: list[str]) -> None:
+        """Delete vec_chunks rows by explicit chunk IDs.
+
+        Unlike ``delete_vectors_by_file`` (which queries the chunks table
+        for current IDs), this method deletes by the exact IDs provided.
+        Use this when the chunks have already been deleted from the chunks
+        table and the subquery approach would miss them.
+
+        @param chunk_ids: Chunk IDs whose vectors should be removed.
+        """
+        if not chunk_ids:
+            return
+        if not self.has_vec_table():
+            return
+        vec_conn = self._get_vec_conn()
+        if vec_conn is None:
+            return
+        for cid in chunk_ids:
+            vec_conn.execute(
+                "DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,)
+            )
+
     def get_existing_vector_ids(self, chunk_ids: list[str]) -> set[str]:
         """Return the subset of chunk IDs that already have vectors.
 
