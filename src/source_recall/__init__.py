@@ -151,9 +151,12 @@ class Index:
         )
         return builder.build()
 
-    def refresh(self) -> int:
+    def refresh(self, *, files: list[str] | None = None) -> int:
         """Incrementally refresh the index.
 
+        @param files: Optional list of repo-relative paths to re-index.
+            When provided, only those files are re-indexed (targeted refresh).
+            When omitted, full change detection runs.
         @returns: Number of files re-indexed.
         """
         from source_recall.builder import IndexBuilder
@@ -163,7 +166,7 @@ class Index:
         builder = IndexBuilder(
             self.repo_path, self.config, self._on_progress, self._embedder
         )
-        return builder.refresh()
+        return builder.refresh(files=files)
 
     def _close_querier(self) -> None:
         """Close and discard the cached querier."""

@@ -51,6 +51,7 @@ class QueryResultResponse(BaseModel):
     @param end_line: Last line in source file.
     @param search_quality: Parse fidelity (ast/regex/text_fallback).
     @param match_reason: How the result was found.
+    @param repo_name: Repository name (set in multi-repo mode).
     """
 
     chunk_id: str
@@ -63,6 +64,7 @@ class QueryResultResponse(BaseModel):
     end_line: int
     search_quality: str
     match_reason: str
+    repo_name: str | None = None
 
 
 class QueryResponse(BaseModel):
