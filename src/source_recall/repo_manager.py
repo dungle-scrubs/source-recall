@@ -58,13 +58,17 @@ class RepoSlot:
     def update_progress(self, file_path: str, current: int, total: int) -> None:
         """Update indexing progress (called from builder callback).
 
+        Writes total before current so readers never see current > total.
+        Uses the slot lock for atomicity across all three fields (M3).
+
         @param file_path: Current file being indexed.
         @param current: Files processed so far.
         @param total: Total files to process.
         """
-        self.progress_file = file_path
-        self.progress_current = current
-        self.progress_total = total
+        with self.lock:
+            self.progress_total = total
+            self.progress_current = current
+            self.progress_file = file_path
 
     def set_ready(self, index: Index) -> None:
         """Atomically transition to READY with an open Index.

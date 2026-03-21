@@ -61,3 +61,36 @@ class TestSlotAtomicTransition:
         slot = RepoSlot(name="test", path=tmp_path)
         slot.set_indexing()
         assert slot.state == SlotState.INDEXING
+
+    def test_update_progress_is_atomic(self, tmp_path: Path) -> None:
+        """Readers never see progress_current > progress_total (M3 audit fix).
+
+        update_progress writes three fields.  Without synchronization a
+        reader could see current=50 with total=0 if it reads between writes.
+        """
+        slot = RepoSlot(name="test", path=tmp_path)
+        slot.set_indexing()
+        violations: list[str] = []
+
+        def reader() -> None:
+            for _ in range(5000):
+                current = slot.progress_current
+                total = slot.progress_total
+                if total > 0 and current > total:
+                    violations.append(f"current={current} > total={total}")
+
+        def writer() -> None:
+            for i in range(500):
+                slot.update_progress(f"file_{i}.py", i + 1, 500)
+
+        readers = [threading.Thread(target=reader) for _ in range(4)]
+        writer_t = threading.Thread(target=writer)
+
+        for r in readers:
+            r.start()
+        writer_t.start()
+        writer_t.join()
+        for r in readers:
+            r.join()
+
+        assert not violations, f"Progress atomicity violations: {violations}"
