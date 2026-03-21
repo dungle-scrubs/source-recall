@@ -211,6 +211,12 @@ _MIGRATIONS: list[tuple[int, str, str]] = [
 # ---------------------------------------------------------------------------
 
 
+# Maximum lock age in seconds.  Locks older than this are treated as
+# stale even if os.kill(pid, 0) reports the PID as alive — the original
+# process likely died and the PID was recycled by the OS (L-1 fix).
+_MAX_LOCK_AGE_S = 3600.0  # 1 hour
+
+
 def _acquire_lock(lock_path: Path, timeout: float = 0) -> None:
     """Acquire a PID-file advisory lock using atomic O_CREAT|O_EXCL.
 
@@ -244,7 +250,22 @@ def _acquire_lock(lock_path: Path, timeout: float = 0) -> None:
             lock_path.unlink(missing_ok=True)
             continue
         else:
-            # Process is alive — wait or fail.
+            # PID is alive — but check lock age to guard against PID
+            # recycling.  If the lock file is older than _MAX_LOCK_AGE_S,
+            # treat it as stale regardless of PID liveness.
+            try:
+                lock_age = time.time() - lock_path.stat().st_mtime
+                if lock_age > _MAX_LOCK_AGE_S:
+                    _store_logger.warning(
+                        "Stealing ancient lock %s (%.0fs old, PID %d)",
+                        lock_path, lock_age, pid,
+                    )
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+
+            # Process is alive and lock is recent — wait or fail.
             if time.monotonic() >= deadline:
                 raise IndexLockError(str(lock_path), pid)
             time.sleep(0.2)
@@ -1017,10 +1038,17 @@ class IndexStore:
     ) -> list[dict[str, Any]]:
         """Search vec_chunks by distance, join with chunks via apsw.
 
+        Over-fetches by 3× to compensate for rows lost to the JOIN
+        filter (orphaned vectors) and post-query branch filtering.
+        The caller is responsible for trimming to the desired count.
+
         @param query_embedding: Query vector.
-        @param top_k: Max results.
+        @param top_k: Max results requested by the caller.
         @returns: List of dicts with chunk data and distance score.
         """
+        # Over-fetch to leave headroom for JOIN losses and branch
+        # filtering that happens downstream in the querier (M-3 fix).
+        top_k = top_k * 3
         vec_conn = self._get_vec_conn()
         if vec_conn is None:
             return []
@@ -1321,7 +1349,11 @@ def _fts_escape(query: str) -> str:
     Wraps each token in double quotes to prevent FTS5 syntax
     interpretation (AND/OR/NOT/NEAR operators, column filters).
     Strips characters that have special meaning in FTS5 even
-    inside quotes: ``"`` ``'`` ``*`` ``^`` ``-``.
+    inside quotes: ``"`` ``'`` ``*`` ``^``.
+
+    Leading ``-`` is stripped to neutralise the FTS5 NOT operator,
+    but internal hyphens are preserved so identifier searches like
+    ``my-component`` work correctly (L-2 fix).
 
     @param query: Raw user query.
     @returns: Escaped FTS5 query string.
@@ -1330,6 +1362,8 @@ def _fts_escape(query: str) -> str:
     escaped = []
     for token in tokens:
         clean = token.translate(_FTS5_STRIP)
+        # Strip leading minus (FTS5 NOT) but keep internal hyphens.
+        clean = clean.lstrip("-")
         if clean:
             escaped.append(f'"{clean}"')
     return " ".join(escaped)
@@ -1346,7 +1380,8 @@ def _now_iso() -> str:
 def get_index_dir(repo_path: Path) -> Path:
     """Compute the index directory for a repository.
 
-    Uses a 12-char hash (48-bit) of the realpath for collision resistance.
+    Uses a 16-char hash (64-bit) of the realpath for collision resistance.
+    Birthday bound hits 1% at ~600 million repos (vs ~3.3 million at 48-bit).
 
     @param repo_path: Path to the repository root.
     @returns: Path to the index directory under ~/.local/share/source-recall/.
@@ -1354,7 +1389,7 @@ def get_index_dir(repo_path: Path) -> Path:
     import hashlib
 
     real = str(repo_path.resolve())
-    path_hash = hashlib.sha256(real.encode()).hexdigest()[:12]
+    path_hash = hashlib.sha256(real.encode()).hexdigest()[:16]
     repo_name = repo_path.resolve().name
     base = Path.home() / ".local" / "share" / "source-recall"
     return base / f"{repo_name}-{path_hash}"
