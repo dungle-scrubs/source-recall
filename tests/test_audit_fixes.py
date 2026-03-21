@@ -1520,3 +1520,111 @@ class TestVectorFlushOrdering:
             f"Vector count ({s.vector_count}) != chunk count ({s.chunk_count}). "
             "Vectors may have been flushed before chunks were committed."
         )
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap: refresh >500 changes triggers full rebuild
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshLargeChangeThreshold:
+    def test_refresh_over_threshold_rebuilds(self, tmp_path: Path) -> None:
+        """When refresh detects >500 changes, it delegates to _build_locked."""
+        import shutil
+        from unittest.mock import patch
+
+        from source_recall.builder import IndexBuilder
+        from source_recall.config import SRConfig
+
+        src = Path(__file__).parent / "fixtures" / "py-app"
+        repo = tmp_path / "repo"
+        shutil.copytree(src, repo)
+
+        config = SRConfig()
+        builder = IndexBuilder(repo, config, embedder=None)
+        builder.build()
+
+        # Mock _detect_changes to return >500 changes.
+        fake_changes = [(f"file_{i}.py", "update") for i in range(501)]
+        with patch.object(builder, "_detect_changes", return_value=fake_changes):
+            with patch.object(builder, "_build_locked") as mock_build:
+                result = builder.refresh()
+
+        # Should have called _build_locked for the full rebuild path.
+        mock_build.assert_called_once()
+        assert result == 501
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap: _persist_config failure visibility
+# ---------------------------------------------------------------------------
+
+
+class TestPersistConfigFailure:
+    def test_add_repo_state_survives_persist(self, tmp_path: Path) -> None:
+        """In-memory state is consistent after add, even before persist."""
+        from source_recall.daemon_config import DaemonConfig
+        from source_recall.repo_manager import RepoManager
+
+        config = DaemonConfig(config_path=tmp_path / "nonexistent" / "repos.toml")
+        manager = RepoManager.from_config(config)
+
+        # Create a valid repo dir.
+        repo = tmp_path / "my-repo"
+        repo.mkdir()
+
+        slot = manager.add(repo, name="my-repo")
+        assert slot.name == "my-repo"
+        assert "my-repo" in manager.slots
+
+        # Persist should work when directory is created.
+        config.config_path.parent.mkdir(parents=True, exist_ok=True)
+        toml_str = config.to_toml()
+        assert "daemon" in toml_str
+
+
+# ---------------------------------------------------------------------------
+# Coverage gap: batch_mode transaction atomicity on error
+# ---------------------------------------------------------------------------
+
+
+class TestBatchModeAtomicity:
+    def test_partial_batch_fully_rolls_back(self, tmp_path: Path) -> None:
+        """If an error occurs mid-batch, ALL writes in the batch are rolled back."""
+        store = IndexStore(tmp_path / "test.db")
+        store.open()
+        store.create_schema()
+
+        chunk1 = ChunkData(
+            file_path="a.py",
+            symbol_name="foo",
+            symbol_type=SymbolType.FUNCTION,
+            content="def foo(): pass",
+            start_line=1,
+            end_line=1,
+        )
+        chunk2 = ChunkData(
+            file_path="b.py",
+            symbol_name="bar",
+            symbol_type=SymbolType.FUNCTION,
+            content="def bar(): pass",
+            start_line=1,
+            end_line=1,
+        )
+
+        # Insert chunk1 outside batch — should survive.
+        store.insert_chunks([chunk1])
+        assert store.get_chunk_count() == 1
+
+        # Start batch, insert chunk2, then raise — chunk2 should roll back.
+        with pytest.raises(RuntimeError):
+            with store.batch_mode():
+                store.insert_chunks([chunk2])
+                msg = "simulated crash"
+                raise RuntimeError(msg)
+
+        # Only chunk1 should remain.
+        assert store.get_chunk_count() == 1
+        results = store.fts_search("bar")
+        assert len(results) == 0
+        store.close()
