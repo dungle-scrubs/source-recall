@@ -87,9 +87,7 @@ class IndexBuilder:
             if self.embedder is not None:
                 vec_enabled = store.ensure_vec_table(self.embedder.dimensions)
                 if not vec_enabled:
-                    logger.warning(
-                        "sqlite-vec unavailable — building FTS-only index"
-                    )
+                    logger.warning("sqlite-vec unavailable — building FTS-only index")
 
             # Detect current branch for branch-aware indexing.
             branch = self._get_current_branch()
@@ -176,9 +174,12 @@ class IndexBuilder:
         # Atomic swap (after store is closed by context manager).
         IndexStore.atomic_swap(tmp_path, db_path)
 
-    def refresh(self) -> int:
+    def refresh(self, *, files: list[str] | None = None) -> int:
         """Incremental refresh: only re-index changed files.
 
+        @param files: Optional list of repo-relative paths. When provided,
+            those files are treated as changed (targeted refresh). When
+            omitted, full change detection runs.
         @returns: Number of files re-indexed.
         @raises IndexNotFoundError: If no index exists.
         """
@@ -199,13 +200,20 @@ class IndexBuilder:
                 # Detect current branch.
                 branch = self._get_current_branch()
 
-                # Try git-object-based refresh for blob-SHA diffing.
-                git_refresh_result = self._try_git_object_refresh(store, branch)
-                if git_refresh_result is not None:
-                    return git_refresh_result
+                # Targeted refresh: caller specified exact files.
+                if files is not None:
+                    if not files:
+                        return 0
+                    changed_files = [(f, "update") for f in files]
+                else:
+                    # Try git-object-based refresh for blob-SHA diffing.
+                    git_refresh_result = self._try_git_object_refresh(store, branch)
+                    if git_refresh_result is not None:
+                        return git_refresh_result
 
-                # Fallback: legacy change detection.
-                changed_files = self._detect_changes(store)
+                    # Fallback: legacy change detection.
+                    changed_files = self._detect_changes(store)
+
                 if not changed_files:
                     # Still update active_branch even if no files changed.
                     store.set_meta_batch({"active_branch": branch})
@@ -293,9 +301,7 @@ class IndexBuilder:
 
         return len(changed_files)
 
-    def _try_git_object_refresh(
-        self, store: IndexStore, branch: str
-    ) -> int | None:
+    def _try_git_object_refresh(self, store: IndexStore, branch: str) -> int | None:
         """Attempt git-object-based refresh using blob-SHA diffing.
 
         Compares blob SHAs from ``git ls-tree`` against stored
@@ -347,11 +353,13 @@ class IndexBuilder:
             # Only update branches on unchanged chunks + update meta.
             for rel_path in unchanged:
                 self._update_branches_only(store, rel_path, branch)
-            store.set_meta_batch({
-                "indexed_at": _now_iso(),
-                "last_commit": _git_head(self.repo_path) or "",
-                "active_branch": branch,
-            })
+            store.set_meta_batch(
+                {
+                    "indexed_at": _now_iso(),
+                    "last_commit": _git_head(self.repo_path) or "",
+                    "active_branch": branch,
+                }
+            )
             return 0
 
         if total_changed == 0:
@@ -395,8 +403,11 @@ class IndexBuilder:
                 blob_sha = blob_map.get(rel_path)
                 is_dirty = rel_path in dirty_map
                 chunk_ids = self._index_file(
-                    store, rel_path, branch=branch,
-                    blob_sha=blob_sha, is_dirty=is_dirty,
+                    store,
+                    rel_path,
+                    branch=branch,
+                    blob_sha=blob_sha,
+                    is_dirty=is_dirty,
                 )
                 if vec_enabled and self.embedder is not None:
                     for cid, content in chunk_ids:
@@ -650,11 +661,15 @@ class IndexBuilder:
             # Read from git blob.
             content = self._read_git_blob(blob_sha)
             if content is None:
-                logger.warning("Failed to read git blob for %s — falling back to disk", rel_path)
+                logger.warning(
+                    "Failed to read git blob for %s — falling back to disk", rel_path
+                )
                 try:
                     content = full.read_text(encoding="utf-8", errors="replace")
                 except OSError:
-                    logger.warning("Skipping unreadable file: %s", rel_path, exc_info=True)
+                    logger.warning(
+                        "Skipping unreadable file: %s", rel_path, exc_info=True
+                    )
                     return []
         else:
             # Read from working tree (dirty file or no blob_sha).
