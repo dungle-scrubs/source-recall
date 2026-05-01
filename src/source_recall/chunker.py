@@ -865,7 +865,9 @@ def _chunk_markdown(
     # Pair fences by matching opener/closer marker type and length
     # (``` only closes ```, not ~~~), with proper state tracking.
     fenced_ranges: list[tuple[int, int]] = []
-    open_fence: tuple[str, int, int] | None = None  # (marker_char, start_pos, marker_len)
+    open_fence: tuple[str, int, int] | None = (
+        None  # (marker_char, start_pos, marker_len)
+    )
     for m in _FENCE_RE.finditer(content):
         marker = m.group(1)
         marker_char = marker[0]  # '`' or '~'
@@ -1067,7 +1069,7 @@ def _chunk_text_fallback(
 
     chunks: list[ChunkData] = []
 
-    for start_pos, end_pos in zip(block_starts, block_ends):
+    for start_pos, end_pos in zip(block_starts, block_ends, strict=True):
         text = content[start_pos:end_pos].strip()
         if not text:
             continue
@@ -1419,9 +1421,7 @@ def _has_jsx(node: Node) -> bool:
     return _contains_any_node_type(node, jsx_types)
 
 
-_REACT_WRAPPER_RE = re.compile(
-    r"(?:^|\.)(memo|forwardRef|lazy)$"
-)
+_REACT_WRAPPER_RE = re.compile(r"(?:^|\.)(memo|forwardRef|lazy)$")
 
 
 def _has_react_wrapper(node: Node) -> bool:

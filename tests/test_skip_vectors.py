@@ -5,8 +5,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from source_recall.builder import IndexBuilder
 from source_recall.config import resolve_config
 from source_recall.embedder import BagOfWordsEmbedder

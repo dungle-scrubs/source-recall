@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
-
-import pytest
 
 from source_recall.builder import IndexBuilder
 from source_recall.config import resolve_config
@@ -43,9 +40,7 @@ def _git_init(repo: Path, *, marker: str = "") -> None:
     )
 
 
-def _make_builder(
-    repo: Path, *, embedder: object | None = None
-) -> IndexBuilder:
+def _make_builder(repo: Path, *, embedder: object | None = None) -> IndexBuilder:
     """Create a builder with optional embedder."""
     config = resolve_config(str(repo))
     return IndexBuilder(repo, config, embedder=embedder)
@@ -291,12 +286,6 @@ class TestRefreshBranchSwitch:
         emb = BagOfWordsEmbedder(dimensions=64)
         builder = _make_builder(repo, embedder=emb)
         builder.build()
-
-        # Get initial vector count.
-        db_path = get_db_path(repo)
-        with IndexStore(db_path) as store:
-            store.run_migrations()
-            initial_vec_count = store.get_vector_count()
 
         # Create feature branch with same files.
         subprocess.run(

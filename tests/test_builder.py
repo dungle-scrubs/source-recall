@@ -390,9 +390,7 @@ class TestVecFailureTracking:
         repo.mkdir()
         _git_init(repo)
         (repo / "a.py").write_text("def hello(): pass\n")
-        subprocess.run(
-            ["git", "add", "."], cwd=repo, capture_output=True, check=True
-        )
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "init"],
             cwd=repo,
@@ -408,9 +406,7 @@ class TestVecFailureTracking:
 
         # Modify a file so refresh has work to do.
         (repo / "a.py").write_text("def hello(): return 'world'\n")
-        subprocess.run(
-            ["git", "add", "."], cwd=repo, capture_output=True, check=True
-        )
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "update"],
             cwd=repo,
@@ -422,10 +418,10 @@ class TestVecFailureTracking:
         class BrokenEmbedder:
             dimensions = 64
 
-            def embed_chunks(self, texts: list[str]) -> list[list[float]]:
+            def embed_chunks(self, _texts: list[str]) -> list[list[float]]:
                 raise RuntimeError("GPU on fire")
 
-            def embed_query(self, query: str) -> list[float]:
+            def embed_query(self, _query: str) -> list[float]:
                 return [0.0] * 64
 
         broken_builder = IndexBuilder(repo, config, embedder=BrokenEmbedder())
@@ -444,9 +440,7 @@ class TestVecFailureTracking:
         repo.mkdir()
         _git_init(repo)
         (repo / "a.py").write_text("def hello(): pass\n")
-        subprocess.run(
-            ["git", "add", "."], cwd=repo, capture_output=True, check=True
-        )
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "init"],
             cwd=repo,
@@ -467,9 +461,7 @@ class TestVecFailureTracking:
 
         # Modify file and refresh with working embedder.
         (repo / "a.py").write_text("def hello(): return 42\n")
-        subprocess.run(
-            ["git", "add", "."], cwd=repo, capture_output=True, check=True
-        )
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "fix"],
             cwd=repo,

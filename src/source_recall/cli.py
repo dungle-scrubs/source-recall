@@ -807,9 +807,9 @@ def serve(
 
     # Build the app with explicit config instead of mutating os.environ.
     if no_embed:
-        server_app = create_app(repo_paths, embedder=None)
+        server_app = create_app(repo_paths, embedder=None, rerank_enabled=rerank)
     else:
-        server_app = create_app(repo_paths)
+        server_app = create_app(repo_paths, rerank_enabled=rerank)
 
     err_console.print(f"  Listening on [cyan]http://{host}:{port}[/cyan]")
     err_console.print()

@@ -4,7 +4,6 @@ PID-file locking, and atomic swap.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -258,7 +257,9 @@ def _acquire_lock(lock_path: Path, timeout: float = 0) -> None:
                 if lock_age > _MAX_LOCK_AGE_S:
                     _store_logger.warning(
                         "Stealing ancient lock %s (%.0fs old, PID %d)",
-                        lock_path, lock_age, pid,
+                        lock_path,
+                        lock_age,
+                        pid,
                     )
                     lock_path.unlink(missing_ok=True)
                     continue
@@ -1019,9 +1020,7 @@ class IndexStore:
                 # DELETE on a missing row is a no-op in vec0 — no need
                 # to catch exceptions here.  Real errors (disk, WAL)
                 # should propagate to the outer transaction handler.
-                vec_conn.execute(
-                    "DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,)
-                )
+                vec_conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
                 vec_conn.execute(
                     "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
                     (cid, blob),
@@ -1128,9 +1127,7 @@ class IndexStore:
         if vec_conn is None:
             return
         for cid in chunk_ids:
-            vec_conn.execute(
-                "DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,)
-            )
+            vec_conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
 
     def get_existing_vector_ids(self, chunk_ids: list[str]) -> set[str]:
         """Return the subset of chunk IDs that already have vectors.

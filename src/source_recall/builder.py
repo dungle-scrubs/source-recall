@@ -102,7 +102,7 @@ class IndexBuilder:
                 git_entries = self._discover_files_git_objects()
                 if git_entries is not None:
                     use_git_objects = True
-                    blob_map = {path: sha for path, sha in git_entries}
+                    blob_map = dict(git_entries)
                     dirty_map = self._detect_dirty_files()
                     # Merge dirty files into blob_map (override committed SHAs).
                     blob_map.update(dirty_map)
@@ -329,7 +329,7 @@ class IndexBuilder:
         if git_entries is None:
             return None
 
-        blob_map: dict[str, str] = {path: sha for path, sha in git_entries}
+        blob_map: dict[str, str] = dict(git_entries)
         dirty_map = self._detect_dirty_files()
         blob_map.update(dirty_map)
 
@@ -847,10 +847,11 @@ class IndexBuilder:
                     continue
 
                 stored = stored_hashes.get(rel_path)
-                if stored is None or stored.content_hash != new_hash:
-                    if rel_path not in seen:
-                        changes.append((rel_path, "update"))
-                        seen.add(rel_path)
+                if (
+                    stored is None or stored.content_hash != new_hash
+                ) and rel_path not in seen:
+                    changes.append((rel_path, "update"))
+                    seen.add(rel_path)
 
             # Also check for newly added files not in stored hashes.
             current_files = set(self._discover_files())
