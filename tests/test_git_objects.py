@@ -5,8 +5,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from source_recall.builder import IndexBuilder
 from source_recall.config import resolve_config
 
@@ -102,7 +100,9 @@ class TestDiscoverFilesGitObjects:
         nm.mkdir(parents=True)
         (nm / "index.js").write_text("module.exports = {}")
         (repo / "app.py").write_text("x = 1\n")
-        subprocess.run(["git", "add", "--force", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "add", "--force", "."], cwd=repo, capture_output=True, check=True
+        )
         subprocess.run(
             ["git", "commit", "-m", "with excluded"],
             cwd=repo,

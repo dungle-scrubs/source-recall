@@ -17,9 +17,11 @@ def ts_app_path() -> Path:
 
 
 @pytest.fixture
-def py_app_path() -> Path:
-    """Path to the Python fixture app."""
-    return FIXTURES_DIR / "py-app"
+def py_app_path(tmp_path: Path) -> Path:
+    """Path to an isolated copy of the Python fixture app."""
+    dst = tmp_path / "py-app"
+    shutil.copytree(FIXTURES_DIR / "py-app", dst)
+    return dst
 
 
 @pytest.fixture
@@ -58,9 +60,16 @@ def clean_index_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         repo_name = repo_path.resolve().name
         return index_base / f"{repo_name}-{path_hash}"
 
+    def patched_get_db_path(repo_path: Path) -> Path:
+        return patched_get_index_dir(repo_path) / "index.db"
+
     monkeypatch.setattr(store_mod, "get_index_dir", patched_get_index_dir)
-    monkeypatch.setattr(
-        store_mod,
-        "get_db_path",
-        lambda repo_path: patched_get_index_dir(repo_path) / "index.db",
-    )
+    monkeypatch.setattr(store_mod, "get_db_path", patched_get_db_path)
+
+    # Some modules import get_db_path directly. Patch those aliases too,
+    # otherwise tests can leak paths across test cases after module import.
+    import source_recall.builder as builder_mod
+    import source_recall.querier as querier_mod
+
+    monkeypatch.setattr(builder_mod, "get_db_path", patched_get_db_path)
+    monkeypatch.setattr(querier_mod, "get_db_path", patched_get_db_path)

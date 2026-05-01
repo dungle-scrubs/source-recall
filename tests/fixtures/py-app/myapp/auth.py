@@ -90,6 +90,7 @@ class AuthService:
         # Simplified for fixture purposes.
         return None
 
+
 # targeted change
 
 # targeted change

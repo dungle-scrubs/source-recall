@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import sqlite3
 import subprocess
 import threading
 import time
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -16,9 +17,6 @@ from source_recall.config import resolve_config
 from source_recall.embedder import BagOfWordsEmbedder
 from source_recall.models import (
     ChunkData,
-    FileRecord,
-    ParseMode,
-    SearchQuality,
     SymbolType,
 )
 from source_recall.store import IndexStore, _fts_escape, get_db_path
@@ -29,17 +27,23 @@ def _git_init(repo: Path, *, marker: str = "") -> None:
     subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
-        cwd=repo, capture_output=True, check=True,
+        cwd=repo,
+        capture_output=True,
+        check=True,
     )
     subprocess.run(
         ["git", "config", "user.name", "Test"],
-        cwd=repo, capture_output=True, check=True,
+        cwd=repo,
+        capture_output=True,
+        check=True,
     )
     (repo / "init.txt").write_text(f"init {marker}\n")
     subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
     subprocess.run(
         ["git", "commit", "-m", "init"],
-        cwd=repo, capture_output=True, check=True,
+        cwd=repo,
+        capture_output=True,
+        check=True,
     )
 
 
@@ -48,7 +52,9 @@ def _git_commit(repo: Path, msg: str = "update") -> None:
     subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
     subprocess.run(
         ["git", "commit", "-m", msg, "--allow-empty"],
-        cwd=repo, capture_output=True, check=True,
+        cwd=repo,
+        capture_output=True,
+        check=True,
     )
 
 
@@ -160,7 +166,9 @@ class TestOrphanedVectors:
                             (old_id,),
                         )
                     )
-                    assert len(rows) == 0, f"Orphaned vector for deleted file chunk {old_id}"
+                    assert len(rows) == 0, (
+                        f"Orphaned vector for deleted file chunk {old_id}"
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +215,8 @@ class TestQuerierThreadSafety:
 
         # Run several refreshes while queries are in flight.
         for _ in range(3):
-            try:
+            with contextlib.suppress(Exception):
                 idx.refresh()
-            except Exception:
-                pass
             time.sleep(0.02)
 
         stop.set()
@@ -318,9 +324,8 @@ class TestMigrationBatchGuard:
         store.open()
         store.create_schema()
 
-        with pytest.raises(AssertionError, match="batch_mode"):
-            with store.batch_mode():
-                store.run_migrations()
+        with pytest.raises(AssertionError, match="batch_mode"), store.batch_mode():
+            store.run_migrations()
 
         store.close()
 
@@ -508,10 +513,12 @@ class TestLockAgeCheck:
 
         # Create a lock file with our own PID but ancient timestamp.
         # (Our PID is alive, simulating PID recycling.)
-        payload = json.dumps({
-            "pid": os.getpid(),
-            "started": "2020-01-01T00:00:00+00:00",
-        })
+        payload = json.dumps(
+            {
+                "pid": os.getpid(),
+                "started": "2020-01-01T00:00:00+00:00",
+            }
+        )
         lock_path.write_text(payload)
 
         # Set the file's mtime to be very old.
@@ -580,7 +587,6 @@ class TestIndexDirHashLength:
 
     def test_hash_length_at_least_16_chars(self) -> None:
         """get_index_dir uses at least 16 hex chars (64 bits)."""
-        from source_recall.store import get_index_dir
 
         # Note: get_index_dir is monkeypatched in tests, so we call the
         # real implementation directly.
@@ -642,7 +648,7 @@ class TestMigrationRollback:
         ]
 
         try:
-            with pytest.raises(Exception):
+            with pytest.raises(sqlite3.DatabaseError):
                 store.run_migrations()
 
             # Version should remain at the original.

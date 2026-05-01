@@ -14,11 +14,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import pytest
-
 from source_recall.builder import IndexBuilder
 from source_recall.config import resolve_config
-from source_recall.embedder import BagOfWordsEmbedder
 from source_recall.store import IndexStore, get_db_path
 
 
@@ -27,17 +24,23 @@ def _git_init(repo: Path, *, marker: str = "") -> None:
     subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
-        cwd=repo, capture_output=True, check=True,
+        cwd=repo,
+        capture_output=True,
+        check=True,
     )
     subprocess.run(
         ["git", "config", "user.name", "Test"],
-        cwd=repo, capture_output=True, check=True,
+        cwd=repo,
+        capture_output=True,
+        check=True,
     )
     (repo / "init.py").write_text(f"# {marker or repo.name}\nx = 1\n")
     subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
     subprocess.run(
         ["git", "commit", "-m", f"init {marker or repo.name}"],
-        cwd=repo, capture_output=True, check=True,
+        cwd=repo,
+        capture_output=True,
+        check=True,
     )
 
 
@@ -57,7 +60,9 @@ class TestGitObjectRefreshDeletion:
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "two files"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         config = resolve_config(str(repo))
@@ -72,13 +77,17 @@ class TestGitObjectRefreshDeletion:
         # Create feature branch that deletes remove_me.py.
         subprocess.run(
             ["git", "checkout", "-b", "feature"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
         (repo / "remove_me.py").unlink()
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "delete file"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         changed = builder.refresh()
@@ -145,7 +154,9 @@ class TestFtsIntegrityAfterBranchSwitch:
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "shared file"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         config = resolve_config(str(repo))
@@ -162,13 +173,17 @@ class TestFtsIntegrityAfterBranchSwitch:
         # Switch to feature branch (shared.py identical).
         subprocess.run(
             ["git", "checkout", "-b", "feature"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
         (repo / "feature.py").write_text("def feature_func(): return 99\n")
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "feature file"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         builder.refresh()
@@ -195,7 +210,9 @@ class TestFtsIntegrityAfterBranchSwitch:
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "core"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         config = resolve_config(str(repo))
@@ -205,11 +222,15 @@ class TestFtsIntegrityAfterBranchSwitch:
         # Switch to feature.
         subprocess.run(
             ["git", "checkout", "-b", "feature"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
         subprocess.run(
             ["git", "commit", "--allow-empty", "-m", "empty feature"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
         builder.refresh()
 
@@ -248,7 +269,9 @@ class TestLegacyDetectChangesWithBlobHash:
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "add app"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         config = resolve_config(str(repo))
@@ -264,14 +287,16 @@ class TestLegacyDetectChangesWithBlobHash:
 
         # Force legacy path by monkeypatching _try_git_object_refresh.
         original = builder._try_git_object_refresh
-        builder._try_git_object_refresh = lambda store, branch: None
+        builder._try_git_object_refresh = lambda _store, _branch: None
 
         # Modify a file so there's something to detect.
         (repo / "app.py").write_text("def hello(): return 'changed'\n")
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "change app"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         # Should not crash — may re-index everything (conservative).
@@ -300,7 +325,9 @@ class TestReadGitBlobBinary:
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "binary file"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         config = resolve_config(str(repo))
@@ -322,9 +349,7 @@ class TestReadGitBlobBinary:
 
 
 class TestDirtyFileOnRefresh:
-    def test_uncommitted_modification_detected_on_refresh(
-        self, tmp_path: Path
-    ) -> None:
+    def test_uncommitted_modification_detected_on_refresh(self, tmp_path: Path) -> None:
         """Refresh detects and re-indexes uncommitted file changes."""
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -333,7 +358,9 @@ class TestDirtyFileOnRefresh:
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "add app"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         config = resolve_config(str(repo))
@@ -364,7 +391,9 @@ class TestDirtyFileOnRefresh:
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "add app"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         config = resolve_config(str(repo))

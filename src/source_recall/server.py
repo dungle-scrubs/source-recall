@@ -159,6 +159,8 @@ class ReposResponse(BaseModel):
 def create_app(
     repo_paths: list[Path] | Path,
     embedder: Any | None = _SENTINEL,
+    *,
+    rerank_enabled: bool = False,
 ) -> FastAPI:
     """Create a FastAPI app serving one or more repository indexes.
 
@@ -167,6 +169,7 @@ def create_app(
 
     @param repo_paths: One or more repo root paths to serve.
     @param embedder: Embedder instance (omit for auto-create, None for FTS-only).
+    @param rerank_enabled: Whether to enable cross-encoder reranking.
     @returns: Configured FastAPI application.
     """
     if isinstance(repo_paths, Path):
@@ -191,7 +194,7 @@ def create_app(
         for repo_path in repo_paths:
             name = repo_path.name
             logger.info("Loading index for %s (%s)...", name, repo_path)
-            idx = Index(repo_path, embedder=embedder)
+            idx = Index(repo_path, embedder=embedder, rerank_enabled=rerank_enabled)
             idx.status()
             state["indexes"][name] = {"index": idx, "path": repo_path}
 

@@ -12,8 +12,6 @@ from source_recall.embedder import BagOfWordsEmbedder
 from source_recall.models import (
     ChunkData,
     ConfigError,
-    FileRecord,
-    ParseMode,
     SearchQuality,
     SymbolType,
 )
@@ -811,11 +809,15 @@ class TestDetectChangesRebaseFallback:
         subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "config", "user.email", "t@t.com"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
         subprocess.run(
             ["git", "config", "user.name", "T"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         builder = IndexBuilder(repo, resolve_config(repo))
@@ -835,7 +837,7 @@ class TestServeNoEnvMutation:
         from source_recall.cli import serve
 
         source = inspect.getsource(serve)
-        assert 'os.environ[' not in source
+        assert "os.environ[" not in source
 
 
 # ---------------------------------------------------------------------------
@@ -848,17 +850,23 @@ def _git_init_audit(repo: Path, *, marker: str = "") -> None:
     subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
     subprocess.run(
         ["git", "config", "user.email", "test@test.com"],
-        cwd=repo, capture_output=True, check=True,
+        cwd=repo,
+        capture_output=True,
+        check=True,
     )
     subprocess.run(
         ["git", "config", "user.name", "Test"],
-        cwd=repo, capture_output=True, check=True,
+        cwd=repo,
+        capture_output=True,
+        check=True,
     )
     (repo / "init.py").write_text(f"# {marker or repo.name}\nx = 1\n")
     subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
     subprocess.run(
         ["git", "commit", "-m", f"init {marker or repo.name}"],
-        cwd=repo, capture_output=True, check=True,
+        cwd=repo,
+        capture_output=True,
+        check=True,
     )
 
 
@@ -876,7 +884,9 @@ class TestC1VectorAtomicity:
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "initial"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         emb = BagOfWordsEmbedder(dimensions=64)
@@ -891,7 +901,9 @@ class TestC1VectorAtomicity:
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "update"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         refreshed = idx.refresh()
@@ -944,7 +956,9 @@ class TestH2PdfBranchAwareness:
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "add pdf"],
-            cwd=repo, capture_output=True, check=True,
+            cwd=repo,
+            capture_output=True,
+            check=True,
         )
 
         from source_recall import Index
@@ -1011,14 +1025,10 @@ class TestH4QueryRequestValidation:
 
         app = create_app(py_app_path, embedder=emb)
         with TestClient(app) as client:
-            resp = client.post(
-                "/query", json={"question": "test", "top_k": 0}
-            )
+            resp = client.post("/query", json={"question": "test", "top_k": 0})
             assert resp.status_code == 422
 
-            resp = client.post(
-                "/query", json={"question": "test", "top_k": 101}
-            )
+            resp = client.post("/query", json={"question": "test", "top_k": 101})
             assert resp.status_code == 422
 
 
@@ -1055,14 +1065,20 @@ class TestM3BatchModeReentrant:
         store.create_schema()
 
         chunk = ChunkData(
-            file_path="a.py", symbol_name="outer",
-            symbol_type=SymbolType.FUNCTION, content="def outer(): pass",
-            start_line=1, end_line=1,
+            file_path="a.py",
+            symbol_name="outer",
+            symbol_type=SymbolType.FUNCTION,
+            content="def outer(): pass",
+            start_line=1,
+            end_line=1,
         )
         chunk_inner = ChunkData(
-            file_path="b.py", symbol_name="inner",
-            symbol_type=SymbolType.FUNCTION, content="def inner(): pass",
-            start_line=1, end_line=1,
+            file_path="b.py",
+            symbol_name="inner",
+            symbol_type=SymbolType.FUNCTION,
+            content="def inner(): pass",
+            start_line=1,
+            end_line=1,
         )
 
         with store.batch_mode():
@@ -1074,18 +1090,19 @@ class TestM3BatchModeReentrant:
         assert store.get_chunk_count() == 2
         store.close()
 
-    def test_nested_batch_inner_rollback_preserves_outer(
-        self, tmp_path: Path
-    ) -> None:
+    def test_nested_batch_inner_rollback_preserves_outer(self, tmp_path: Path) -> None:
         """Inner batch failure rolls back only inner work."""
         store = IndexStore(tmp_path / "test.db")
         store.open()
         store.create_schema()
 
         chunk_outer = ChunkData(
-            file_path="a.py", symbol_name="outer",
-            symbol_type=SymbolType.FUNCTION, content="def outer(): pass",
-            start_line=1, end_line=1,
+            file_path="a.py",
+            symbol_name="outer",
+            symbol_type=SymbolType.FUNCTION,
+            content="def outer(): pass",
+            start_line=1,
+            end_line=1,
         )
 
         with store.batch_mode():
@@ -1177,9 +1194,7 @@ class TestM5IndexContextManager:
 class TestM6SavepointCounterInstance:
     """M6: _sp_counter is per-instance, not class-level."""
 
-    def test_separate_instances_have_separate_counters(
-        self, tmp_path: Path
-    ) -> None:
+    def test_separate_instances_have_separate_counters(self, tmp_path: Path) -> None:
         """Two IndexStore instances don't share savepoint counters."""
         s1 = IndexStore(tmp_path / "a.db")
         s1.open()
@@ -1189,9 +1204,8 @@ class TestM6SavepointCounterInstance:
         s2.open()
         s2.create_schema()
 
-        with s1.batch_mode():
-            with s1._transaction():
-                pass
+        with s1.batch_mode(), s1._transaction():
+            pass
         assert s1._sp_counter >= 1
         assert s2._sp_counter == 0
 
@@ -1255,7 +1269,7 @@ class TestL4CleanJsonAction:
 class TestL3RerankIntegration:
     """L3: Reranker integration with query pipeline."""
 
-    def test_dummy_reranker_preserves_order(self, tmp_path: Path) -> None:
+    def test_dummy_reranker_preserves_order(self) -> None:
         """DummyReranker returns results in original order."""
         from source_recall.reranker import DummyReranker
 
@@ -1278,10 +1292,9 @@ class TestL3RerankIntegration:
         (repo / "app.py").write_text("def hello(): return 1\n")
 
         idx = Index(repo, embedder=None, rerank_enabled=True)
-        reranker = idx._get_reranker()
+        idx._get_reranker()
         # CrossEncoderReranker or None depending on availability.
         # The key test is that it doesn't crash.
-        assert reranker is not None or True  # May fail to load model.
 
 
 class TestM4TextFallbackLineTracking:
@@ -1323,31 +1336,37 @@ class TestM4TextFallbackLineTracking:
 class TestC2ConfigResolutionPriority:
     """C2: env vars must beat TOML values."""
 
-    def test_env_var_beats_toml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_env_var_beats_toml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """SR_TOP_K env var overrides top_k in .source-recall.toml."""
         from source_recall.config import resolve_config
 
         toml_path = tmp_path / ".source-recall.toml"
-        toml_path.write_text('[source-recall]\ntop_k = 42\n')
+        toml_path.write_text("[source-recall]\ntop_k = 42\n")
 
         monkeypatch.setenv("SR_TOP_K", "99")
 
         config = resolve_config(tmp_path)
         assert config.top_k == 99
 
-    def test_toml_used_when_no_env_var(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_toml_used_when_no_env_var(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """TOML value is used when no env var is set."""
         from source_recall.config import resolve_config
 
         toml_path = tmp_path / ".source-recall.toml"
-        toml_path.write_text('[source-recall]\ntop_k = 42\n')
+        toml_path.write_text("[source-recall]\ntop_k = 42\n")
 
         monkeypatch.delenv("SR_TOP_K", raising=False)
 
         config = resolve_config(tmp_path)
         assert config.top_k == 42
 
-    def test_override_beats_env_var(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_override_beats_env_var(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Explicit override beats env var."""
         from source_recall.config import resolve_config
 
@@ -1356,12 +1375,14 @@ class TestC2ConfigResolutionPriority:
         config = resolve_config(tmp_path, top_k=7)
         assert config.top_k == 7
 
-    def test_override_beats_toml(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_override_beats_toml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Explicit override beats TOML."""
         from source_recall.config import resolve_config
 
         toml_path = tmp_path / ".source-recall.toml"
-        toml_path.write_text('[source-recall]\ntop_k = 42\n')
+        toml_path.write_text("[source-recall]\ntop_k = 42\n")
 
         monkeypatch.delenv("SR_TOP_K", raising=False)
 
@@ -1395,11 +1416,7 @@ class TestC1FenceLengthComparison:
         """4-backtick closer properly closes 4-backtick opener."""
         from source_recall.chunker import chunk_file
 
-        content = (
-            "# Before\n\n"
-            "````\nfenced content\n````\n\n"
-            "# After\n"
-        )
+        content = "# Before\n\n````\nfenced content\n````\n\n# After\n"
         chunks, _ = chunk_file("test.md", content)
         heading_names = [c.symbol_name for c in chunks if c.symbol_name]
         assert "Before" in heading_names
@@ -1409,11 +1426,7 @@ class TestC1FenceLengthComparison:
         """5-backtick closer closes a 3-backtick opener."""
         from source_recall.chunker import chunk_file
 
-        content = (
-            "# Before\n\n"
-            "```\nfenced\n`````\n\n"
-            "# After\n"
-        )
+        content = "# Before\n\n```\nfenced\n`````\n\n# After\n"
         chunks, _ = chunk_file("test.md", content)
         heading_names = [c.symbol_name for c in chunks if c.symbol_name]
         assert "Before" in heading_names
@@ -1474,12 +1487,7 @@ class TestM8UnclosedFence:
         """Headings after an unclosed fence opener are excluded."""
         from source_recall.chunker import chunk_file
 
-        content = (
-            "# Before\n\n"
-            "```python\n"
-            "code here\n"
-            "# Not A Real Heading\n"
-        )
+        content = "# Before\n\n```python\ncode here\n# Not A Real Heading\n"
         chunks, _ = chunk_file("test.md", content)
         heading_names = [c.symbol_name for c in chunks if c.symbol_name]
         assert "Before" in heading_names
@@ -1546,9 +1554,11 @@ class TestRefreshLargeChangeThreshold:
 
         # Mock _detect_changes to return >500 changes.
         fake_changes = [(f"file_{i}.py", "update") for i in range(501)]
-        with patch.object(builder, "_detect_changes", return_value=fake_changes):
-            with patch.object(builder, "_build_locked") as mock_build:
-                result = builder.refresh()
+        with (
+            patch.object(builder, "_detect_changes", return_value=fake_changes),
+            patch.object(builder, "_build_locked") as mock_build,
+        ):
+            result = builder.refresh()
 
         # Should have called _build_locked for the full rebuild path.
         mock_build.assert_called_once()
@@ -1617,11 +1627,10 @@ class TestBatchModeAtomicity:
         assert store.get_chunk_count() == 1
 
         # Start batch, insert chunk2, then raise — chunk2 should roll back.
-        with pytest.raises(RuntimeError):
-            with store.batch_mode():
-                store.insert_chunks([chunk2])
-                msg = "simulated crash"
-                raise RuntimeError(msg)
+        with pytest.raises(RuntimeError), store.batch_mode():
+            store.insert_chunks([chunk2])
+            msg = "simulated crash"
+            raise RuntimeError(msg)
 
         # Only chunk1 should remain.
         assert store.get_chunk_count() == 1

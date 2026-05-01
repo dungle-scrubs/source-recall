@@ -11,6 +11,10 @@ test *args:
 t *args:
     uv run python -m pytest --tb=short -q {{args}}
 
+# Run end-to-end smoke test against this repository
+smoke path=".":
+    ./scripts/smoke.sh {{path}}
+
 # Lint and format
 lint:
     uv run ruff check src/ tests/
