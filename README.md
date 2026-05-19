@@ -234,6 +234,7 @@ just install       # install sr globally
 
 ```bash
 # Setup
+mise install
 uv sync
 
 # Run tests (fast, skips model-loading tests)
@@ -245,3 +246,7 @@ uv run python -m pytest
 # Lint
 uv run ruff check src/ tests/
 ```
+
+This repo uses mise to pin the local Python, uv, and just versions.
+Run `mise install` after cloning, then use the existing `uv` and `just`
+commands normally.
