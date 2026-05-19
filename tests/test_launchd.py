@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from source_recall.daemon_config import DaemonConfig
 from source_recall.launchd import PLIST_LABEL, generate_plist
 
@@ -55,6 +57,23 @@ class TestPlistGeneration:
         config = DaemonConfig(config_path=cfg_path)
         plist = generate_plist(config)
         assert str(cfg_path) in plist
+
+    def test_prefers_repo_local_venv_sr_binary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Plist uses repo-local .venv/bin/sr when available."""
+        venv_bin = tmp_path / ".venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        sr_bin = venv_bin / "sr"
+        sr_bin.write_text("#!/bin/sh\n")
+        sr_bin.chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+        plist = generate_plist(DaemonConfig())
+
+        assert f"<string>{sr_bin}</string>" in plist
+        assert "<string>sr</string>" not in plist
 
 
 class TestDaemonStartCLI:

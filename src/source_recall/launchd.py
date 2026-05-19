@@ -22,6 +22,9 @@ def _find_sr_binary() -> str:
     """
     import shutil
 
+    local_venv_sr = Path.cwd() / ".venv" / "bin" / "sr"
+    if local_venv_sr.exists():
+        return str(local_venv_sr)
     sr = shutil.which("sr")
     if sr:
         return sr
