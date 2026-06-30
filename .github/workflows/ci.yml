@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        # Pinned to the version mise.toml declares so CI matches
+        # local dev exactly.
+        run: |
+          pip install --upgrade uv==0.11.15
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Restore uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        # uv sync installs the dev dependency group, which includes
+        # source-recall[embed] so slow-marked tests can import
+        # sentence_transformers when they run.
+        run: |
+          uv sync --frozen
+
+      - name: Lint
+        run: |
+          uv run ruff check src/ tests/
+          uv run ruff format --check src/ tests/
+
+      - name: Test (fast)
+        # Skip slow tests on every PR — they download ~500 MB of model
+        # weights and add ~30s. Run them in the nightly job below.
+        run: |
+          uv run pytest -m "not slow" --tb=short
+
+  test-slow:
+    name: Slow tests (model-loading)
+    runs-on: ubuntu-latest
+    # Run nightly and on release tags. Not per-PR.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: pip install --upgrade uv==0.11.15
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Restore uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-slow-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-slow-${{ runner.os }}-
+
+      - name: Restore HuggingFace model cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-coderankembed
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run slow tests
+        run: uv run pytest -m "slow" --tb=short
+
+  smoke:
+    name: End-to-end smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: pip install --upgrade uv==0.11.15
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Restore uv cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-smoke-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-smoke-${{ runner.os }}-
+
+      - name: Install dependencies
+        # Smoke runs the FTS-only path (no --embed), so the embed
+        # extra isn't strictly needed. Install core only to verify
+        # the FTS-only install path works end-to-end.
+        run: uv sync --frozen
+
+      - name: Smoke test
+        run: ./scripts/smoke.sh

@@ -14,7 +14,6 @@ import signal
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 
 def test_daemon_module_installs_sigterm_handler(tmp_path: Path) -> None:
@@ -44,16 +43,15 @@ def test_daemon_module_installs_sigterm_handler(tmp_path: Path) -> None:
         # both direct invocation (kill -TERM) and Ctrl-C.
         current_term = signal.getsignal(signal.SIGTERM)
         current_int = signal.getsignal(signal.SIGINT)
-        assert current_term in (handler, signal.SIG_DFL) or callable(
-            current_term
-        ), "SIGTERM handler not installed"
+        assert current_term in (handler, signal.SIG_DFL) or callable(current_term), (
+            "SIGTERM handler not installed"
+        )
         # signal.getsignal may return _signal.HandlerType on some
         # platforms; accept any callable.
         assert callable(current_int), "SIGINT handler not installed"
 
         # Invoking the handler with (signum, frame) must set the
         # shared stop event so the periodic refresh loop exits.
-        import threading
 
         # Reset the handler to its prior state in case subsequent
         # tests are sensitive to SIGTERM handling.

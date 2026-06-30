@@ -1172,9 +1172,7 @@ class IndexStore:
         vec_conn.execute("BEGIN")
         try:
             for cid in chunk_ids:
-                vec_conn.execute(
-                    "DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,)
-                )
+                vec_conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?", (cid,))
             vec_conn.execute("COMMIT")
         except Exception:
             vec_conn.execute("ROLLBACK")

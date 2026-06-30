@@ -58,7 +58,7 @@ class TestBuildBatchAtomicity:
         # Several files, each producing chunks + refs + symbol lookups.
         for i in range(5):
             (repo / f"f{i}.py").write_text(
-                f"import os\n" f"def func_{i}():\n" f"    return {i}\n"
+                f"import os\ndef func_{i}():\n    return {i}\n"
             )
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
@@ -102,9 +102,7 @@ class TestBuildBatchAtomicity:
         repo = tmp_path / "repo"
         repo.mkdir()
         _git_init(repo, marker="consistency")
-        (repo / "a.py").write_text(
-            "import os\n" "def alpha():\n" "    return os.getcwd()\n"
-        )
+        (repo / "a.py").write_text("import os\ndef alpha():\n    return os.getcwd()\n")
         subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
         subprocess.run(
             ["git", "commit", "-m", "a"],

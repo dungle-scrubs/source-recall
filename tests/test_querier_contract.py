@@ -58,15 +58,19 @@ def _build_with_refs(repo: Path) -> None:
             "helper_five",
         ):
             store.insert_refs(
-                [RefData(source_chunk_id=caller, target_symbol=name, ref_type=RefType.CALL)]
+                [
+                    RefData(
+                        source_chunk_id=caller,
+                        target_symbol=name,
+                        ref_type=RefType.CALL,
+                    )
+                ]
             )
         store.conn.commit()
 
 
 class TestResultLengthContract:
-    def test_query_returns_at_most_top_k_with_expansion(
-        self, tmp_path: Path
-    ) -> None:
+    def test_query_returns_at_most_top_k_with_expansion(self, tmp_path: Path) -> None:
         """len(results) must never exceed top_k, even with graph expansion."""
         repo = tmp_path / "repo"
         _build_with_refs(repo)

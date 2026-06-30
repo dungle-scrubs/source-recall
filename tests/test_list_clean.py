@@ -16,8 +16,8 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from source_recall.cli import app
 import source_recall.store as store_mod
+from source_recall.cli import app
 
 runner = CliRunner()
 

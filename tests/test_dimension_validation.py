@@ -65,9 +65,7 @@ class TestEmbedDimensionValidation:
         with caplog.at_level(logging.WARNING, logger="source_recall.querier"):
             querier.query("authenticate")
 
-        warnings = [
-            r for r in caplog.records if "dimension" in r.message.lower()
-        ]
+        warnings = [r for r in caplog.records if "dimension" in r.message.lower()]
         assert warnings == [], f"Unexpected dimension warning: {warnings!r}"
         querier.close()
 
@@ -82,8 +80,6 @@ class TestEmbedDimensionValidation:
         with caplog.at_level(logging.WARNING, logger="source_recall.querier"):
             querier.query("authenticate")
 
-        warnings = [
-            r for r in caplog.records if "dimension" in r.message.lower()
-        ]
+        warnings = [r for r in caplog.records if "dimension" in r.message.lower()]
         assert warnings == []
         querier.close()

@@ -14,5 +14,13 @@ build/
 *.lock
 .env
 .DS_Store
-uv.lock
+# uv.lock is committed for reproducible CI (uv sync --frozen).
+!uv.lock
 .claude/
+# AI assistant state directories — don't leak contributor tooling into PRs.
+.aider*
+.continue/
+.cursor/
+AGENTS.local.md
+*.swp
+*.swo

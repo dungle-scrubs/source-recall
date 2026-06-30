@@ -49,7 +49,6 @@ def _install_shutdown_handlers() -> Any:
         logger.info("Received signal %d — initiating graceful shutdown", signum)
         _stop_event.set()
 
-    prior_term = signal.getsignal(signal.SIGTERM)
     prior_int = signal.getsignal(signal.SIGINT)
     try:
         signal.signal(signal.SIGTERM, _handler)
@@ -376,8 +375,7 @@ def create_daemon_app(
         # serialize outside the lock so we don't hold it during I/O.
         manager = _get_manager()
         cfg.repos = [
-            DaemonConfig.RepoEntry(path=p, name=n)
-            for n, p in manager.snapshot_repos()
+            DaemonConfig.RepoEntry(path=p, name=n) for n, p in manager.snapshot_repos()
         ]
 
         toml_str = cfg.to_toml()

@@ -115,8 +115,6 @@ def test_failed_build_removes_tmp_sidecars(tmp_path: Path) -> None:
         db_path.parent / f"{db_path.name}.tmp.{pid}-shm",
     ]
     leftovers = [s for s in sidecars if s.exists()]
-    assert leftovers == [], (
-        f"Failed build left tmp sidecars behind: {leftovers}"
-    )
+    assert leftovers == [], f"Failed build left tmp sidecars behind: {leftovers}"
     # Silence unused-name lint from the import-only pattern above.
     assert real_atomic_swap is not None

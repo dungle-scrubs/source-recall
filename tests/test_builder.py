@@ -378,7 +378,6 @@ class TestIdentityVerification:
         with pytest.raises(IndexIdentityError):
             builder_b.refresh()
 
-
     def test_missing_repo_path_meta_with_matching_commit_raises(
         self, tmp_path: Path
     ) -> None:

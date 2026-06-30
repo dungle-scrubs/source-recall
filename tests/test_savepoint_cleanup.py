@@ -39,9 +39,7 @@ def _rewind_schema_version(store: IndexStore, version: int) -> None:
         ("schema_version", str(version)),
     )
     # Clear any migration rows at >= version to mirror a true v3 DB.
-    store.conn.execute(
-        "DELETE FROM schema_migrations WHERE version >= ?", (version,)
-    )
+    store.conn.execute("DELETE FROM schema_migrations WHERE version >= ?", (version,))
     store.conn.commit()
 
 
@@ -70,9 +68,7 @@ class TestSavepointReleaseOnRollback:
         assert row is not None
         assert row[0] == "ok"
 
-    def test_failed_transaction_releases_nested_savepoint(
-        self, tmp_path: Path
-    ) -> None:
+    def test_failed_transaction_releases_nested_savepoint(self, tmp_path: Path) -> None:
         """A failing nested _transaction inside batch_mode releases its savepoint."""
         store = _make_store(tmp_path)
 
@@ -92,10 +88,7 @@ class TestSavepointReleaseOnRollback:
             )
 
         # The inner write was rolled back, the outer write committed.
-        keys = {
-            row[0]
-            for row in store.conn.execute("SELECT key FROM meta").fetchall()
-        }
+        keys = {row[0] for row in store.conn.execute("SELECT key FROM meta").fetchall()}
         assert "inside_tx" not in keys
         assert "after_outer" in keys
 
@@ -118,10 +111,7 @@ class TestSavepointReleaseOnRollback:
                 ("after_outer", "ok"),
             )
 
-        keys = {
-            row[0]
-            for row in store.conn.execute("SELECT key FROM meta").fetchall()
-        }
+        keys = {row[0] for row in store.conn.execute("SELECT key FROM meta").fetchall()}
         assert "inside_nested" not in keys
         assert "after_outer" in keys
 
@@ -145,11 +135,11 @@ class TestSavepointReleaseOnRollback:
                 raise RuntimeError("first call fails")
             return original(*args, **kwargs)
 
-        with patch.object(
-            store, "_migrate_004_add_columns", failing_then_ok
+        with (
+            patch.object(store, "_migrate_004_add_columns", failing_then_ok),
+            pytest.raises(RuntimeError),
         ):
-            with pytest.raises(RuntimeError):
-                store.run_migrations()
+            store.run_migrations()
 
         # Second run should succeed.
         store.run_migrations()
@@ -216,9 +206,8 @@ class TestSavepointReleaseOnRollback:
         # alive long enough to observe the leak.
         with store.batch_mode():
             for _ in range(3):
-                with pytest.raises(RuntimeError):
-                    with store._transaction():
-                        raise RuntimeError("boom")
+                with pytest.raises(RuntimeError), store._transaction():
+                    raise RuntimeError("boom")
 
             # Locate the highest ``sp_N`` savepoint that survived. Each
             # failure leaks one in the buggy code; the fix prevents any.

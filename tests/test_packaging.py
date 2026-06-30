@@ -12,8 +12,6 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -90,9 +88,13 @@ class TestLazyImportContract:
                 if stripped.startswith("#"):
                     continue
                 if (
-                    "import sentence_transformers" in stripped
-                    or "from sentence_transformers" in stripped
-                ) and not line.startswith(" ") and not line.startswith("\t"):
+                    (
+                        "import sentence_transformers" in stripped
+                        or "from sentence_transformers" in stripped
+                    )
+                    and not line.startswith(" ")
+                    and not line.startswith("\t")
+                ):
                     violations.append(f"{py.name}: {line.strip()}")
                     break
         assert violations == [], (
@@ -106,16 +108,18 @@ class TestLazyImportContract:
 
         # Ensure any cached import is cleared so we observe fresh import.
         for mod in list(sys.modules):
-            if mod == "sentence_transformers" or mod.startswith("sentence_transformers."):
+            if mod == "sentence_transformers" or mod.startswith(
+                "sentence_transformers."
+            ):
                 del sys.modules[mod]
 
         # Importing the Index class and constructing with embedder=None
         # must not pull in sentence_transformers.
         from source_recall import Index  # noqa: F401
 
-        # Construction with embedder=None must not raise and must not
-        # import sentence_transformers.
-        Index.__init__  # touch the class to ensure it's loaded
+        # The import above is the act under test; if it had triggered
+        # a module-level sentence_transformers import, the assertion
+        # below would catch it.
         assert "sentence_transformers" not in sys.modules, (
             "importing Index triggered a sentence_transformers import"
         )

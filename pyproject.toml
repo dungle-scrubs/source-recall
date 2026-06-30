@@ -83,6 +83,11 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/source_recall/cli.py" = ["B008"]  # typer uses function calls in arg defaults
+"tests/*" = [
+    "SIM117",  # nested with-statements are clearer than combined in arrange/act/assert tests
+    "ARG001",  # unused function args match fixture/mock signatures
+    "ARG002",  # unused method args match fixture/mock signatures
+]
 
 [tool.ruff.lint.isort]
 known-first-party = ["source_recall"]

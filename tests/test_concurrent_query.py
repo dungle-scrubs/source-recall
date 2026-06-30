@@ -78,7 +78,7 @@ class TestConcurrentQueries:
             f"queries did not run concurrently (max in-flight={in_flight['max']})"
         )
         assert elapsed < 2 * sleep_s, (
-            f"queries serialized: elapsed={elapsed:.2f}s, expected <{2*sleep_s}s"
+            f"queries serialized: elapsed={elapsed:.2f}s, expected <{2 * sleep_s}s"
         )
 
     def test_refresh_waits_for_in_flight_query(self, tmp_path: Path) -> None:
@@ -87,7 +87,6 @@ class TestConcurrentQueries:
 
         from source_recall import querier as querier_mod
 
-        sleep_s = 0.3
         original = querier_mod.IndexQuerier.query
         query_started = threading.Event()
         query_can_finish = threading.Event()

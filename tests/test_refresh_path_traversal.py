@@ -7,7 +7,6 @@ force its content into the index. These tests pin the rejection behavior.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
@@ -42,7 +41,9 @@ class TestRefreshPathValidation:
 
         # The sentinel MUST still exist with its original contents
         # (refresh path never actually opened the file for read).
-        assert (outer / "secret.txt").read_text(encoding="utf-8") == "SHOULD NOT BE READ"
+        assert (outer / "secret.txt").read_text(
+            encoding="utf-8"
+        ) == "SHOULD NOT BE READ"
 
     def test_rejects_absolute_path(self, tmp_path: Path) -> None:
         """Absolute filesystem paths outside the repo are rejected."""
