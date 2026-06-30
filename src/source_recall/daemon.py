@@ -192,6 +192,12 @@ def create_daemon_app(
         t0 = time.monotonic()
         state["started_at"] = t0
 
+        # Clear any leftover stop signal from a prior daemon instance in
+        # the same process (e.g. a previous test's lifespan shutdown set
+        # the module-level event). Without this, the periodic refresh
+        # loop sees the event already set and exits before the first tick.
+        _stop_event.clear()
+
         # Install signal handlers so SIGTERM/SIGINT outside uvicorn's
         # own handling still triggers a graceful drain (H-2 audit fix).
         _install_shutdown_handlers()
