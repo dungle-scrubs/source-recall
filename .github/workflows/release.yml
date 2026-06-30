@@ -47,7 +47,7 @@ jobs:
           ref: ${{ needs.release-please.outputs.tag_name }}
 
       - name: Install uv
-        run: pip install --upgrade uv==0.11.15
+        run: pip install --upgrade uv==0.11.25
 
       - name: Set up Python
         uses: actions/setup-python@v5
