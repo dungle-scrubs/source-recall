@@ -119,35 +119,5 @@ remove name:
 daemon-repos:
     uv run sr repos
 
-# Legacy launchd recipes (deprecated — use daemon-* instead)
-
-# Install and start launchd service (DEPRECATED)
-launchd-install:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "DEPRECATED: Use 'just daemon-start' instead"
-    plist="$HOME/Library/LaunchAgents/dev.source-recall.serve.plist"
-    if [ -f "$plist" ]; then
-        echo "Unloading existing service..."
-        launchctl bootout gui/$(id -u) "$plist" 2>/dev/null || true
-    fi
-    cp launchd/dev.source-recall.serve.plist "$plist"
-    echo "Installed plist to $plist"
-    echo "Edit it to set your repo paths, then run: just launchd-start"
-
-# Start launchd service (DEPRECATED)
-launchd-start:
-    @echo "DEPRECATED: Use 'just daemon-start' instead"
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.source-recall.serve.plist
-    @echo "Service started. Check: just health"
-
-# Stop launchd service (DEPRECATED)
-launchd-stop:
-    @echo "DEPRECATED: Use 'just daemon-stop' instead"
-    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/dev.source-recall.serve.plist
-    @echo "Service stopped."
-
-# View launchd service logs (DEPRECATED)
-launchd-logs:
-    @echo "DEPRECATED: Use 'just daemon-logs' instead"
-    tail -50 /tmp/source-recall-serve.log
+# Legacy launchd recipes removed — use 'sr daemon start' / 'just daemon-start'
+# which generate a path-resolved plist dynamically via launchd.generate_plist().
