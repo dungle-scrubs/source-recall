@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false  # never cancel an in-flight release
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          release-type: python
+          # Config and manifest live at the repo root.
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish:
+    runs-on: ubuntu-latest
+    # Publish in the SAME workflow as release-please. Using a separate
+    # workflow triggered by 'release: published' would silently fail
+    # because GITHUB_TOKEN-generated events don't trigger other workflows.
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      # trusted publishing (OIDC) — no PyPI token needed if the project
+      # is registered on PyPI. Replace with a stored token (PYPI_TOKEN)
+      # if trusted publishing is not configured.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Check out the release tag, not main, so the build matches
+          # the published artifact.
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: Install uv
+        run: pip install --upgrade uv==0.11.15
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # If you haven't configured trusted publishing on PyPI yet,
+        # add a 'password' input pointing at a PYPI_TOKEN secret:
+        #   with:
+        #     password: ${{ secrets.PYPI_TOKEN }}
+        # and remove the id-token: write permission above.
+
+      - name: Create GitHub Release with artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release-please.outputs.tag_name }}
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            LICENSE

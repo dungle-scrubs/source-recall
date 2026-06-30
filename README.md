@@ -250,16 +250,19 @@ just install       # install sr globally
 
 ## Development
 
+See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the full guide. The
+short version:
+
 ```bash
 # Setup
 mise install
 uv sync
 
 # Run tests (fast, skips model-loading tests)
-uv run python -m pytest -m "not slow"
+uv run pytest -m "not slow"
 
 # Run all tests including slow model tests
-uv run python -m pytest
+uv run pytest
 
 # Lint
 uv run ruff check src/ tests/
