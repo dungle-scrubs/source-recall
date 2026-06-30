@@ -1,0 +1,13 @@
+database:
+  host: localhost
+  port: 5432
+  name: myapp
+  pool_size: 10
+
+redis:
+  host: localhost
+  port: 6379
+
+auth:
+  secret_key: change-me
+  token_ttl: 86400

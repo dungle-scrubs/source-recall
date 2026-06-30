@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.source-recall.serve</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Edit these paths to match your setup -->
+        <string>/Users/kevin/.local/bin/sr</string>
+        <string>serve</string>
+        <!-- Add repo paths here, e.g.: -->
+        <!-- <string>/Users/kevin/dev/cheater</string> -->
+        <!-- <string>/Users/kevin/dev/source-recall</string> -->
+        <string>--port</string>
+        <string>7249</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/source-recall-serve.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/source-recall-serve.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/kevin/.local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
