@@ -92,9 +92,6 @@ ignore = ["E501"]
 [tool.ruff.lint.isort]
 known-first-party = ["source_recall"]
 
-[tool.ty]
-src = ["src"]
-
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
