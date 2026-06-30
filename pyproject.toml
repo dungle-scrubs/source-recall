@@ -20,26 +20,40 @@ dependencies = [
     # L4: Pre-1.0 — vec0 virtual-table API may change.
     # Pinned exactly; monitor for 1.0 release.
     "sqlite-vec==0.1.6",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "pymupdf>=1.24.0",
+    # L6: apsw bundles its own SQLite.  A major upgrade could bundle a
+    # version incompatible with stdlib sqlite3 (both access the same
+    # WAL file).  Pin conservatively.  apsw is required on all
+    # platforms: stdlib sqlite3 is built without
+    # SQLITE_ENABLE_LOAD_EXTENSION on most distros, so we use apsw's
+    # extension-loading API as the load path for sqlite-vec.
+    "apsw>=3.49.0.0,<4.0.0.0",
+    "httpx>=0.28.1",
+]
+
+[project.optional-dependencies]
+# Heavy ML deps pulled only when vector search / reranking is wanted.
+# FTS-only users install without the extra and avoid the ~2 GB torch
+# download.  Import is lazy (see tests/test_packaging.py), so omitting
+# the extra just disables vector features at runtime.
+embed = [
     # L5: Minor upgrades may change embedding behavior. Stored vectors
     # could become incompatible with new query vectors.  Consider
     # storing the library version in meta for compat checking.
     "sentence-transformers>=3.0.0,<4.0.0",
     "onnxruntime>=1.18.0,<2.0.0",
     "einops>=0.8.0,<1.0.0",
-    "fastapi>=0.115.0",
-    "uvicorn>=0.32.0",
-    "pymupdf>=1.24.0",
-    # L6: apsw bundles its own SQLite.  A major upgrade could bundle a
-    # version incompatible with stdlib sqlite3 (both access the same
-    # WAL file).  Pin conservatively.
-    "apsw>=3.49.0.0,<4.0.0.0",
-    "httpx>=0.28.1",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.9.0",
+    # The embed extra so the test suite has access to the real
+    # embedder/reranker for slow-marked tests.
+    "source-recall[embed]",
 ]
 
 [project.scripts]

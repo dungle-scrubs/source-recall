@@ -6,7 +6,23 @@ BM25 + vector search with reciprocal rank fusion.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+## Requirements
+
+- Python ≥ 3.12 (3.13 recommended)
+- [uv](https://docs.astral.sh/uv/) for installs (or any PEP 517 installer)
+- [mise](https://mise.jdx.dev/) optional but recommended — pins Python,
+  uv, and just to known-good versions (run `mise install` after cloning)
+
 ## Install
+
+Full install (with vector search and reranking, ~2 GB model deps):
+
+```bash
+uv tool install -e .[embed]
+```
+
+FTS-only install (no model download, instant startup, keyword search
+only):
 
 ```bash
 uv tool install -e .
@@ -105,7 +121,7 @@ Configuration is resolved in order (first wins):
 | `SR_TOP_K` | `8` | Default number of results |
 | `SR_CHUNK_MAX_CHARS` | `6000` | Max characters per chunk before sub-chunking |
 | `SR_AUTO_REFRESH` | `true` | Auto-refresh stale indexes before queries |
-| `SR_EMBED_ENABLED` | `true` | Enable vector embeddings (set `false` for FTS-only) |
+| `SR_EMBED_ENABLED` | `true` | Enable vector embeddings (set `false` for FTS-only). Requires the `embed` install extra. |
 | `SR_EMBED_BATCH_SIZE` | `32` | Chunks per embedding batch |
 | `SR_RERANK_ENABLED` | `false` | Enable cross-encoder reranking (slower, more accurate) |
 
@@ -130,7 +146,7 @@ exclude_patterns = ["node_modules/", "dist/", ".git/"]
 | `top_k` | int | 8 | Results per query (1–100). |
 | `chunk_max_chars` | int | 6,000 | Sub-chunk threshold. |
 | `auto_refresh` | bool | true | Re-index changed files before querying. |
-| `embed_enabled` | bool | true | `false` disables vector search entirely. |
+| `embed_enabled` | bool | true | `false` disables vector search entirely. Requires the `embed` install extra. |
 | `embed_batch_size` | int | 32 | Tune for memory vs speed (1–512). |
 | `rerank_enabled` | bool | false | Cross-encoder reranking over top candidates. Adds ~100ms per query but improves relevance. |
 | `exclude_patterns` | list | see below | Glob patterns to skip during indexing. |
