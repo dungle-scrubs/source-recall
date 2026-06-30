@@ -478,9 +478,12 @@ class IndexStore:
                 )
                 self.conn.execute(f"RELEASE migration_{version}")
             except Exception:
-                # ROLLBACK TO leaves the savepoint open; release it so the
-                # connection is left clean even though we're about to re-raise.
+                # ROLLBACK TO retains the savepoint in the transaction
+                # stack (per SQLite docs); explicit RELEASE removes it
+                # so repeated failures in the same transaction window
+                # don't accumulate nested savepoints of the same name.
                 self.conn.execute(f"ROLLBACK TO migration_{version}")
+                self.conn.execute(f"RELEASE migration_{version}")
                 raise
 
     def _migrate_004_add_columns(self) -> None:
@@ -1314,9 +1317,11 @@ class IndexStore:
                 yield
                 self.conn.execute(f"RELEASE {sp}")
             except Exception:
-                # ROLLBACK TO leaves the savepoint open; release it so
-                # the connection is clean after the exception bubbles up.
+                # ROLLBACK TO retains the savepoint; explicit RELEASE
+                # removes it so the connection is clean after the
+                # exception bubbles up.
                 self.conn.execute(f"ROLLBACK TO {sp}")
+                self.conn.execute(f"RELEASE {sp}")
                 raise
         else:
             self.conn.execute("BEGIN")
@@ -1361,9 +1366,11 @@ class IndexStore:
                 yield
                 self.conn.execute(f"RELEASE {sp}")
             except Exception:
-                # ROLLBACK TO leaves the savepoint open; release it so
-                # the savepoint list stays clean across re-entries.
+                # ROLLBACK TO retains the savepoint; explicit RELEASE
+                # removes it so the savepoint list stays clean across
+                # re-entries.
                 self.conn.execute(f"ROLLBACK TO {sp}")
+                self.conn.execute(f"RELEASE {sp}")
                 raise
             finally:
                 self._batch_depth -= 1
