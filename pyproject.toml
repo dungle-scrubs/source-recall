@@ -3,11 +3,25 @@ name = "source-recall"
 version = "0.1.0"
 description = "Code search and retrieval for AI coding tools"
 readme = "README.md"
+keywords = ["code-search", "retrieval", "tree-sitter", "embeddings", "semantic-search", "developer-tools"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Text Processing :: Indexing",
+]
 authors = [
     { name = "Kevin", email = "dungle-scrubs@users.noreply.github.com" },
 ]
 requires-python = ">=3.12"
 license = "MIT"
+license-files = ["LICENSE"]
+urls = { Homepage = "https://github.com/dungle-scrubs/source-recall", Repository = "https://github.com/dungle-scrubs/source-recall", Issues = "https://github.com/dungle-scrubs/source-recall/issues", Changelog = "https://github.com/dungle-scrubs/source-recall/blob/main/CHANGELOG.md" }
 dependencies = [
     # Pinned exactly — C ABI breaks across minor versions.
     # See AGENTS.md "tree-sitter pins are exact".
@@ -60,7 +74,7 @@ dev = [
 sr = "source_recall.cli:app"
 
 [build-system]
-requires = ["uv_build>=0.9.26,<0.11.0"]
+requires = ["uv_build>=0.8.0,<0.12.0"]
 build-backend = "uv_build"
 
 [tool.ruff]
