@@ -9,7 +9,7 @@ proposed beyond this report.
 
 Verdict: **Not ready to publish.** Three blockers (license, CI, test
 isolation contract for `sentence-transformers`); one high-severity
-issue (release artifact distribution); ~12 medium items; ~8 low.
+issue (release artifact distribution); ~11 medium items; ~8 low.
 
 ---
 
@@ -66,6 +66,11 @@ embed = ["sentence-transformers>=3.0.0,<4.0.0", "onnxruntime>=1.18.0,<2.0.0", "e
 dev = ["pytest>=8.0.0", "ruff>=0.9.0", "source-recall[embed]"]
 ```
 
+Note: the `dev` group MUST include `source-recall[embed]`, otherwise
+the test suite loses access to `sentence_transformers` and
+`test_reranker.py::test_cross_encoder_reranker_reorders` (the one
+`slow`-marked test) silently fails to import the library it tests.
+
 Update README install: `uv tool install -e .[embed]` or
 `uv tool install -e .` for FTS-only mode.
 
@@ -96,35 +101,11 @@ from uv.
 Recommended action: add a `## Requirements` section in README
 stating Python ≥ 3.12 and that mise is recommended.
 
-### H-3. `apsw` listed as a hard dependency even though it's only used on macOS for sqlite-vec
-
-`store.py:27` says "sqlite-vec availability (requires apsw for
-extension loading on macOS)". Yet `apsw` is in core `dependencies`,
-not an `[os-specific]` extra. On Linux the stdlib `sqlite3` can load
-extensions via `conn.enable_load_extension(True) + sqlite_vec.load()`,
-which would let the project drop `apsw` on Linux entirely. As-is,
-Linux users pay for an unused dependency.
-
-Recommended action: gate `apsw` on `sys.platform == "darwin"` either
-via a marker (`"apsw>=3.49.0.0,<4.0.0.0; sys_platform == 'darwin'"`)
-or a separate `[os-darwin]` extra. Verify `sqlite-vec` works on Linux
-without `apsw` first; the design comment suggests it should.
-
 ---
 
 ## 🟡 Medium-Severity
 
-### M-1. `.gitignore` excludes `uv.lock`
-
-Line: `.gitignore:19`
-The lock file is committed in the current tree (verified: `uv.lock`
-exists at 296 KB) but is listed in `.gitignore`. Either remove the
-line (if the project commits the lock) or document the decision.
-Most open-source Python projects commit `uv.lock` for reproducible
-installs; the current tree follows that practice but the gitignore
-suggests the original intent was to not commit it.
-
-### M-2. `.gitignore` allows `.claude/` to be ignored but doesn't add `.cursor/`, `.aider*`, etc.
+### M-1. `.gitignore` allows `.claude/` to be ignored but doesn't add `.cursor/`, `.aider*`, etc.
 
 Line: `.gitignore:20`
 `.claude/` is gitignored, which is appropriate. But there's no entry
@@ -135,7 +116,7 @@ its state files will leak into the PR.
 Recommended action: ignore common AI-tool state: `.aider*`,
 `.continue/`, `AGENTS.local.md`, `.cursor/`, `*.swp`.
 
-### M-3. `pyproject.toml` `authors` uses a GitHub noreply email
+### M-2. `pyproject.toml` `authors` uses a GitHub noreply email
 
 Line: `pyproject.toml:6`
 `authors = [{ name = "Kevin", email = "dungle-scrubs@users.noreply.github.com" }]`
@@ -145,14 +126,14 @@ support is intended, list a real contact channel (GitHub Discussions,
 Discord, mailing list). Otherwise document that the project is
 maintained on a best-effort basis.
 
-### M-4. No `CODE_OF_CONDUCT.md`
+### M-3. No `CODE_OF_CONDUCT.md`
 
 GitHub displays a `CODE_OF_CONDUCT.md` link in the community
 profile; missing it signals "we haven't thought about governance".
 A simple `Contributor Covenant v2.1` is the minimum bar for OSS
 publishing.
 
-### M-5. No `CONTRIBUTING.md`
+### M-4. No `CONTRIBUTING.md`
 
 The README has a `## Development` section with the basics, but no
 dedicated CONTRIBUTING guide for how to file issues, run a single
@@ -160,12 +141,12 @@ test, write a regression test, etc. AGENTS.md covers the TDD
 discipline well but is internal documentation — a CONTRIBUTING.md
 should reference it.
 
-### M-6. No SECURITY.md / vulnerability disclosure policy
+### M-5. No SECURITY.md / vulnerability disclosure policy
 
 Standard for OSS. One-paragraph "report via GitHub Security Advisories
 or email X with a 90-day disclosure window" is enough.
 
-### M-7. `tests/test_reranker.py::TestRerankerProtocol::test_cross_encoder_reranker_reorders` is marked `@pytest.mark.slow` but is the ONLY model-loading test
+### M-6. `tests/test_reranker.py::TestRerankerProtocol::test_cross_encoder_reranker_reorders` is marked `@pytest.mark.slow` but is the ONLY model-loading test
 
 Line: `tests/test_reranker.py:27`
 The mark exists but no other test in the suite actually loads the
@@ -174,14 +155,14 @@ will never exercise the production embedding path. Either add a
 small smoke test for `CodeRankEmbedder` (using a tiny fixture) or
 note in CI that the slow suite runs nightly, not per-PR.
 
-### M-8. `scripts/smoke.sh` is the only smoke test; no equivalent for daemon mode
+### M-7. `scripts/smoke.sh` is the only smoke test; no equivalent for daemon mode
 
 Line: `scripts/smoke.sh`
 The script exercises the CLI + HTTP server smoke path. It does not
 exercise the daemon (`sr daemon run`). The daemon is documented as
 the multi-repo / refresh story; it deserves its own smoke check.
 
-### M-9. `launchd/dev.source-recall.serve.plist` hardcodes `/Users/kevin`
+### M-8. `launchd/dev.source-recall.serve.plist` hardcodes `/Users/kevin`
 
 Line: `launchd/dev.source-recall.serve.plist:11` and `:18`
 Hardcoded path `/Users/kevin/.local/bin/sr` and a comment "Edit these
@@ -192,7 +173,7 @@ which means anyone who clones gets a non-working plist. Either:
 - Document loudly in README that the plist is a template requiring
   editing.
 
-### M-10. `justfile` has 12+ deprecated recipes (`launchd-*`) that print deprecation warnings
+### M-9. `justfile` has 12+ deprecated recipes (`launchd-*`) that print deprecation warnings
 
 Line: `justfile:88-127`
 The `launchd-install/start/stop/logs` recipes print "DEPRECATED" but
@@ -200,14 +181,14 @@ remain in the file. For an OSS release, dead code in user-facing
 recipes is confusing. Either remove them or move them to a
 deprecated.md justfile target.
 
-### M-11. No `ty` check in CI / `justfile`
+### M-10. No `ty` check in CI / `justfile`
 
 `pyproject.toml` declares `[tool.ty]` (the Astral type checker) but
 neither `just lint` nor any command runs `ty check`. If the project
 intends to use `ty`, add a `just typecheck` recipe and run it in CI.
 If not, remove the `[tool.ty]` block.
 
-### M-12. README claim "30ms queries" is unverified on a multi-repo cold start
+### M-11. README claim "30ms queries" is unverified on a multi-repo cold start
 
 Line: `README.md:13` and `README.md:79`
 The README states `sr serve` is "~30ms queries instead of 12s". The
@@ -216,7 +197,7 @@ conditions (single repo? cold or warm? query length?). For OSS
 marketing it would be more credible to say "<100ms in practice;
 depends on query complexity and index size".
 
-### M-13. No example / demo
+### M-12. No example / demo
 
 For a code-search tool, a 30-second demo (terminal recording or
 screencast) is the highest-ROI documentation. The README has curl
@@ -304,8 +285,8 @@ are exact, good — verify they're not stale.
 2. **B-2**: Add `.github/workflows/ci.yml`. ~30 min including matrix.
 3. **B-3**: Split `embed` extra. ~1 hour including test verification.
 4. **H-1**: Pick version policy + first PyPI release. Half a day.
-5. **H-2/H-3**: README + apsw gating. ~1 hour.
-6. **M-1..M-13**: drive-by sweep. Half a day total.
+5. **H-2**: README Python version requirement. ~10 min.
+6. **M-1..M-12**: drive-by sweep. Half a day total.
 
 Total to publishable: ~1 focused day of work. After that, point the
 `release-please` skill at the repo and cut a v0.1.0.
