@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **packaging:** Trove classifiers, keywords, and `[project.urls]`
+  (Homepage, Repository, Issues, Changelog) in `pyproject.toml`. The
+  PyPI listing now carries Python-version, topic, and audience
+  classifiers plus direct links back to the project.
+- **packaging:** `license-files = ["LICENSE"]` so the MIT LICENSE
+  ships inside the sdist (`License-File: LICENSE` in METADATA) and is
+  discoverable by license scanners.
 - **cli:** `sr --version` (and `-v`) reports the installed version, derived
   from package metadata so it tracks release-please bumps automatically.
 - **license:** MIT LICENSE file and SPDX license expression in `pyproject.toml`.
@@ -67,3 +74,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.plans/` and `.tallow/`. Removed the unused `[tool.ty]` block.
 - **docs:** README gains a Requirements section, a Support section,
   and a qualified query-latency claim.
+
+### Fixed
+- **build:** `build-system.requires` upper bound bumped from
+  `uv_build<0.11.0` to `<0.12.0`. The previous constraint excluded the
+  uv_build series that CI (`uv==0.11.x`) ships; `uv build` only warned,
+  but PEP 517 frontends honoring `build-system.requires` (pip, `build`)
+  would have selected an incompatible backend.
+- **tracking:** `.plans/` and `.tallow/` were listed in `.gitignore`
+  but never untracked. `git rm --cached` removes the 7 author-local
+  scratch files from the index; they remain on disk, ignored.
+- **toolchain:** Bumped the uv pin from `0.11.15` to `0.11.25` in
+  `mise.toml`, `.github/workflows/ci.yml`, and
+  `.github/workflows/release.yml` so local dev and CI agree on the uv
+  binary version.
