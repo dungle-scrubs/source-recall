@@ -18,11 +18,34 @@ BagOfWordsEmbedder test double.
 Markdown (heading-based), PDF (pymupdf page extraction),
 plain text (sentence-boundary sliding window).
 
-## In Progress
-
 ### Phase 1c — Reranking + cross-references
-See `PHASE1C.md`. Local cross-encoder reranking, import/call/type
-ref extraction, symbol_lookup table, score-gated graph expansion.
+Local cross-encoder reranking (`cross-encoder/ms-marco-MiniLM-L-6-v2`),
+import/inherit/decorator/import ref extraction in `chunker.py`,
+`refs` + `symbol_lookup` tables (schema migration v3), store CRUD
+with FK cascade, score-gated graph expansion in `querier.py`.
+Off by default; enable with `SR_RERANK_ENABLED=true`. Adds ~100ms
+per query. Validated by `tests/test_refs.py` (11 tests) and
+`tests/test_reranker.py` (3 tests, one marked `slow`).
+
+## Planned
+
+### Release readiness
+See `OPEN_SOURCE_READINESS.md`. Blockers before publishing:
+LICENSE, CI workflow, `sentence-transformers` as optional extra.
+
+### Phase 2 — MCP server
+Model Context Protocol server so LLM tools (Claude, Cursor, etc.)
+can use source-recall as a retrieval backend. Separate from the
+HTTP query server — MCP uses stdio transport with JSON-RPC.
+
+Tools to expose:
+- `search_code` — query with natural language
+- `lookup_symbol` — exact symbol lookup
+- `get_file_context` — retrieve a file's chunks with refs
+- `index_status` — check index health
+
+The MCP server wraps the same `Index` API that `sr serve` uses.
+Difference is transport (stdio vs HTTP) and protocol (MCP vs REST).
 
 ## Planned
 
