@@ -614,6 +614,23 @@ def create_daemon_app(
             state["bg_threads"].append(t)
         t.start()
 
+        # Wrap join so the thread is removed from bg_threads once it
+        # finishes (whether via daemon shutdown or any other caller).
+        # Without this the list grows unbounded over the daemon's
+        # lifetime and shutdown joins every historical thread, paying
+        # N×(join-timeout) even when no work is in flight.
+        _orig_join = t.join
+
+        def _join_then_cleanup(timeout: float | None = None) -> None:
+            try:
+                _orig_join(timeout=timeout)
+            finally:
+                with state["bg_threads_lock"]:
+                    if t in state["bg_threads"]:
+                        state["bg_threads"].remove(t)
+
+        t.join = _join_then_cleanup  # type: ignore[method-assign]
+
         return RepoStateResponse(
             name=slot.name,
             path=str(slot.path),
