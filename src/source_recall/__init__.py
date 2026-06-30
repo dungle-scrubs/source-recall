@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import threading
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -20,6 +22,11 @@ from source_recall.models import (
     SchemaVersionError,
     SourceRecallError,
 )
+
+try:
+    __version__ = _pkg_version("source-recall")
+except PackageNotFoundError:  # pragma: no cover - editable/source checkout
+    __version__ = "0.0.0+unknown"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -87,6 +94,7 @@ __all__ = [
     "SchemaVersionError",
     "ConfigError",
     "FileDiscoveryError",
+    "__version__",
 ]
 
 

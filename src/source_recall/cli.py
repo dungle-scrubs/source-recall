@@ -12,10 +12,19 @@ import typer
 from rich.console import Console
 from rich.syntax import Syntax
 
+from source_recall.__init__ import __version__
 from source_recall.store import get_index_base
 
 if TYPE_CHECKING:
     from source_recall.models import IndexStatus
+
+
+def _version_callback(value: bool) -> None:
+    """Print the installed version and exit when --version is passed."""
+    if value:
+        typer.echo(__version__)
+        raise typer.Exit
+
 
 app = typer.Typer(
     name="sr",
@@ -35,6 +44,26 @@ app = typer.Typer(
     ),
     no_args_is_help=True,
 )
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    version: bool = typer.Option(  # noqa: ARG001
+        None,
+        "--version",
+        "-v",
+        callback=_version_callback,
+        is_eager=True,
+        help="Show the installed version and exit.",
+    ),
+) -> None:
+    """source-recall: Code search and retrieval for AI coding tools."""
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit
+
+
 console = Console()
 err_console = Console(stderr=True)
 
