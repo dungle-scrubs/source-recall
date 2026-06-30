@@ -54,6 +54,14 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Verify install
+        # Resolve the lock and confirm the package imports + reports its
+        # version before building. Catches a broken release before it is
+        # published.
+        run: |
+          uv sync --frozen
+          uv run sr --version
+
       - name: Build distributions
         run: uv build
 
