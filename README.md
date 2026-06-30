@@ -4,6 +4,8 @@ Fast code and document search. Indexes repositories with tree-sitter
 parsing, embeds chunks with a local model, and retrieves via hybrid
 BM25 + vector search with reciprocal rank fusion.
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 ## Install
 
 ```bash
