@@ -3,7 +3,7 @@
 Thanks for your interest in contributing. This guide covers the
 basics. For the full design rationale and the load-bearing
 constraints the codebase depends on, read
-[`AGENTS.md`](./AGENTS.md) and the [`critiques/`](./critiques/)
+[`AGENTS.md`](./AGENTS.md) and the [`docs/history/critiques/`](./docs/history/critiques/)
 directory.
 
 ## Requirements

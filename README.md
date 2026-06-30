@@ -39,7 +39,7 @@ sr index ~/dev/my-project
 # Search
 sr ask "how does authentication work" ~/dev/my-project
 
-# Start persistent server (30ms queries instead of 12s)
+# Start persistent server (typically <100ms warm queries vs ~12s cold)
 sr serve ~/dev/my-project
 ```
 
@@ -72,7 +72,7 @@ sr ask --files "database"         # file paths only
 ### `sr serve [PATHS...]`
 
 Start a persistent HTTP query server. Loads the embedding model
-once on startup (~12s), then serves queries in ~30ms.
+once on startup (~12s), then serves warm queries in <100ms.
 
 ```bash
 sr serve .                                    # single repo
@@ -202,25 +202,30 @@ search (no model download, instant startup).
 
 ## Auto-Start (macOS)
 
-A launchd plist is included for running `sr serve` at login:
+The daemon can run as a launchd service that auto-starts at login and
+restarts on crash. `sr daemon start` generates a plist dynamically
+(with resolved paths from your environment) and loads it — no manual
+editing required:
 
 ```bash
-# Edit the plist to set your repo paths
-vim launchd/dev.source-recall.serve.plist
+# Configure which repos the daemon serves
+sr add ~/dev/my-project
 
-# Install and start
-just launchd-install
-just launchd-start
+# Generate the plist and start the service
+sr daemon start
 
 # Check status
-just health
+sr daemon status
 
 # View logs
-just launchd-logs
+sr daemon logs
 
 # Stop
-just launchd-stop
+sr daemon stop
 ```
+
+Other platforms (systemd on Linux, Task Scheduler on Windows) are not
+yet automated; run `sr daemon run` in your platform's service manager.
 
 ## Justfile
 
@@ -271,3 +276,12 @@ uv run ruff check src/ tests/
 This repo uses mise to pin the local Python, uv, and just versions.
 Run `mise install` after cloning, then use the existing `uv` and `just`
 commands normally.
+
+## Support
+
+- **Bugs and feature requests:** [GitHub Issues][issues]
+- **Security vulnerabilities:** see [`SECURITY.md`](./SECURITY.md) — do
+  not open a public issue; use a private GitHub Security Advisory.
+- **Code of conduct:** [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
+
+[issues]: https://github.com/dungle-scrubs/source-recall/issues

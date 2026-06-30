@@ -22,5 +22,8 @@ build/
 .continue/
 .cursor/
 AGENTS.local.md
+# Author-local planning/tooling scratch space — not part of the project.
+.plans/
+.tallow/
 *.swp
 *.swo

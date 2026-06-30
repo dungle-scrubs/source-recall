@@ -77,9 +77,9 @@ change the format without migrating existing indexes.
 5. If error-node density exceeds 10%, the file falls
    back to text chunking automatically
 
-## `critiques/` is design rationale, not code
+## `docs/history/critiques/` is design rationale, not code
 
-The four markdown files in `critiques/` document
+The four markdown files in `docs/history/critiques/` document
 adversarial review of early design decisions. They drove
 the Phase 1 architecture. Read them before proposing
 structural changes.
