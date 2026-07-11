@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from source_recall.daemon_config import DaemonConfig
-from source_recall.launchd import PLIST_LABEL, generate_plist
+from source_recall.launchd import (
+    PLIST_LABEL,
+    generate_plist,
+    install_plist,
+    is_loaded,
+    unload_plist,
+)
 
 
 class TestPlistGeneration:
@@ -74,6 +80,87 @@ class TestPlistGeneration:
 
         assert f"<string>{sr_bin}</string>" in plist
         assert "<string>sr</string>" not in plist
+
+
+class TestPlistLifecycle:
+    """Behavioral tests for install/unload/is_loaded, subprocess mocked.
+
+    subprocess.run is patched throughout so these tests never touch the
+    real ~/Library/LaunchAgents or invoke the real launchctl.
+    """
+
+    def test_install_plist_writes_file_and_bootstraps(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """install_plist writes the plist to PLIST_PATH and calls bootstrap."""
+        plist_path = tmp_path / "dev.source-recall.daemon.plist"
+        monkeypatch.setattr("source_recall.launchd.PLIST_PATH", plist_path)
+        config = DaemonConfig()
+
+        with (
+            patch("source_recall.launchd.unload_plist") as mock_unload,
+            patch("source_recall.launchd.subprocess.run") as mock_run,
+            patch("source_recall.launchd.os.getuid", return_value=501),
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+            result = install_plist(config)
+
+        mock_unload.assert_called_once()
+        assert result == plist_path
+        assert plist_path.exists()
+        assert PLIST_LABEL in plist_path.read_text()
+
+        mock_run.assert_called_once_with(
+            ["launchctl", "bootstrap", "gui/501", str(plist_path)],
+            check=True,
+            capture_output=True,
+        )
+
+    def test_unload_plist_calls_bootout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """unload_plist invokes launchctl bootout with the plist path."""
+        plist_path = tmp_path / "dev.source-recall.daemon.plist"
+        monkeypatch.setattr("source_recall.launchd.PLIST_PATH", plist_path)
+
+        with (
+            patch("source_recall.launchd.subprocess.run") as mock_run,
+            patch("source_recall.launchd.os.getuid", return_value=501),
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+            unload_plist()
+
+        mock_run.assert_called_once_with(
+            ["launchctl", "bootout", "gui/501", str(plist_path)],
+            capture_output=True,
+        )
+
+    def test_is_loaded_true_when_launchctl_reports_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """is_loaded returns True when launchctl print exits 0."""
+        with (
+            patch("source_recall.launchd.subprocess.run") as mock_run,
+            patch("source_recall.launchd.os.getuid", return_value=501),
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+            assert is_loaded() is True
+
+        mock_run.assert_called_once_with(
+            ["launchctl", "print", f"gui/501/{PLIST_LABEL}"],
+            capture_output=True,
+        )
+
+    def test_is_loaded_false_when_launchctl_reports_nonzero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """is_loaded returns False when launchctl print exits nonzero."""
+        with (
+            patch("source_recall.launchd.subprocess.run") as mock_run,
+            patch("source_recall.launchd.os.getuid", return_value=501),
+        ):
+            mock_run.return_value = MagicMock(returncode=3)
+            assert is_loaded() is False
 
 
 class TestDaemonStartCLI:
