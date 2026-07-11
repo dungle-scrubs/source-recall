@@ -317,6 +317,19 @@ def _release_lock(lock_path: Path) -> None:
 # IndexStore
 # ---------------------------------------------------------------------------
 
+# Conservative bound below SQLITE_MAX_VARIABLE_NUMBER, which can be as low as
+# 999 on older/limited SQLite builds. lookup_symbols batches its IN-list to
+# stay under this so a large unique-name set cannot fail the whole query.
+_SYMBOL_LOOKUP_BATCH = 900
+
+# Higher rank = stronger parse fidelity. Used to keep the best definitions
+# when the per-name cap in lookup_symbols drops the surplus.
+_SEARCH_QUALITY_RANK: dict[str, int] = {
+    "ast": 2,
+    "regex": 1,
+    "text_fallback": 0,
+}
+
 
 def _search_row_from_lookup(row: sqlite3.Row) -> SearchRow:
     """Map a symbol_lookup JOIN row to a SearchRow (positional).
@@ -1019,7 +1032,12 @@ class IndexStore:
           ref-encounter ordering; and
         - ``limit`` is applied **per name**, so a hot symbol with many
           definitions cannot starve later names (a single global ``LIMIT``
-          would).
+          would). The cap is quality-aware: definitions are ordered by
+          ``search_quality`` (ast > regex > text_fallback, stable) before
+          truncation so the strongest definitions survive.
+
+        The unique-name IN-list is batched under SQLITE_MAX_VARIABLE_NUMBER
+        so a large reference set cannot fail the query on limited builds.
 
         @param symbol_names: Symbol names to resolve (duplicates ignored).
         @param limit: Optional per-name cap on definitions returned.
@@ -1030,27 +1048,39 @@ class IndexStore:
         # Dedup while preserving order so a repeated ref target does not
         # inflate the IN-list or the result set.
         unique = list(dict.fromkeys(symbol_names))
-        placeholders = ",".join("?" for _ in unique)
-        # Select the lookup key (sl.symbol_name) first so we can group by
-        # the *requested* name regardless of the chunk's own symbol_name.
-        sql = (
-            "SELECT sl.symbol_name, sl.chunk_id, sl.file_path, c.symbol_name, "
-            "c.symbol_type, c.content, c.start_line, c.end_line, "
-            "c.search_quality, c.branches "
-            "FROM symbol_lookup sl "
-            "JOIN chunks c ON c.id = sl.chunk_id "
-            f"WHERE sl.symbol_name IN ({placeholders})"
-        )
-        rows = self.conn.execute(sql, list(unique)).fetchall()
 
+        # Batch the IN-list under SQLITE_MAX_VARIABLE_NUMBER: a single query
+        # with thousands of placeholders fails on limited SQLite builds.
         grouped: dict[str, list[SearchRow]] = {}
-        for row in rows:
-            grouped.setdefault(row[0], []).append(_search_row_from_lookup(row[1:]))
+        for start in range(0, len(unique), _SYMBOL_LOOKUP_BATCH):
+            batch = unique[start : start + _SYMBOL_LOOKUP_BATCH]
+            placeholders = ",".join("?" for _ in batch)
+            # Select the lookup key (sl.symbol_name) first so we can group by
+            # the *requested* name regardless of the chunk's own symbol_name.
+            sql = (
+                "SELECT sl.symbol_name, sl.chunk_id, sl.file_path, c.symbol_name, "
+                "c.symbol_type, c.content, c.start_line, c.end_line, "
+                "c.search_quality, c.branches "
+                "FROM symbol_lookup sl "
+                "JOIN chunks c ON c.id = sl.chunk_id "
+                f"WHERE sl.symbol_name IN ({placeholders})"
+            )
+            for row in self.conn.execute(sql, batch).fetchall():
+                grouped.setdefault(row[0], []).append(_search_row_from_lookup(row[1:]))
 
         result: list[SearchRow] = []
         for name in unique:
             defs = grouped.get(name, [])
-            result.extend(defs if limit is None else defs[:limit])
+            if limit is not None and len(defs) > limit:
+                # Deterministic, quality-aware cap: keep the strongest
+                # definitions. sorted() is stable, so equal-quality rows
+                # preserve their original (row) order.
+                defs = sorted(
+                    defs,
+                    key=lambda r: _SEARCH_QUALITY_RANK.get(r.search_quality, 0),
+                    reverse=True,
+                )[:limit]
+            result.extend(defs)
         return result
 
     # -- Vector CRUD (sqlite-vec via apsw) ---------------------------------

@@ -11,6 +11,7 @@ from source_recall.models import (
     ChunkData,
     FileRecord,
     ParseMode,
+    SearchQuality,
     SymbolType,
 )
 from source_recall.store import IndexStore
@@ -453,6 +454,79 @@ class TestSymbolLookup:
     def test_lookup_symbols_empty(self, store: IndexStore) -> None:
         """An empty name list returns no rows and issues no query."""
         assert store.lookup_symbols([]) == []
+
+    def test_lookup_symbols_beyond_sqlite_variable_limit(
+        self, store: IndexStore
+    ) -> None:
+        """A name set larger than SQLITE_MAX_VARIABLE_NUMBER must not raise.
+
+        A single ``IN (...)`` with >999 placeholders trips SQLite's bound
+        parameter cap on some builds; lookup_symbols must batch instead of
+        failing the whole graph expansion.
+        """
+        names = [f"sym_{i:05d}" for i in range(1500)]
+        # Register a definition for every other name so grouping has real rows.
+        present = names[::2]
+        chunks = [
+            ChunkData(
+                file_path=f"{name}.py",
+                symbol_name=name,
+                symbol_type=SymbolType.FUNCTION,
+                content=f"def {name}(): pass",
+                start_line=1,
+                end_line=1,
+            )
+            for name in present
+        ]
+        store.insert_chunks(chunks)
+        store.insert_symbol_lookups(
+            [(c.chunk_id, c.symbol_name, c.file_path) for c in chunks]
+        )
+
+        rows = store.lookup_symbols(names)
+
+        resolved = {r.symbol_name for r in rows}
+        assert resolved == set(present)
+        assert len(rows) == len(present)
+
+    def test_lookup_symbols_limit_keeps_highest_quality(
+        self, store: IndexStore
+    ) -> None:
+        """The per-name cap keeps the strongest-quality definitions.
+
+        With more definitions than ``limit`` and differing search_quality,
+        the retained rows must be the highest quality, not an arbitrary
+        first-N of the unordered result set.
+        """
+        qualities = [
+            SearchQuality.TEXT_FALLBACK,
+            SearchQuality.TEXT_FALLBACK,
+            SearchQuality.AST,
+            SearchQuality.REGEX,
+            SearchQuality.TEXT_FALLBACK,
+        ]
+        chunks = [
+            ChunkData(
+                file_path=f"def{i}.py",
+                symbol_name="widget",
+                symbol_type=SymbolType.FUNCTION,
+                content=f"def widget(): pass  # {i}",
+                start_line=1,
+                end_line=1,
+                search_quality=q,
+            )
+            for i, q in enumerate(qualities)
+        ]
+        store.insert_chunks(chunks)
+        store.insert_symbol_lookups(
+            [(c.chunk_id, "widget", c.file_path) for c in chunks]
+        )
+
+        rows = store.lookup_symbols(["widget"], limit=2)
+
+        assert len(rows) == 2
+        # The two strongest qualities (ast, regex) survive the cap.
+        assert [r.search_quality for r in rows] == ["ast", "regex"]
 
 
 class TestHasVecTableMemo:
