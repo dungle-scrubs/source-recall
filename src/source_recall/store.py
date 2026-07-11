@@ -4,6 +4,7 @@ PID-file locking, and atomic swap.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -336,6 +337,11 @@ class IndexStore:
         self._vec_conn: Any = None  # apsw.Connection, lazily opened
         self._batch_depth: int = 0
         self._sp_counter: int = 0  # Per-instance savepoint counter.
+        # Memoized vec_chunks existence.  The table can only appear via
+        # ensure_vec_table (which invalidates this) for the life of an
+        # open store, so a sqlite_master lookup on the query hot path is
+        # wasteful.  None = not yet resolved.
+        self._has_vec_table_cache: bool | None = None
 
     # -- Connection lifecycle -----------------------------------------------
 
@@ -370,6 +376,9 @@ class IndexStore:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+        # The cached vec_chunks existence is only valid while a connection
+        # is open against a specific file; reset it so a reopen re-resolves.
+        self._has_vec_table_cache = None
 
     def __enter__(self) -> IndexStore:
         """Context manager entry — opens the connection.
@@ -880,20 +889,6 @@ class IndexStore:
             for row in rows
         ]
 
-    def get_chunks_referencing(self, symbol: str) -> list[dict[str, Any]]:
-        """Find chunks that reference a given symbol (reverse lookup).
-
-        @param symbol: Target symbol name.
-        @returns: List of chunk dicts with ref_type.
-        """
-        rows = self.conn.execute(
-            "SELECT r.ref_type, c.* FROM refs r "
-            "JOIN chunks c ON c.id = r.source_chunk_id "
-            "WHERE r.target_symbol = ?",
-            (symbol,),
-        ).fetchall()
-        return [dict(row) for row in rows]
-
     def insert_symbol_lookup(
         self, chunk_id: str, symbol_name: str, file_path: str
     ) -> None:
@@ -924,44 +919,30 @@ class IndexStore:
         )
         self._auto_commit()
 
-    def lookup_symbol(self, symbol_name: str) -> list[dict[str, Any]]:
+    def lookup_symbol(
+        self, symbol_name: str, limit: int | None = None
+    ) -> list[dict[str, Any]]:
         """Find chunks that define a symbol.
 
         @param symbol_name: Symbol to look up.
+        @param limit: Optional cap on the number of definitions returned.
+            ``None`` (the default) returns every match, preserving legacy
+            behavior; a positive integer bounds graph-expansion result sets.
         @returns: List of dicts with chunk_id, file_path, etc.
         """
-        rows = self.conn.execute(
+        sql = (
             "SELECT sl.chunk_id, sl.file_path, c.symbol_name, c.symbol_type, "
             "c.content, c.start_line, c.end_line, c.search_quality, c.branches "
             "FROM symbol_lookup sl "
             "JOIN chunks c ON c.id = sl.chunk_id "
-            "WHERE sl.symbol_name = ?",
-            (symbol_name,),
-        ).fetchall()
+            "WHERE sl.symbol_name = ?"
+        )
+        params: tuple[Any, ...] = (symbol_name,)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (symbol_name, limit)
+        rows = self.conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
-
-    def delete_refs_for_file(self, file_path: str) -> None:
-        """Delete all refs originating from chunks in a file.
-
-        @param file_path: Repo-relative file path.
-        """
-        self.conn.execute(
-            "DELETE FROM refs WHERE source_chunk_id IN "
-            "(SELECT id FROM chunks WHERE file_path = ?)",
-            (file_path,),
-        )
-        self._auto_commit()
-
-    def delete_symbol_lookups_for_file(self, file_path: str) -> None:
-        """Delete all symbol_lookup entries for a file.
-
-        @param file_path: Repo-relative file path.
-        """
-        self.conn.execute(
-            "DELETE FROM symbol_lookup WHERE file_path = ?",
-            (file_path,),
-        )
-        self._auto_commit()
 
     # -- Vector CRUD (sqlite-vec via apsw) ---------------------------------
     #
@@ -1010,17 +991,28 @@ class IndexStore:
                 embedding FLOAT[{dimensions}]
             )"""
         )
+        # The table now exists; drop the memoized negative result so the
+        # next has_vec_table() re-observes it.
+        self._has_vec_table_cache = None
         return True
 
     def has_vec_table(self) -> bool:
         """Check if the vec_chunks table exists.
 
+        The result is memoized per open store: vec_chunks existence is
+        fixed once the store is open (it only appears via
+        ensure_vec_table, which invalidates the cache).  This avoids a
+        sqlite_master lookup on every query.
+
         @returns: True if the table exists.
         """
-        row = self.conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_chunks'"
-        ).fetchone()
-        return row is not None
+        if self._has_vec_table_cache is None:
+            row = self.conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='vec_chunks'"
+            ).fetchone()
+            self._has_vec_table_cache = row is not None
+        return self._has_vec_table_cache
 
     def insert_vectors(
         self,
@@ -1232,10 +1224,13 @@ class IndexStore:
         @param tmp_path: Temporary database that was just built.
         @param target_path: Final destination path.
         """
-        # Checkpoint + truncate WAL on the temp file.
+        # Checkpoint + truncate WAL on the temp file.  Close the connection
+        # in a finally so a failing PRAGMA wal_checkpoint cannot leak it.
         conn = sqlite3.connect(str(tmp_path))
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.close()
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
 
         # fsync the temp file.
         fd = os.open(str(tmp_path), os.O_RDONLY)
@@ -1248,13 +1243,14 @@ class IndexStore:
         # build opens the temp in WAL mode).  os.rename only moves the
         # named file, so without this they would linger as junk (M-1 fix).
         for suffix in ("-wal", "-shm"):
-            Path(str(tmp_path) + suffix).unlink(missing_ok=True)
+            _best_effort_unlink_sidecar(Path(str(tmp_path) + suffix))
 
         # Remove stale WAL/SHM sidecars from the target path
-        # to prevent replay confusion after rename.
+        # to prevent replay confusion after rename.  Best-effort: a
+        # missing sidecar is fine, and a locked one (Windows) must not
+        # abort the swap.
         for suffix in ("-wal", "-shm"):
-            sidecar = Path(str(target_path) + suffix)
-            sidecar.unlink(missing_ok=True)
+            _best_effort_unlink_sidecar(Path(str(target_path) + suffix))
 
         # Atomic rename — only works within the same filesystem.
         # Guard against accidental cross-device usage.
@@ -1440,6 +1436,21 @@ def _now_iso() -> str:
     @returns: ISO-formatted timestamp.
     """
     return datetime.now(UTC).isoformat()
+
+
+def _best_effort_unlink_sidecar(path: Path) -> None:
+    """Remove a WAL/SHM sidecar without ever raising.
+
+    ``missing_ok`` covers the common absent-file case.  On Windows a
+    sidecar still held by an open handle raises ``PermissionError`` on
+    unlink; that must not abort ``atomic_swap`` (the stale sidecar is
+    harmless once the primary file is renamed).  Any OSError is swallowed.
+
+    @param path: The ``-wal`` or ``-shm`` sidecar path.
+    """
+    # E.g. PermissionError when the file is locked by another handle.
+    with contextlib.suppress(OSError):
+        path.unlink(missing_ok=True)
 
 
 def _fsync_dir(path: Path) -> None:

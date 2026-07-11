@@ -361,6 +361,57 @@ class TestFileCountByMode:
         assert counts == {}
 
 
+class TestSymbolLookup:
+    @staticmethod
+    def _seed_definitions(store: IndexStore, symbol: str, n: int) -> None:
+        """Insert ``n`` chunks each registered as a definition of ``symbol``."""
+        chunks = [
+            ChunkData(
+                file_path=f"def{i}.py",
+                symbol_name=symbol,
+                symbol_type=SymbolType.FUNCTION,
+                content=f"def {symbol}(): pass  # {i}",
+                start_line=1,
+                end_line=1,
+            )
+            for i in range(n)
+        ]
+        store.insert_chunks(chunks)
+        store.insert_symbol_lookups([(c.chunk_id, symbol, c.file_path) for c in chunks])
+
+    def test_lookup_symbol_returns_all_by_default(self, store: IndexStore) -> None:
+        """Without a limit, lookup_symbol returns every matching definition."""
+        self._seed_definitions(store, "widget", 5)
+        rows = store.lookup_symbol("widget")
+        assert len(rows) == 5
+
+    def test_lookup_symbol_respects_limit(self, store: IndexStore) -> None:
+        """A limit bounds the number of definitions returned."""
+        self._seed_definitions(store, "widget", 5)
+        rows = store.lookup_symbol("widget", limit=2)
+        assert len(rows) == 2
+
+
+class TestHasVecTableMemo:
+    def test_has_vec_table_memoized(self, store: IndexStore) -> None:
+        """has_vec_table caches its result: once resolved to False it does
+        not re-observe a table created outside ensure_vec_table."""
+        assert store.has_vec_table() is False
+        # Create a table named vec_chunks directly, bypassing the only
+        # sanctioned creation path (ensure_vec_table).  The memoized
+        # value must not change.
+        store.conn.execute("CREATE TABLE vec_chunks (x)")
+        assert store.has_vec_table() is False
+
+    def test_ensure_vec_table_invalidates_cache(self, store: IndexStore) -> None:
+        """ensure_vec_table drops the memoized negative so the table becomes
+        visible on the next has_vec_table() call."""
+        pytest.importorskip("sqlite_vec")
+        assert store.has_vec_table() is False
+        assert store.ensure_vec_table(8) is True
+        assert store.has_vec_table() is True
+
+
 class TestMeta:
     def test_set_and_get(self, store: IndexStore) -> None:
         """Meta key-value pairs are stored and retrieved."""
@@ -437,6 +488,48 @@ class TestAtomicSwap:
         assert not tmp_db.exists()
         assert not tmp_wal.exists(), f"temp WAL left orphaned: {tmp_wal}"
         assert not tmp_shm.exists(), f"temp SHM left orphaned: {tmp_shm}"
+
+    def test_swap_tolerates_missing_target_sidecar(self, tmp_path: Path) -> None:
+        """A missing target -wal/-shm sidecar does not abort the swap."""
+        target = tmp_path / "test.db"
+        tmp_db = tmp_path / "test.db.tmp.123"
+        s = IndexStore(tmp_db)
+        s.open()
+        s.create_schema()
+        s.close()
+
+        # No target sidecars exist — swap must complete without raising.
+        IndexStore.atomic_swap(tmp_db, target)
+        assert target.exists()
+        assert not tmp_db.exists()
+
+    def test_swap_tolerates_locked_target_sidecar(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A target sidecar held by an open handle (PermissionError on
+        Windows) does not abort the swap; it is left best-effort."""
+        target = tmp_path / "test.db"
+        stale_wal = tmp_path / "test.db-wal"
+        stale_wal.write_text("stale")
+        tmp_db = tmp_path / "test.db.tmp.123"
+        s = IndexStore(tmp_db)
+        s.open()
+        s.create_schema()
+        s.close()
+
+        real_unlink = os.unlink
+
+        def fake_unlink(path: object, *args: object, **kwargs: object) -> None:
+            if str(path).endswith("test.db-wal"):
+                raise PermissionError("sidecar held by an open handle")
+            real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "unlink", fake_unlink)
+
+        # Must not propagate the PermissionError.
+        IndexStore.atomic_swap(tmp_db, target)
+        assert target.exists()
+        assert not tmp_db.exists()
 
 
 class TestFTSEscape:
