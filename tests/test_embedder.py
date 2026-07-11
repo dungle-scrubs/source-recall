@@ -111,3 +111,44 @@ class TestBagOfWordsEmbedder:
         # Verify specific bucket assignments are deterministic by checking
         # a known non-zero pattern.
         assert any(v != 0.0 for v in v1)
+
+
+class TestCodeRankEncodeBatchSize:
+    class _FakeArray:
+        def __init__(self, rows: int) -> None:
+            self._rows = rows
+
+        def tolist(self) -> list[list[float]]:
+            return [[0.0] for _ in range(self._rows)]
+
+    def test_encode_batch_size_passed_through(self) -> None:
+        """embed_chunks passes the configured encode batch size to encode."""
+        from source_recall.embedder import CodeRankEmbedder
+
+        emb = CodeRankEmbedder(encode_batch_size=4)
+        captured: dict[str, object] = {}
+
+        class FakeModel:
+            def encode(self, texts, show_progress_bar=False, batch_size=None):
+                captured["batch_size"] = batch_size
+                return TestCodeRankEncodeBatchSize._FakeArray(len(texts))
+
+        emb._model = FakeModel()
+        emb.embed_chunks(["a", "b"])
+        assert captured["batch_size"] == 4
+
+    def test_encode_batch_size_clamped_to_safe_max(self) -> None:
+        """An oversized batch size is clamped to avoid attention-matrix OOM."""
+        from source_recall.embedder import _MAX_ENCODE_BATCH, CodeRankEmbedder
+
+        emb = CodeRankEmbedder(encode_batch_size=100_000)
+        captured: dict[str, object] = {}
+
+        class FakeModel:
+            def encode(self, texts, show_progress_bar=False, batch_size=None):
+                captured["batch_size"] = batch_size
+                return TestCodeRankEncodeBatchSize._FakeArray(len(texts))
+
+        emb._model = FakeModel()
+        emb.embed_chunks(["a"])
+        assert captured["batch_size"] == _MAX_ENCODE_BATCH

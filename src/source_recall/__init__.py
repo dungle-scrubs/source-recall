@@ -89,7 +89,9 @@ class Index:
         if embedder is _SENTINEL:
             # Auto-create embedder based on config.
             if self.config.embed_enabled:
-                self._embedder = self._create_default_embedder()
+                self._embedder = self._create_default_embedder(
+                    self.config.embed_batch_size
+                )
             else:
                 self._embedder = None
         else:
@@ -103,15 +105,17 @@ class Index:
         self._querier_lock = _ReaderWriterLock()
 
     @staticmethod
-    def _create_default_embedder() -> Embedder | None:
+    def _create_default_embedder(encode_batch_size: int = 32) -> Embedder | None:
         """Attempt to create a CodeRankEmbedder.
 
+        @param encode_batch_size: Batch size for model.encode (clamped
+            inside CodeRankEmbedder to a safe max).
         @returns: CodeRankEmbedder instance or None on failure.
         """
         try:
             from source_recall.embedder import CodeRankEmbedder
 
-            return CodeRankEmbedder()
+            return CodeRankEmbedder(encode_batch_size=encode_batch_size)
         except Exception:
             logger.warning(
                 "Could not create CodeRankEmbedder — falling back to FTS-only",
