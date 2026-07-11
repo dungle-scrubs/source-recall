@@ -1378,6 +1378,18 @@ class IndexStore:
         finally:
             os.close(fd)
 
+        # Atomic rename — only works within the same filesystem.  Guard
+        # against accidental cross-device usage BEFORE any sidecar cleanup:
+        # a swap that will be rejected must touch neither the temp nor the
+        # live target's sidecars, so rejection cannot corrupt the target's
+        # -wal/-shm (M-2 fix).
+        if tmp_path.stat().st_dev != target_path.parent.stat().st_dev:
+            msg = (
+                f"atomic_swap requires same filesystem: "
+                f"{tmp_path} and {target_path} are on different devices"
+            )
+            raise OSError(msg)
+
         # Remove the temp file's own WAL/SHM sidecars (created because the
         # build opens the temp in WAL mode).  os.rename only moves the
         # named file, so without this they would linger as junk (M-1 fix).
@@ -1391,14 +1403,6 @@ class IndexStore:
         for suffix in ("-wal", "-shm"):
             _best_effort_unlink_sidecar(Path(str(target_path) + suffix))
 
-        # Atomic rename — only works within the same filesystem.
-        # Guard against accidental cross-device usage.
-        if tmp_path.stat().st_dev != target_path.parent.stat().st_dev:
-            msg = (
-                f"atomic_swap requires same filesystem: "
-                f"{tmp_path} and {target_path} are on different devices"
-            )
-            raise OSError(msg)
         os.rename(tmp_path, target_path)
 
         # fsync the parent directory so the rename survives a crash.

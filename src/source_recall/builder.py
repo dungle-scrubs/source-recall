@@ -30,6 +30,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _ChunkFailedError(Exception):
+    """A file failed to chunk/extract during a refresh re-index.
+
+    Raised only when ``_index_file``/``_index_pdf`` run with
+    ``swallow_chunk_errors=False`` so the refresh caller can distinguish a
+    chunking failure (recoverable: keep the file's prior index entries)
+    from a storage failure (SQLite error, disk exhaustion) which must
+    propagate and abort the whole refresh transaction.
+    """
+
+
 class IndexBuilder:
     """Orchestrates building and refreshing a code index.
 
@@ -326,20 +337,12 @@ class IndexBuilder:
                 # Incremental update.
                 total = len(changed_files)
                 pending_vectors: list[tuple[str, str]] = []
-                # Collect OLD chunk IDs before Phase 1 deletes them.
-                # delete_vectors_by_file queries the chunks table, but
-                # after Phase 1 the old chunks are gone — the subquery
-                # would return new chunk IDs (or nothing for deletes),
-                # leaving old vectors orphaned.  Capture IDs now while
-                # the old chunks still exist.
+                # OLD chunk IDs whose vectors Phase 2 must delete.  These
+                # are captured per-file as each delete happens (before the
+                # old chunks are gone) and only recorded once the file's
+                # re-index actually succeeds — a file that fails to
+                # re-chunk keeps both its chunks and its vectors.
                 old_vec_chunk_ids: list[str] = []
-                if vec_enabled:
-                    for rel_path, _action in changed_files:
-                        rows = store.conn.execute(
-                            "SELECT id FROM chunks WHERE file_path = ?",
-                            (rel_path,),
-                        ).fetchall()
-                        old_vec_chunk_ids.extend(row[0] for row in rows)
 
                 # Phase 1: Batch sqlite3 writes (chunks, FTS, refs,
                 # file_hashes) in a single transaction.
@@ -348,15 +351,25 @@ class IndexBuilder:
                         if self.on_progress:
                             self.on_progress(rel_path, i + 1, total)
 
-                        store.delete_chunks_for_file(rel_path)
-                        store.delete_file_hash(rel_path)
+                        if action == "delete":
+                            if vec_enabled:
+                                old_vec_chunk_ids.extend(
+                                    self._chunk_ids_for_file(store, rel_path)
+                                )
+                            store.delete_chunks_for_file(rel_path)
+                            store.delete_file_hash(rel_path)
+                            continue
 
-                        if action != "delete":
-                            chunk_ids = self._index_file(store, rel_path, branch=branch)
-
-                            if vec_enabled and self.embedder is not None:
-                                for cid, content in chunk_ids:
-                                    pending_vectors.append((cid, content))
+                        result = self._reindex_file_preserving(
+                            store, rel_path, branch=branch, vec_enabled=vec_enabled
+                        )
+                        if result is None:
+                            # Chunking failed — prior index left intact.
+                            continue
+                        chunk_ids, old_ids = result
+                        if vec_enabled and self.embedder is not None:
+                            old_vec_chunk_ids.extend(old_ids)
+                            pending_vectors.extend(chunk_ids)
 
                 # Phase 2: Vector cleanup + insert (apsw connection).
                 # MUST run AFTER the sqlite3 batch commits.  The apsw
@@ -477,21 +490,18 @@ class IndexBuilder:
 
         pending_vectors: list[tuple[str, str]] = []
 
-        # Collect OLD chunk IDs before Phase 1 deletes them (C-1 fix).
+        # OLD chunk IDs whose vectors Phase 2 must delete (C-1 fix).
+        # Captured per-file as each delete happens, and for re-indexed
+        # files only recorded once the re-index succeeds so a file that
+        # fails to re-chunk keeps both its chunks and its vectors.
         old_vec_chunk_ids: list[str] = []
-        if vec_enabled:
-            all_dirty_paths = list(deleted) + files_to_reindex
-            for rel_path in all_dirty_paths:
-                rows = store.conn.execute(
-                    "SELECT id FROM chunks WHERE file_path = ?",
-                    (rel_path,),
-                ).fetchall()
-                old_vec_chunk_ids.extend(row[0] for row in rows)
 
         # Phase 1: Batch sqlite3 writes.
         with store.batch_mode():
             # Delete removed files.
             for rel_path in deleted:
+                if vec_enabled:
+                    old_vec_chunk_ids.extend(self._chunk_ids_for_file(store, rel_path))
                 store.delete_chunks_for_file(rel_path)
                 store.delete_file_hash(rel_path)
 
@@ -501,21 +511,23 @@ class IndexBuilder:
                 if self.on_progress:
                     self.on_progress(rel_path, i + 1, total)
 
-                store.delete_chunks_for_file(rel_path)
-                store.delete_file_hash(rel_path)
-
                 blob_sha = blob_map.get(rel_path)
                 is_dirty = rel_path in dirty_map
-                chunk_ids = self._index_file(
+                result = self._reindex_file_preserving(
                     store,
                     rel_path,
                     branch=branch,
+                    vec_enabled=vec_enabled,
                     blob_sha=blob_sha,
                     is_dirty=is_dirty,
                 )
+                if result is None:
+                    # Chunking failed — prior index left intact.
+                    continue
+                chunk_ids, old_ids = result
                 if vec_enabled and self.embedder is not None:
-                    for cid, content in chunk_ids:
-                        pending_vectors.append((cid, content))
+                    old_vec_chunk_ids.extend(old_ids)
+                    pending_vectors.extend(chunk_ids)
 
             # Update branches on unchanged files.
             for rel_path in unchanged:
@@ -589,6 +601,78 @@ class IndexBuilder:
         stored = store.get_file_hash(rel_path)
         if stored is not None:
             store.upsert_file_hash(stored, branch=branch)
+
+    def _chunk_ids_for_file(self, store: IndexStore, rel_path: str) -> list[str]:
+        """Return the ids of chunks currently stored for a file.
+
+        @param store: Open IndexStore.
+        @param rel_path: Repo-relative path.
+        @returns: List of chunk ids.
+        """
+        rows = store.conn.execute(
+            "SELECT id FROM chunks WHERE file_path = ?",
+            (rel_path,),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def _reindex_file_preserving(
+        self,
+        store: IndexStore,
+        rel_path: str,
+        *,
+        branch: str,
+        vec_enabled: bool,
+        blob_sha: str | None = None,
+        is_dirty: bool = False,
+    ) -> tuple[list[tuple[str, str]], list[str]] | None:
+        """Re-index one file during refresh without risking data loss.
+
+        The destructive delete of the file's existing chunks/hashes and the
+        insert of its new chunks run inside a single SQLite SAVEPOINT (via
+        the re-entrant ``batch_mode``, which nests as a savepoint under the
+        surrounding batch).  If chunking raises, the savepoint is rolled
+        back so the file KEEPS its prior index entries — a re-chunk failure
+        never commits a delete with no replacement data.
+
+        @param store: Open IndexStore (already inside ``batch_mode``).
+        @param rel_path: Repo-relative path.
+        @param branch: Branch name for branch-aware indexing.
+        @param vec_enabled: Whether vectors are enabled (controls old-id
+            capture for downstream vector cleanup).
+        @param blob_sha: Git blob SHA for content-address comparison.
+        @param is_dirty: True if the file has uncommitted changes.
+        @returns: ``(chunk_pairs, old_vec_chunk_ids)`` on success, or None if
+            the file failed to chunk (prior chunks/hashes left intact).
+        """
+        # Capture old vector chunk ids BEFORE the delete — the caller only
+        # deletes their vectors when this re-index succeeds, so a failed
+        # file keeps both its chunks and its vectors.
+        old_ids = self._chunk_ids_for_file(store, rel_path) if vec_enabled else []
+        try:
+            with store.batch_mode():
+                store.delete_chunks_for_file(rel_path)
+                store.delete_file_hash(rel_path)
+                chunk_pairs = self._index_file(
+                    store,
+                    rel_path,
+                    branch=branch,
+                    blob_sha=blob_sha,
+                    is_dirty=is_dirty,
+                    swallow_chunk_errors=False,
+                )
+        except _ChunkFailedError:
+            # Chunking failed — the savepoint already rolled back the
+            # pre-delete, so the file keeps its prior index entries.
+            # Storage failures are NOT caught here: they propagate out of
+            # the surrounding batch and abort the whole refresh so a partial
+            # index is never committed as a success.
+            logger.warning(
+                "Refresh: preserving prior index for file that failed to re-chunk: %s",
+                rel_path,
+                exc_info=True,
+            )
+            return None
+        return chunk_pairs, old_ids
 
     # -- File discovery -----------------------------------------------------
 
@@ -683,6 +767,7 @@ class IndexBuilder:
         branch: str = "",
         blob_sha: str | None = None,
         is_dirty: bool = False,
+        swallow_chunk_errors: bool = True,
     ) -> list[tuple[str, str]]:
         """Read, chunk, and store a single file.
 
@@ -698,13 +783,25 @@ class IndexBuilder:
         @param branch: Branch name for branch-aware indexing.
         @param blob_sha: Git blob SHA for content-address comparison.
         @param is_dirty: True if the file has uncommitted changes.
+        @param swallow_chunk_errors: When True (full-build default), a file
+            that fails to chunk is logged and skipped so one malformed file
+            can't abort the whole build.  Refresh passes False so the caller
+            can roll back its pre-delete and preserve the file's prior index
+            entries instead of committing a destructive delete with no
+            replacement data.
         @returns: List of (chunk_id, content) tuples for embedding.
         """
         full = self.repo_path / rel_path
 
         # PDF files need binary extraction via pymupdf.
         if full.suffix.lower() == ".pdf":
-            return self._index_pdf(store, rel_path, full, branch=branch)
+            return self._index_pdf(
+                store,
+                rel_path,
+                full,
+                branch=branch,
+                swallow_chunk_errors=swallow_chunk_errors,
+            )
 
         # --- Blob-SHA fast path: skip re-read if content unchanged ---
         if blob_sha is not None and not is_dirty:
@@ -786,7 +883,13 @@ class IndexBuilder:
             chunks, quality, refs = chunk_file_with_refs(
                 rel_path, content, max_chars=self.config.chunk_max_chars
             )
-        except Exception:
+        except Exception as exc:
+            if not swallow_chunk_errors:
+                # Refresh path: signal a chunk-only failure so the caller's
+                # savepoint rolls back the pre-delete and the file keeps its
+                # prior index entries.  Storage failures below are NOT
+                # wrapped — they must propagate and abort the refresh.
+                raise _ChunkFailedError(rel_path) from exc
             logger.warning(
                 "Skipping file that failed to chunk: %s", rel_path, exc_info=True
             )
@@ -830,7 +933,12 @@ class IndexBuilder:
         return chunk_pairs
 
     def _index_pdf(
-        self, store: IndexStore, rel_path: str, full: Path, branch: str = ""
+        self,
+        store: IndexStore,
+        rel_path: str,
+        full: Path,
+        branch: str = "",
+        swallow_chunk_errors: bool = True,
     ) -> list[tuple[str, str]]:
         """Extract text from a PDF and index its chunks.
 
@@ -838,11 +946,16 @@ class IndexBuilder:
         @param rel_path: Repo-relative path.
         @param full: Absolute path to the PDF file.
         @param branch: Branch name for branch-aware indexing.
+        @param swallow_chunk_errors: See ``_index_file``.  Refresh passes
+            False so a PDF that fails extraction keeps its prior chunks
+            instead of losing them to the pre-delete.
         @returns: List of (chunk_id, content) tuples for embedding.
         """
         try:
             chunks, quality = chunk_pdf(rel_path, full)
-        except Exception:
+        except Exception as exc:
+            if not swallow_chunk_errors:
+                raise _ChunkFailedError(rel_path) from exc
             return []
 
         # Hash the first 64 KB of the PDF binary for change detection.
