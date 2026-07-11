@@ -175,8 +175,10 @@ def create_daemon_app(
     """
     # Local auth token — generated (or loaded) up front so it is available
     # to the auth dependency on the very first request, independent of the
-    # lifespan. Stored 0600 in the config dir next to repos.toml.
-    token = load_or_create_token(config.config_path)
+    # lifespan. Stored 0600 at the canonical default config dir (NOT beside a
+    # custom --config), so a custom-config daemon and the CLI client — which
+    # always reads the default location — agree on the same secret.
+    token = load_or_create_token()
 
     state: dict[str, Any] = {
         "manager": None,
@@ -369,6 +371,12 @@ def create_daemon_app(
         lifespan=lifespan,
         # Every route requires the local auth token.
         dependencies=[Depends(_require_token)],
+        # Disable FastAPI's built-in docs/schema routes: they sit OUTSIDE the
+        # auth dependency and this is a machine API, so an unauthenticated
+        # /docs, /redoc, or /openapi.json would leak the route surface.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
     # Publish the token so in-process callers (e.g. the test client) can
     # authenticate without touching the filesystem.

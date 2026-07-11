@@ -73,6 +73,29 @@ class TestServeExposureGuard:
         mock_run.assert_called_once()
 
 
+class TestAskAuthErrors:
+    def test_ask_surfaces_401_not_silent_fallback(self, tmp_path: Path) -> None:
+        """A 401 from the daemon is surfaced as an error, not swallowed.
+
+        Previously a 401 fell through to an in-process query against the local
+        index, masking an auth/token-path mismatch. It must now surface.
+        """
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.json.return_value = {"detail": "Missing or invalid auth token"}
+
+        with (
+            patch("httpx.post", return_value=mock_resp),
+            patch("source_recall.Index") as mock_index,
+        ):
+            result = runner.invoke(app, ["ask", "some query"])
+
+        assert result.exit_code == 1
+        assert "auth token" in result.output.lower()
+        # It must NOT fall back to the in-process index.
+        mock_index.assert_not_called()
+
+
 class TestAddCommand:
     def test_add_posts_to_daemon(self, tmp_path: Path) -> None:
         """sr add sends POST /repos to daemon."""

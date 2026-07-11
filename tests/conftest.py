@@ -80,6 +80,25 @@ def clean_index_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _isolate_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redirect the default config dir to tmp_path so tests never touch ~.
+
+    The daemon auth token now lives at ONE canonical location — the default
+    config dir — used by both the daemon and the CLI client regardless of
+    ``--config``. Redirecting that dir here keeps the token (and any repos.toml
+    written by the CLI) inside tmp_path instead of ``~/.config/source-recall``.
+    """
+    from source_recall.daemon_config import DaemonConfig
+
+    config_dir = tmp_path / "sr-config"
+    monkeypatch.setattr(
+        DaemonConfig,
+        "default_config_dir",
+        classmethod(lambda _cls: config_dir),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _auth_test_client(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make every ``TestClient`` speak the daemon's auth + host contract.
 
