@@ -193,7 +193,7 @@ class TestFtsIntegrityAfterBranchSwitch:
             store.run_migrations()
             results_after = store.fts_search("fibonacci")
             assert len(results_after) > 0
-            fib_results = [r for r in results_after if "shared.py" in r["file_path"]]
+            fib_results = [r for r in results_after if "shared.py" in r.file_path]
             assert len(fib_results) > 0
 
     def test_fts_finds_chunk_after_two_branch_switches(self, tmp_path: Path) -> None:

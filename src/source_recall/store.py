@@ -22,6 +22,7 @@ from source_recall.models import (
     ParseMode,
     RefData,
     SchemaVersionError,
+    SearchRow,
 )
 
 # ---------------------------------------------------------------------------
@@ -317,6 +318,28 @@ def _release_lock(lock_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _search_row_from_lookup(row: sqlite3.Row) -> SearchRow:
+    """Map a symbol_lookup JOIN row to a SearchRow (positional).
+
+    Column order: chunk_id, file_path, symbol_name, symbol_type, content,
+    start_line, end_line, search_quality, branches.
+
+    @param row: A sqlite3.Row from ``lookup_symbol``/``lookup_symbols``.
+    @returns: Typed SearchRow (score/distance default to unset).
+    """
+    return SearchRow(
+        chunk_id=row[0],
+        file_path=row[1],
+        symbol_name=row[2],
+        symbol_type=row[3],
+        content=row[4],
+        start_line=row[5],
+        end_line=row[6],
+        search_quality=row[7],
+        branches=row[8],
+    )
+
+
 class IndexStore:
     """Manages SQLite connections, schema, and CRUD for a single index.
 
@@ -337,6 +360,10 @@ class IndexStore:
         self._vec_conn: Any = None  # apsw.Connection, lazily opened
         self._batch_depth: int = 0
         self._sp_counter: int = 0  # Per-instance savepoint counter.
+        # (st_dev, st_ino, st_mtime_ns) captured at open().  A long-lived
+        # reader compares this against the current file to detect an
+        # atomic-swap replacement (new inode) and self-heal by reopening.
+        self._file_signature: tuple[int, int, int] | None = None
         # Memoized vec_chunks existence.  The table can only appear via
         # ensure_vec_table (which invalidates this) for the life of an
         # open store, so a sqlite_master lookup on the query hot path is
@@ -366,7 +393,38 @@ class IndexStore:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.row_factory = sqlite3.Row
         self._conn = conn
+        self._file_signature = self._stat_signature()
         return conn
+
+    def _stat_signature(self) -> tuple[int, int, int] | None:
+        """Cheap identity fingerprint of the db file.
+
+        @returns: (st_dev, st_ino, st_mtime_ns), or None if the file is
+            momentarily absent (e.g. mid-swap).
+        """
+        try:
+            st = os.stat(self.db_path)
+        except OSError:
+            return None
+        return (st.st_dev, st.st_ino, st.st_mtime_ns)
+
+    def file_replaced(self) -> bool:
+        """Whether the db file changed on disk since ``open()``.
+
+        An ``atomic_swap`` renames a freshly built db over the target, so
+        the inode (and mtime) differ from what this connection opened.
+        A long-lived reader calls this before serving a query and reopens
+        when it returns True, so swapped results self-heal immediately
+        instead of waiting for the next periodic refresh.
+
+        @returns: True if the current file differs from the opened one.
+        """
+        if self._conn is None:
+            return False
+        current = self._stat_signature()
+        # A missing file (None) mid-swap is transient — keep the current
+        # connection rather than thrash; the next call re-checks.
+        return current is not None and current != self._file_signature
 
     def close(self) -> None:
         """Close all connections if open."""
@@ -379,6 +437,8 @@ class IndexStore:
         # The cached vec_chunks existence is only valid while a connection
         # is open against a specific file; reset it so a reopen re-resolves.
         self._has_vec_table_cache = None
+        # The file signature belongs to the now-closed connection.
+        self._file_signature = None
 
     def __enter__(self) -> IndexStore:
         """Context manager entry — opens the connection.
@@ -778,12 +838,12 @@ class IndexStore:
 
     # -- FTS query ----------------------------------------------------------
 
-    def fts_search(self, query: str, limit: int = 30) -> list[dict[str, Any]]:
+    def fts_search(self, query: str, limit: int = 30) -> list[SearchRow]:
         """Run a BM25 full-text search.
 
         @param query: FTS5 query string.
         @param limit: Max results.
-        @returns: List of dicts with chunk data and BM25 score.
+        @returns: List of SearchRow with chunk data and BM25 score.
         """
         # Escape special FTS5 characters for safety.
         safe_query = _fts_escape(query)
@@ -804,27 +864,27 @@ class IndexStore:
         ).fetchall()
 
         return [
-            {
-                "chunk_id": row[0],
-                "file_path": row[1],
-                "symbol_name": row[2],
-                "symbol_type": row[3],
-                "content": row[4],
-                "start_line": row[5],
-                "end_line": row[6],
-                "search_quality": row[7],
-                "score": row[8],
-                "branches": row[9],
-            }
+            SearchRow(
+                chunk_id=row[0],
+                file_path=row[1],
+                symbol_name=row[2],
+                symbol_type=row[3],
+                content=row[4],
+                start_line=row[5],
+                end_line=row[6],
+                search_quality=row[7],
+                score=row[8],
+                branches=row[9],
+            )
             for row in rows
         ]
 
-    def symbol_search(self, symbol: str, limit: int = 10) -> list[dict[str, Any]]:
+    def symbol_search(self, symbol: str, limit: int = 10) -> list[SearchRow]:
         """Exact-match search on symbol_name.
 
         @param symbol: Symbol name to match (case-insensitive).
         @param limit: Max results.
-        @returns: List of dicts with chunk data.
+        @returns: List of SearchRow with chunk data.
         """
         rows = self.conn.execute(
             """SELECT id, file_path, symbol_name, symbol_type,
@@ -836,18 +896,18 @@ class IndexStore:
         ).fetchall()
 
         return [
-            {
-                "chunk_id": row[0],
-                "file_path": row[1],
-                "symbol_name": row[2],
-                "symbol_type": row[3],
-                "content": row[4],
-                "start_line": row[5],
-                "end_line": row[6],
-                "search_quality": row[7],
-                "score": 100.0,  # Exact matches get max score.
-                "branches": row[8],
-            }
+            SearchRow(
+                chunk_id=row[0],
+                file_path=row[1],
+                symbol_name=row[2],
+                symbol_type=row[3],
+                content=row[4],
+                start_line=row[5],
+                end_line=row[6],
+                search_quality=row[7],
+                score=100.0,  # Exact matches get max score.
+                branches=row[8],
+            )
             for row in rows
         ]
 
@@ -921,14 +981,14 @@ class IndexStore:
 
     def lookup_symbol(
         self, symbol_name: str, limit: int | None = None
-    ) -> list[dict[str, Any]]:
+    ) -> list[SearchRow]:
         """Find chunks that define a symbol.
 
         @param symbol_name: Symbol to look up.
         @param limit: Optional cap on the number of definitions returned.
             ``None`` (the default) returns every match, preserving legacy
             behavior; a positive integer bounds graph-expansion result sets.
-        @returns: List of dicts with chunk_id, file_path, etc.
+        @returns: List of SearchRow with chunk_id, file_path, etc.
         """
         sql = (
             "SELECT sl.chunk_id, sl.file_path, c.symbol_name, c.symbol_type, "
@@ -942,7 +1002,56 @@ class IndexStore:
             sql += " LIMIT ?"
             params = (symbol_name, limit)
         rows = self.conn.execute(sql, params).fetchall()
-        return [dict(row) for row in rows]
+        return [_search_row_from_lookup(row) for row in rows]
+
+    def lookup_symbols(
+        self, symbol_names: Sequence[str], *, limit: int | None = None
+    ) -> list[SearchRow]:
+        """Resolve several symbol names in a single query.
+
+        Replaces the per-name ``lookup_symbol`` loop in graph expansion:
+        one ``WHERE symbol_name IN (...)`` round-trip instead of N, while
+        preserving the old loop's semantics —
+
+        - names are deduplicated (first-seen order preserved);
+        - output is grouped in request order (all of the first name's
+          definitions, then the second's, ...), matching the original
+          ref-encounter ordering; and
+        - ``limit`` is applied **per name**, so a hot symbol with many
+          definitions cannot starve later names (a single global ``LIMIT``
+          would).
+
+        @param symbol_names: Symbol names to resolve (duplicates ignored).
+        @param limit: Optional per-name cap on definitions returned.
+        @returns: SearchRow definitions, ordered by requested-name order.
+        """
+        if not symbol_names:
+            return []
+        # Dedup while preserving order so a repeated ref target does not
+        # inflate the IN-list or the result set.
+        unique = list(dict.fromkeys(symbol_names))
+        placeholders = ",".join("?" for _ in unique)
+        # Select the lookup key (sl.symbol_name) first so we can group by
+        # the *requested* name regardless of the chunk's own symbol_name.
+        sql = (
+            "SELECT sl.symbol_name, sl.chunk_id, sl.file_path, c.symbol_name, "
+            "c.symbol_type, c.content, c.start_line, c.end_line, "
+            "c.search_quality, c.branches "
+            "FROM symbol_lookup sl "
+            "JOIN chunks c ON c.id = sl.chunk_id "
+            f"WHERE sl.symbol_name IN ({placeholders})"
+        )
+        rows = self.conn.execute(sql, list(unique)).fetchall()
+
+        grouped: dict[str, list[SearchRow]] = {}
+        for row in rows:
+            grouped.setdefault(row[0], []).append(_search_row_from_lookup(row[1:]))
+
+        result: list[SearchRow] = []
+        for name in unique:
+            defs = grouped.get(name, [])
+            result.extend(defs if limit is None else defs[:limit])
+        return result
 
     # -- Vector CRUD (sqlite-vec via apsw) ---------------------------------
     #
@@ -1058,7 +1167,7 @@ class IndexStore:
         self,
         query_embedding: list[float],
         top_k: int = 30,
-    ) -> list[dict[str, Any]]:
+    ) -> list[SearchRow]:
         """Search vec_chunks by distance, join with chunks via apsw.
 
         Over-fetches by 3× to compensate for rows lost to the JOIN
@@ -1067,7 +1176,7 @@ class IndexStore:
 
         @param query_embedding: Query vector.
         @param top_k: Max results requested by the caller.
-        @returns: List of dicts with chunk data and distance score.
+        @returns: List of SearchRow with chunk data and distance score.
         """
         # Over-fetch to leave headroom for JOIN losses and branch
         # filtering that happens downstream in the querier (M-3 fix).
@@ -1098,18 +1207,18 @@ class IndexStore:
         )
 
         return [
-            {
-                "chunk_id": row[0],
-                "file_path": row[1],
-                "symbol_name": row[2],
-                "symbol_type": row[3],
-                "content": row[4],
-                "start_line": row[5],
-                "end_line": row[6],
-                "search_quality": row[7],
-                "distance": row[8],
-                "branches": row[9],
-            }
+            SearchRow(
+                chunk_id=row[0],
+                file_path=row[1],
+                symbol_name=row[2],
+                symbol_type=row[3],
+                content=row[4],
+                start_line=row[5],
+                end_line=row[6],
+                search_quality=row[7],
+                distance=row[8],
+                branches=row[9],
+            )
             for row in rows
         ]
 

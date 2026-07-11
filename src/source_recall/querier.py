@@ -5,10 +5,16 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from source_recall.concurrency import ReaderWriterLock
 from source_recall.config import SRConfig
-from source_recall.models import IndexNotFoundError, IndexStatus, QueryResult
+from source_recall.models import (
+    IndexNotFoundError,
+    IndexStatus,
+    QueryResult,
+    SearchRow,
+)
 from source_recall.store import IndexStore, get_db_path
 
 logger = logging.getLogger(__name__)
@@ -38,6 +44,13 @@ _QUALITY_MULTIPLIER: dict[str, float] = {
 
 # RRF parameter — optimized for short lists (not the standard k=60).
 _RRF_K = 15
+
+# Per-name cap on ref-target definitions during graph expansion.
+# Applied per requested symbol (not globally) so one hot symbol name
+# cannot starve the others; expansion still contributes at most 10 slots
+# overall (bounded again by top_k).  Generous enough to leave headroom for
+# dedup against results already ranked.
+_GRAPH_LOOKUP_LIMIT = 25
 
 
 def _compute_symbol_weight(query: str) -> float:
@@ -105,22 +118,20 @@ def _extract_symbol_candidates(query: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _filter_by_branch(
-    results: list[dict[str, Any]], branch: str
-) -> list[dict[str, Any]]:
+def _filter_by_branch(results: list[SearchRow], branch: str) -> list[SearchRow]:
     """Filter search results to those belonging to a specific branch.
 
     Uses exact match against the comma-separated branches field.
-    Results without a branches key or with empty branches pass through
-    (backward compatibility with pre-v4 indexes).
+    Results with empty branches pass through (backward compatibility
+    with pre-v4 indexes).
 
-    @param results: Search results with optional 'branches' key.
+    @param results: Search rows carrying a 'branches' field.
     @param branch: Target branch name.
     @returns: Filtered results.
     """
-    filtered: list[dict[str, Any]] = []
+    filtered: list[SearchRow] = []
     for row in results:
-        branches_csv = row.get("branches", "")
+        branches_csv = row.branches
         if not branches_csv:
             # Legacy chunk (no branch info) — include by default.
             filtered.append(row)
@@ -130,8 +141,8 @@ def _filter_by_branch(
 
 
 def _rrf_merge(
-    fts_results: list[dict[str, Any]],
-    vec_results: list[dict[str, Any]],
+    fts_results: list[SearchRow],
+    vec_results: list[SearchRow],
     *,
     k: int = 15,
 ) -> dict[str, float]:
@@ -148,11 +159,11 @@ def _rrf_merge(
     scores: dict[str, float] = {}
 
     for rank, row in enumerate(fts_results, start=1):
-        cid = row["chunk_id"]
+        cid = row.chunk_id
         scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
 
     for rank, row in enumerate(vec_results, start=1):
-        cid = row["chunk_id"]
+        cid = row.chunk_id
         scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
 
     return scores
@@ -183,52 +194,133 @@ class IndexQuerier:
         self.embedder = embedder
         self.reranker = reranker
         self._store: IndexStore | None = None
+        # Governs the cached store's *lifetime*.  Concurrent queries hold
+        # the read lock (running in parallel); a swap-triggered reopen
+        # takes the write lock, which drains in-flight readers before the
+        # stale connection is closed.  Without this a reopen could close a
+        # sqlite connection another thread is mid-query on.
+        self._store_rwlock = ReaderWriterLock()
+
+    def _enter_store(self) -> IndexStore:
+        """Acquire the store read lock and return a live IndexStore.
+
+        On return the caller holds the read lock and MUST release it once
+        it is finished using the store (see ``query``/``status``).
+
+        Self-heal: a build may have atomic-swapped ``index.db`` out from
+        under our long-lived connection.  When the file changed (new
+        inode/mtime) the store is reopened under the *write* lock so
+        concurrent readers drain first — we never close a connection a
+        reader is mid-query on.
+
+        @returns: Active IndexStore (read lock held).
+        @raises IndexNotFoundError: If no index exists.
+        """
+        while True:
+            self._store_rwlock.acquire_read()
+            store = self._store
+            if store is not None and not store.file_replaced():
+                return store
+            # (Re)open needed — escalate to the write lock (drains readers).
+            self._store_rwlock.release_read()
+            self._store_rwlock.acquire_write()
+            try:
+                if self._store is not None and self._store.file_replaced():
+                    # Drop the reference *before* reopening: if _open_store
+                    # fails we must not leave a closed store cached (its
+                    # file_replaced() would read False and be served as
+                    # live).  The next _enter_store then reopens cleanly.
+                    old = self._store
+                    self._store = None
+                    old.close()
+                if self._store is None:
+                    self._open_store()
+            finally:
+                self._store_rwlock.release_write()
+            # Loop back: re-acquire the read lock and re-verify.
 
     def _get_store(self) -> IndexStore:
-        """Get or open the IndexStore.
+        """Ensure the store is open (self-healing) and return it.
+
+        Convenience for callers that use the store synchronously without
+        needing the lifetime read lock held (tests, single-threaded use).
+        ``query``/``status`` use ``_enter_store`` so the read lock is held
+        for the full operation instead.
 
         @returns: Active IndexStore.
         @raises IndexNotFoundError: If no index exists.
         """
-        if self._store is not None:
-            return self._store
+        store = self._enter_store()
+        self._store_rwlock.release_read()
+        return store
 
+    def _open_store(self) -> IndexStore:
+        """Open, migrate, and validate a fresh store (caller holds write lock).
+
+        Caches the store on ``self._store`` only on full success; on any
+        initialization failure the candidate connection is closed so it is
+        not leaked and no half-open store is cached.
+
+        @returns: Active IndexStore.
+        @raises IndexNotFoundError: If no index exists.
+        """
         db_path = get_db_path(self.repo_path)
         if not db_path.exists():
             raise IndexNotFoundError(str(self.repo_path))
 
         store = IndexStore(db_path)
-        store.open()
-        store.run_migrations()
-        self._store = store
+        try:
+            store.open()
+            store.run_migrations()
+            self._validate_embed_dimensions(store)
+        except BaseException:
+            store.close()
+            raise
 
-        # Validate embedding dimensions match the stored index (H-3).
-        # A mismatch silently degrades vector search to empty results
-        # because vec_chunks' schema is fixed at creation time.
-        if self.embedder is not None:
-            stored_dim_str = store.get_meta("embed_dimensions")
-            if stored_dim_str:
-                try:
-                    stored_dim = int(stored_dim_str)
-                except ValueError:
-                    stored_dim = 0
-                if stored_dim and stored_dim != self.embedder.dimensions:
-                    logger.warning(
-                        "Embedding dimension mismatch: index was built with "
-                        "%d dimensions but the current embedder uses %d. "
-                        "Vector search is disabled until the index is "
-                        "rebuilt with a matching embedder. Re-run "
-                        "'sr index' to fix.",
-                        stored_dim,
-                        self.embedder.dimensions,
-                    )
+        self._store = store
         return store
 
+    def _validate_embed_dimensions(self, store: IndexStore) -> None:
+        """Warn if the embedder's dimensions differ from the stored index.
+
+        A mismatch silently degrades vector search to empty results because
+        vec_chunks' schema is fixed at creation time (H-3).
+
+        @param store: The freshly opened store to inspect.
+        """
+        if self.embedder is None:
+            return
+        stored_dim_str = store.get_meta("embed_dimensions")
+        if not stored_dim_str:
+            return
+        try:
+            stored_dim = int(stored_dim_str)
+        except ValueError:
+            stored_dim = 0
+        if stored_dim and stored_dim != self.embedder.dimensions:
+            logger.warning(
+                "Embedding dimension mismatch: index was built with "
+                "%d dimensions but the current embedder uses %d. "
+                "Vector search is disabled until the index is "
+                "rebuilt with a matching embedder. Re-run "
+                "'sr index' to fix.",
+                stored_dim,
+                self.embedder.dimensions,
+            )
+
     def close(self) -> None:
-        """Close the underlying store."""
-        if self._store is not None:
-            self._store.close()
-            self._store = None
+        """Close the underlying store.
+
+        Takes the write lock so it cannot tear the connection down while a
+        concurrent query holds the read lock.
+        """
+        self._store_rwlock.acquire_write()
+        try:
+            if self._store is not None:
+                self._store.close()
+                self._store = None
+        finally:
+            self._store_rwlock.release_write()
 
     def query(
         self,
@@ -249,7 +341,32 @@ class IndexQuerier:
             from meta; empty string = no filtering (all branches).
         @returns: Ranked list of QueryResult.
         """
-        store = self._get_store()
+        # Hold the store read lock for the whole query so a concurrent
+        # swap-triggered reopen cannot close the connection mid-flight.
+        store = self._enter_store()
+        try:
+            return self._run_query(store, question, top_k=top_k, branch=branch)
+        finally:
+            self._store_rwlock.release_read()
+
+    def _run_query(
+        self,
+        store: IndexStore,
+        question: str,
+        *,
+        top_k: int | None,
+        branch: str | None,
+    ) -> list[QueryResult]:
+        """Execute a query against an already-acquired store.
+
+        Caller holds the store read lock for the duration.
+
+        @param store: Live IndexStore (read lock held by caller).
+        @param question: Natural language or symbol query.
+        @param top_k: Override number of results (default: config.top_k).
+        @param branch: Branch filter (see ``query``).
+        @returns: Ranked list of QueryResult.
+        """
         k = top_k if top_k is not None else self.config.top_k
 
         # Resolve branch: None → active_branch from meta.
@@ -261,7 +378,7 @@ class IndexQuerier:
 
         # Vector search if embedder and vec_chunks available.
         # Skip for empty/whitespace queries — no meaningful embedding.
-        vec_results: list[dict[str, Any]] = []
+        vec_results: list[SearchRow] = []
         if self.embedder is not None and store.has_vec_table() and question.strip():
             try:
                 query_vec = self.embedder.embed_query(question)
@@ -271,7 +388,7 @@ class IndexQuerier:
 
         # Symbol search if query looks like it references symbols.
         symbol_weight = _compute_symbol_weight(question)
-        symbol_results: list[dict[str, Any]] = []
+        symbol_results: list[SearchRow] = []
 
         if symbol_weight >= 0.3:
             candidates = _extract_symbol_candidates(question)
@@ -285,18 +402,18 @@ class IndexQuerier:
             symbol_results = _filter_by_branch(symbol_results, branch)
 
         # Build chunk data lookup.
-        all_chunks: dict[str, dict[str, Any]] = {}
+        all_chunks: dict[str, SearchRow] = {}
         for row in fts_results:
-            all_chunks.setdefault(row["chunk_id"], row)
+            all_chunks.setdefault(row.chunk_id, row)
         for row in vec_results:
-            all_chunks.setdefault(row["chunk_id"], row)
+            all_chunks.setdefault(row.chunk_id, row)
         for row in symbol_results:
-            all_chunks.setdefault(row["chunk_id"], row)
+            all_chunks.setdefault(row.chunk_id, row)
 
         # Determine match reasons.
-        fts_ids = {r["chunk_id"] for r in fts_results}
-        vec_ids = {r["chunk_id"] for r in vec_results}
-        sym_ids = {r["chunk_id"] for r in symbol_results}
+        fts_ids = {r.chunk_id for r in fts_results}
+        vec_ids = {r.chunk_id for r in vec_results}
+        sym_ids = {r.chunk_id for r in symbol_results}
 
         if vec_results:
             # Hybrid mode: RRF merge of FTS + vector results.
@@ -304,7 +421,7 @@ class IndexQuerier:
 
             # Symbol exact matches get a rank-1 bonus.
             for row in symbol_results:
-                cid = row["chunk_id"]
+                cid = row.chunk_id
                 bonus = 1.0 / (_RRF_K + 1)  # Rank-1 RRF score.
                 scores[cid] = scores.get(cid, 0.0) + bonus
 
@@ -312,9 +429,7 @@ class IndexQuerier:
             for cid in scores:
                 chunk = all_chunks.get(cid)
                 if chunk:
-                    multiplier = _QUALITY_MULTIPLIER.get(
-                        chunk.get("search_quality", "ast"), 1.0
-                    )
+                    multiplier = _QUALITY_MULTIPLIER.get(chunk.search_quality, 1.0)
                     scores[cid] *= multiplier
 
             # Build match reasons.
@@ -338,15 +453,15 @@ class IndexQuerier:
             reasons = {}
 
             for row in fts_results:
-                cid = row["chunk_id"]
-                if cid not in seen or row["score"] > seen[cid]:
-                    seen[cid] = row["score"]
+                cid = row.chunk_id
+                if cid not in seen or row.score > seen[cid]:
+                    seen[cid] = row.score
                     reasons[cid] = "bm25"
 
             for row in symbol_results:
-                cid = row["chunk_id"]
-                if cid not in seen or row["score"] > seen[cid]:
-                    seen[cid] = max(seen.get(cid, 0.0), row["score"])
+                cid = row.chunk_id
+                if cid not in seen or row.score > seen[cid]:
+                    seen[cid] = max(seen.get(cid, 0.0), row.score)
                     r = reasons.get(cid, "")
                     if "symbol" not in r:
                         reasons[cid] = f"{r}+symbol" if r else "symbol_exact"
@@ -355,9 +470,7 @@ class IndexQuerier:
             for cid in seen:
                 chunk = all_chunks.get(cid)
                 if chunk:
-                    multiplier = _QUALITY_MULTIPLIER.get(
-                        chunk.get("search_quality", "ast"), 1.0
-                    )
+                    multiplier = _QUALITY_MULTIPLIER.get(chunk.search_quality, 1.0)
                     seen[cid] *= multiplier
 
             scores = seen
@@ -368,7 +481,7 @@ class IndexQuerier:
         if self.reranker is not None and candidates and question.strip():
             try:
                 items = [
-                    {"chunk_id": cid, "content": all_chunks[cid]["content"]}
+                    {"chunk_id": cid, "content": all_chunks[cid].content}
                     for cid in candidates
                     if cid in all_chunks
                 ]
@@ -390,8 +503,10 @@ class IndexQuerier:
         # mutate the caller's all_chunks (M-5 fix).
         top_ids = ranked_ids[:5]
         expanded_ids: list[str] = []
-        expanded_chunks: dict[str, dict[str, Any]] = {}
-        if top_ids:
+        expanded_chunks: dict[str, SearchRow] = {}
+        # Gate expansion behind config (like the reranker/vector gates):
+        # when disabled we never touch the ref graph — zero overhead.
+        if top_ids and self.config.graph_expand_enabled:
             expanded_ids, expanded_chunks = self._graph_expand(
                 store, top_ids, all_chunks, question
             )
@@ -413,14 +528,14 @@ class IndexQuerier:
         return [
             QueryResult(
                 chunk_id=cid,
-                file_path=all_chunks[cid]["file_path"],
-                symbol_name=all_chunks[cid]["symbol_name"],
-                symbol_type=all_chunks[cid]["symbol_type"],
-                content=all_chunks[cid]["content"],
+                file_path=all_chunks[cid].file_path,
+                symbol_name=all_chunks[cid].symbol_name,
+                symbol_type=all_chunks[cid].symbol_type,
+                content=all_chunks[cid].content,
                 score=round(scores.get(cid, 0.0), 4),
-                start_line=all_chunks[cid]["start_line"],
-                end_line=all_chunks[cid]["end_line"],
-                search_quality=all_chunks[cid]["search_quality"],
+                start_line=all_chunks[cid].start_line,
+                end_line=all_chunks[cid].end_line,
+                search_quality=all_chunks[cid].search_quality,
                 match_reason=reasons.get(cid, ""),
             )
             for cid in final_ids[:k]
@@ -431,9 +546,9 @@ class IndexQuerier:
         self,
         store: IndexStore,
         top_ids: list[str],
-        all_chunks: dict[str, dict[str, Any]],
+        all_chunks: dict[str, SearchRow],
         _question: str,
-    ) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    ) -> tuple[list[str], dict[str, SearchRow]]:
         """Expand top results along the ref graph.
 
         For each top result, look up its outgoing refs, resolve targets
@@ -450,18 +565,25 @@ class IndexQuerier:
         """
         existing = set(all_chunks.keys())
         expanded_ids: list[str] = []
-        expanded_chunks: dict[str, dict[str, Any]] = {}
+        expanded_chunks: dict[str, SearchRow] = {}
 
+        # Collect every ref target across the top results in encounter
+        # order, then resolve them all in a single batched query instead
+        # of one lookup_symbol round-trip per ref (N+1 fix).
+        target_names: list[str] = []
         for cid in top_ids:
-            refs = store.get_refs_for_chunk(cid)
-            for ref in refs:
-                # Resolve target symbol to chunk(s).
-                targets = store.lookup_symbol(ref.target_symbol)
-                for target in targets:
-                    tcid = target["chunk_id"]
-                    if tcid not in existing and tcid not in expanded_ids:
-                        expanded_chunks[tcid] = target
-                        expanded_ids.append(tcid)
+            for ref in store.get_refs_for_chunk(cid):
+                target_names.append(ref.target_symbol)
+
+        if not target_names:
+            return [], {}
+
+        targets = store.lookup_symbols(target_names, limit=_GRAPH_LOOKUP_LIMIT)
+        for target in targets:
+            tcid = target.chunk_id
+            if tcid not in existing and tcid not in expanded_chunks:
+                expanded_chunks[tcid] = target
+                expanded_ids.append(tcid)
 
         return expanded_ids[:10], expanded_chunks  # Cap at 10 expansion slots.
 
@@ -471,7 +593,18 @@ class IndexQuerier:
         @returns: IndexStatus with all metrics.
         @raises IndexNotFoundError: If no index exists.
         """
-        store = self._get_store()
+        store = self._enter_store()
+        try:
+            return self._collect_status(store)
+        finally:
+            self._store_rwlock.release_read()
+
+    def _collect_status(self, store: IndexStore) -> IndexStatus:
+        """Gather status metrics from an already-acquired store.
+
+        @param store: Live IndexStore (read lock held by caller).
+        @returns: IndexStatus with all metrics.
+        """
         db_path = get_db_path(self.repo_path)
 
         indexed_at = store.get_meta("indexed_at") or ""

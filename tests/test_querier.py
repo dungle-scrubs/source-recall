@@ -4,11 +4,27 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from source_recall.models import SearchRow
 from source_recall.querier import (
     _compute_symbol_weight,
     _extract_symbol_candidates,
     _filter_by_branch,
 )
+
+
+def _row(chunk_id: str, branches: str = "") -> SearchRow:
+    """Build a minimal SearchRow for branch-filter tests."""
+    return SearchRow(
+        chunk_id=chunk_id,
+        file_path=f"{chunk_id}.py",
+        symbol_name=chunk_id,
+        symbol_type="function",
+        content="",
+        start_line=1,
+        end_line=1,
+        search_quality="ast",
+        branches=branches,
+    )
 
 
 class TestComputeSymbolWeight:
@@ -134,40 +150,40 @@ class TestFilterByBranch:
     def test_filters_to_matching_branch(self) -> None:
         """Only results containing the target branch pass through."""
         results = [
-            {"chunk_id": "a", "branches": "main"},
-            {"chunk_id": "b", "branches": "main,feature"},
-            {"chunk_id": "c", "branches": "feature"},
+            _row("a", "main"),
+            _row("b", "main,feature"),
+            _row("c", "feature"),
         ]
         filtered = _filter_by_branch(results, "main")
-        ids = {r["chunk_id"] for r in filtered}
+        ids = {r.chunk_id for r in filtered}
         assert ids == {"a", "b"}
 
     def test_empty_branches_passes_through(self) -> None:
         """Legacy chunks with empty branches are always included."""
         results = [
-            {"chunk_id": "a", "branches": ""},
-            {"chunk_id": "b", "branches": "main"},
+            _row("a", ""),
+            _row("b", "main"),
         ]
         filtered = _filter_by_branch(results, "main")
-        ids = {r["chunk_id"] for r in filtered}
+        ids = {r.chunk_id for r in filtered}
         assert ids == {"a", "b"}
 
     def test_no_false_positive_on_substring(self) -> None:
         """'feature' must not match 'feature-old'."""
         results = [
-            {"chunk_id": "a", "branches": "feature-old"},
-            {"chunk_id": "b", "branches": "feature"},
+            _row("a", "feature-old"),
+            _row("b", "feature"),
         ]
         filtered = _filter_by_branch(results, "feature")
-        ids = {r["chunk_id"] for r in filtered}
+        ids = {r.chunk_id for r in filtered}
         assert ids == {"b"}
 
-    def test_missing_branches_key_passes(self) -> None:
-        """Results without branches key pass through (backward compat)."""
+    def test_default_empty_branches_passes(self) -> None:
+        """A row with default (empty) branches passes through (backward compat)."""
         results = [
-            {"chunk_id": "a"},
-            {"chunk_id": "b", "branches": "main"},
+            _row("a"),
+            _row("b", "main"),
         ]
         filtered = _filter_by_branch(results, "main")
-        ids = {r["chunk_id"] for r in filtered}
+        ids = {r.chunk_id for r in filtered}
         assert ids == {"a", "b"}
