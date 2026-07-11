@@ -604,16 +604,39 @@ class TestIndexDirHashLength:
 
 
 class TestModelChecksumVerification:
-    """CodeRankEmbedder should have a checksum verification mechanism."""
+    """CodeRankEmbedder must verify config.json integrity before loading."""
 
-    def test_checksum_constant_defined(self) -> None:
-        """The embedder module defines a model checksum for verification."""
-        import source_recall.embedder as emb_mod
+    def test_load_model_rejects_tampered_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """_load_model raises when the cached config.json SHA does not match.
 
-        assert hasattr(emb_mod, "_CODERANK_CONFIG_SHA256"), (
-            "Embedder module should define _CODERANK_CONFIG_SHA256 for "
-            "defense-in-depth against model tampering"
+        The pinned _CODERANK_CONFIG_SHA256 is the source of truth. If the
+        cached config.json bytes hash to anything else (a tampered or swapped
+        file), _load_model must refuse to load the model rather than execute
+        its trust_remote_code path against unverified config.
+        """
+        import huggingface_hub
+
+        from source_recall.embedder import (
+            CodeRankEmbedder,
+            EmbedderVerificationError,
         )
+
+        tampered = tmp_path / "config.json"
+        tampered.write_bytes(b'{"auto_map": "evil"}')
+
+        # Point the cache resolver at the tampered file so verification runs
+        # entirely offline without downloading or loading the real model.
+        monkeypatch.setattr(
+            huggingface_hub,
+            "try_to_load_from_cache",
+            lambda *_args, **_kwargs: str(tampered),
+        )
+
+        emb = CodeRankEmbedder(show_progress=False)
+        with pytest.raises(EmbedderVerificationError, match="checksum mismatch"):
+            emb._load_model()
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from source_recall.embedder import BagOfWordsEmbedder, Embedder
 
 
@@ -152,3 +154,44 @@ class TestCodeRankEncodeBatchSize:
         emb._model = FakeModel()
         emb.embed_chunks(["a"])
         assert captured["batch_size"] == _MAX_ENCODE_BATCH
+
+
+class TestCodeRankInference:
+    """Real CodeRankEmbed inference smoke test (downloads/loads the model)."""
+
+    @pytest.mark.slow
+    def test_embeds_chunk_and_query_with_prefix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Loads the real model, embeds a chunk and a query, checks dims and prefix.
+
+        Exercises _load_model (config verification + cpu/max_seq_length),
+        embed_chunks, and embed_query. Asserts 768-d output and that
+        embed_query prepends _QUERY_PREFIX to the encoded string.
+        """
+        from source_recall.embedder import (
+            _CODERANK_DIMENSIONS,
+            _QUERY_PREFIX,
+            CodeRankEmbedder,
+        )
+
+        emb = CodeRankEmbedder(show_progress=False)
+
+        chunk_vec = emb.embed_chunks(["def add(a, b):\n    return a + b"])[0]
+        assert len(chunk_vec) == _CODERANK_DIMENSIONS == 768
+
+        query_vec = emb.embed_query("how to add two numbers")
+        assert len(query_vec) == 768
+
+        # The model is loaded now; spy on encode to capture the exact input
+        # string and confirm embed_query applies the required query prefix.
+        captured: dict[str, object] = {}
+        real_encode = emb._model.encode  # type: ignore[union-attr]
+
+        def spy(texts, *args, **kwargs):  # type: ignore[no-untyped-def]
+            captured["texts"] = texts
+            return real_encode(texts, *args, **kwargs)
+
+        monkeypatch.setattr(emb._model, "encode", spy)
+        emb.embed_query("find the parser")
+        assert captured["texts"] == [f"{_QUERY_PREFIX}find the parser"]
