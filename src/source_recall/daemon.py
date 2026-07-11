@@ -26,6 +26,8 @@ from source_recall.server import (
     QueryResultResponse,
     RefreshResponse,
     StatusResponse,
+    _warm_embedder,
+    _warm_reranker,
 )
 
 logger = logging.getLogger(__name__)
@@ -307,6 +309,30 @@ def create_daemon_app(
         )
         refresh_thread.start()
 
+        # Warm the shared embedder (and any per-repo reranker) on a
+        # background daemon thread so the first query does not pay the
+        # model-load cold spike. Does not block startup; failures are
+        # logged and ignored inside the _warm_* helpers.
+        def _warmup() -> None:
+            _warm_embedder(state["embedder"])
+            seen: set[int] = set()
+            for slot in list(manager.slots.values()):
+                idx = slot.index
+                if idx is None:
+                    continue
+                try:
+                    reranker = idx._get_reranker()
+                except Exception:
+                    reranker = None
+                    logger.warning("Reranker warmup failed", exc_info=True)
+                if reranker is not None and id(reranker) not in seen:
+                    seen.add(id(reranker))
+                    _warm_reranker(reranker)
+
+        warmup_thread = threading.Thread(target=_warmup, daemon=True, name="sr-warmup")
+        warmup_thread.start()
+        _app.state.warmup_thread = warmup_thread
+
         yield
 
         # Shutdown: stop periodic refresh, wait for background builds,
@@ -314,7 +340,11 @@ def create_daemon_app(
         # ensures the loop also responds to SIGTERM/SIGINT, not just
         # the lifespan exit (H-2 audit fix).
         _stop_event.set()
-        refresh_thread.join(timeout=5)
+        # Join with the configured shutdown budget (same as the build
+        # threads below), not a hardcoded 5s. close_all() then acquires
+        # each slot lock so it can never close an index underneath a
+        # still-running periodic refresh.
+        refresh_thread.join(timeout=config.shutdown_timeout_s)
 
         # Cancel signal handlers on lifespan exit — their job is done.
         # Re-raise any signal sent during shutdown so the OS sees the
@@ -749,7 +779,12 @@ def create_daemon_app(
         return {"status": "removed", "name": name}
 
     def _query_single_repo(
-        name: str, idx: Any, question: str, top_k: int | None, branch: str | None
+        name: str,
+        idx: Any,
+        question: str,
+        top_k: int | None,
+        branch: str | None,
+        query_vec: list[float] | None = None,
     ) -> list[QueryResultResponse]:
         """Query a single repo and tag results with repo name.
 
@@ -758,9 +793,10 @@ def create_daemon_app(
         @param question: Query string.
         @param top_k: Max results.
         @param branch: Branch filter.
+        @param query_vec: Precomputed query embedding shared across repos.
         @returns: List of tagged QueryResultResponse.
         """
-        results = idx.query(question, top_k=top_k, branch=branch)
+        results = idx.query(question, top_k=top_k, branch=branch, query_vec=query_vec)
         return [
             QueryResultResponse(
                 chunk_id=r.chunk_id,
@@ -798,6 +834,20 @@ def create_daemon_app(
 
         t0 = time.monotonic()
 
+        # Embed the query once, at the daemon layer, and reuse the vector
+        # across every repo. All ready repos are opened with the shared
+        # ``state["embedder"]`` (see the lifespan startup loop), so a single
+        # query vector is correct for all of them; a per-repo re-embed would
+        # be pure duplicate work on the fan-out path. FTS-only mode
+        # (embedder is None) and empty queries produce no vector.
+        embedder = state["embedder"]
+        query_vec: list[float] | None = None
+        if embedder is not None and req.question.strip():
+            try:
+                query_vec = embedder.embed_query(req.question)
+            except Exception:
+                logger.warning("Query embedding failed", exc_info=True)
+
         if req.repo is not None:
             # Single-repo query.
             if req.repo not in manager.slots:
@@ -812,13 +862,13 @@ def create_daemon_app(
                     detail=f"Repo '{req.repo}' not ready (state: {slot.state})",
                 )
             all_results = _query_single_repo(
-                req.repo, slot.index, req.question, req.top_k, req.branch
+                req.repo, slot.index, req.question, req.top_k, req.branch, query_vec
             )
         elif len(ready) == 1:
             # Single ready repo — no fan-out needed.
             name, slot = next(iter(ready.items()))
             all_results = _query_single_repo(
-                name, slot.index, req.question, req.top_k, req.branch
+                name, slot.index, req.question, req.top_k, req.branch, query_vec
             )
         elif len(ready) == 0:
             raise HTTPException(status_code=503, detail="No repos ready")
@@ -827,7 +877,7 @@ def create_daemon_app(
             all_results = []
             for name, slot in ready.items():
                 repo_results = _query_single_repo(
-                    name, slot.index, req.question, req.top_k, req.branch
+                    name, slot.index, req.question, req.top_k, req.branch, query_vec
                 )
                 if repo_results:
                     max_score = max(r.score for r in repo_results)

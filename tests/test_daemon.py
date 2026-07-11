@@ -237,6 +237,31 @@ class TestDaemonAuth:
         assert resp.status_code == 200
 
 
+class TestDaemonWarmup:
+    def test_startup_warms_embedder(self, daemon_config: DaemonConfig) -> None:
+        """Daemon startup spawns a background thread that warms the embedder."""
+        from source_recall.daemon import create_daemon_app
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+
+        calls: list[str] = []
+        orig = emb.embed_query
+
+        def spy(q: str) -> list[float]:
+            calls.append(q)
+            return orig(q)
+
+        emb.embed_query = spy  # type: ignore[method-assign]
+
+        app = create_daemon_app(daemon_config, embedder=emb)
+        with TestClient(app):
+            warmup = app.state.warmup_thread
+            assert warmup is not None
+            warmup.join(timeout=5)
+
+        assert "warmup" in calls
+
+
 class TestDaemonHostValidation:
     def test_foreign_host_header_rejected(self, daemon_client: TestClient) -> None:
         """A non-loopback Host header is rejected (DNS-rebinding defense)."""

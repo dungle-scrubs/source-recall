@@ -45,13 +45,15 @@ class TestConcurrentQueries:
         in_flight = {"n": 0, "max": 0}
         lock = threading.Lock()
 
-        def slow_query(self, question, *, top_k=None, branch=None):  # type: ignore[no-untyped-def]
+        def slow_query(self, question, *, top_k=None, branch=None, query_vec=None):  # type: ignore[no-untyped-def]
             with lock:
                 in_flight["n"] += 1
                 in_flight["max"] = max(in_flight["max"], in_flight["n"])
             time.sleep(sleep_s)
             try:
-                return original(self, question, top_k=top_k, branch=branch)
+                return original(
+                    self, question, top_k=top_k, branch=branch, query_vec=query_vec
+                )
             finally:
                 with lock:
                     in_flight["n"] -= 1
@@ -91,10 +93,12 @@ class TestConcurrentQueries:
         query_started = threading.Event()
         query_can_finish = threading.Event()
 
-        def blocking_query(self, question, *, top_k=None, branch=None):  # type: ignore[no-untyped-def]
+        def blocking_query(self, question, *, top_k=None, branch=None, query_vec=None):  # type: ignore[no-untyped-def]
             query_started.set()
             query_can_finish.wait(timeout=5)
-            return original(self, question, top_k=top_k, branch=branch)
+            return original(
+                self, question, top_k=top_k, branch=branch, query_vec=query_vec
+            )
 
         querier_mod.IndexQuerier.query = blocking_query  # type: ignore[method-assign]
         try:

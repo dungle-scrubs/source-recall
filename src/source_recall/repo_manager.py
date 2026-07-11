@@ -277,7 +277,15 @@ class RepoManager:
             return [(slot.name, slot.path) for slot in self.slots.values()]
 
     def close_all(self) -> None:
-        """Close all Index instances. Called during shutdown."""
+        """Close all Index instances. Called during shutdown.
+
+        Each slot is closed while holding its per-slot lock — the same
+        lock the periodic-refresh loop takes around ``index.refresh()`` —
+        so a refresh that is still draining after the shutdown join
+        finishes before the connection is torn down. Without this,
+        close_all could close the SQLite connection mid-refresh.
+        """
         with self._lock:
             for slot in self.slots.values():
-                slot.close()
+                with slot.lock:
+                    slot.close()
