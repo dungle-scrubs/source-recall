@@ -105,15 +105,20 @@ class TestBackgroundIndexThreadTracking:
             finished["count"] += 1
             return result
 
-        with TestClient(app) as client:
-            for i in range(3):
-                repo = tmp_path / f"repo-{i}"
-                _make_git_repo(repo)
-                with patch.object(Index, "build", counting_build):
+        # Keep the patch active for the whole block: the background build
+        # thread may invoke Index.build after the POST returns, so restoring
+        # the patch per-request races the worker and undercounts under load.
+        with patch.object(Index, "build", counting_build):
+            with TestClient(app) as client:
+                for i in range(3):
+                    repo = tmp_path / f"repo-{i}"
+                    _make_git_repo(repo)
                     client.post("/repos", json={"path": str(repo)})
 
-            # Wait for all to start.
-            time.sleep(1)
+                # Wait for all builds to complete before shutdown.
+                deadline = time.monotonic() + 10
+                while finished["count"] < 3 and time.monotonic() < deadline:
+                    time.sleep(0.05)
 
         # All 3 builds should have completed before shutdown finished.
         assert finished["count"] == 3
