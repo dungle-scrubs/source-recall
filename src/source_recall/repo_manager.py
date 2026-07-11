@@ -286,18 +286,27 @@ class RepoManager:
         down. Without this, close_all could close the SQLite connection
         mid-refresh.
 
-        Lock acquisition is bounded by a shared ``lock_timeout_s`` budget so
-        shutdown always completes in bounded time: a slot whose lock cannot be
-        acquired before the budget is exhausted (a refresh that outlived the
-        shutdown-thread join) is force-closed WITHOUT the lock. That interrupts
-        the in-flight refresh write, but the interrupted write is a SQLite WAL
-        transaction that is rolled back on next open — no index corruption.
-        Blocking indefinitely here would let one stuck refresh hang shutdown
-        forever, defeating ``shutdown_timeout_s``.
+        Both the slot-lock acquisition AND the ``Index.close()`` itself are
+        bounded by a shared ``lock_timeout_s`` budget so shutdown always
+        completes in bounded time:
 
-        @param lock_timeout_s: Total budget (seconds) to spend waiting on slot
-            locks across all slots. Force-closes any slot still locked when the
-            budget runs out.
+        * A slot whose lock cannot be acquired before the budget is exhausted
+          (a refresh that outlived the shutdown-thread join) is force-closed
+          WITHOUT the lock.
+        * ``Index.close()`` acquires the querier writer lock, which can itself
+          block indefinitely behind a hung reader (a stuck query). It is run in
+          a worker thread joined under the remaining budget, so a genuinely
+          blocking close is abandoned rather than hanging shutdown forever.
+
+        An interrupted or abandoned close leaves at most an in-flight SQLite
+        WAL transaction, which is rolled back on next open — no index
+        corruption. Blocking indefinitely here would let one stuck refresh or
+        close hang shutdown forever, defeating ``shutdown_timeout_s``.
+
+        @param lock_timeout_s: Total budget (seconds) to spend on slot-lock
+            acquisition AND closing across all slots. Force-closes any slot
+            still locked, and abandons any close still running, when the budget
+            runs out.
         """
         with self._lock:
             slots = list(self.slots.values())
@@ -313,7 +322,35 @@ class RepoManager:
                     slot.name,
                 )
             try:
-                slot.close()
+                remaining = max(0.0, deadline - time.monotonic())
+                self._close_slot_bounded(slot, timeout_s=remaining)
             finally:
                 if acquired:
                     slot.lock.release()
+
+    @staticmethod
+    def _close_slot_bounded(slot: RepoSlot, *, timeout_s: float) -> None:
+        """Close a slot's Index, bounded by ``timeout_s``.
+
+        ``Index.close()`` takes the querier writer lock, which can block
+        indefinitely behind a stuck reader. Running it in a worker thread and
+        joining under the remaining budget guarantees shutdown stays bounded: a
+        close that outlives the budget is abandoned (its daemon thread keeps
+        draining, leaving only a WAL-recoverable transaction).
+
+        @param slot: Slot whose Index to close.
+        @param timeout_s: Max seconds to wait for the close to complete.
+        """
+        worker = threading.Thread(
+            target=slot.close,
+            name=f"sr-close-{slot.name}",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=timeout_s)
+        if worker.is_alive():
+            logger.warning(
+                "Shutdown: close of slot '%s' did not complete within budget; "
+                "abandoning (WAL-recoverable, close continues in background)",
+                slot.name,
+            )
