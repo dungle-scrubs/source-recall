@@ -36,6 +36,43 @@ class TestDaemonRun:
         assert result.exit_code != 0
 
 
+class TestServeExposureGuard:
+    def test_serve_non_loopback_refused_without_insecure(self, tmp_path: Path) -> None:
+        """sr serve --host <non-loopback> exits without --insecure."""
+        with patch("uvicorn.run") as mock_run:
+            result = runner.invoke(
+                app, ["serve", str(tmp_path), "--host", "0.0.0.0", "--no-embed"]
+            )
+        assert result.exit_code == 1
+        assert "insecure" in result.output.lower()
+        mock_run.assert_not_called()
+
+    def test_serve_non_loopback_allowed_with_insecure(self, tmp_path: Path) -> None:
+        """--insecure lets a non-loopback bind through with a warning."""
+        with patch("uvicorn.run") as mock_run:
+            result = runner.invoke(
+                app,
+                [
+                    "serve",
+                    str(tmp_path),
+                    "--host",
+                    "0.0.0.0",
+                    "--no-embed",
+                    "--insecure",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "warning" in result.output.lower()
+        mock_run.assert_called_once()
+
+    def test_serve_loopback_starts_normally(self, tmp_path: Path) -> None:
+        """Default loopback host needs no opt-in."""
+        with patch("uvicorn.run") as mock_run:
+            result = runner.invoke(app, ["serve", str(tmp_path), "--no-embed"])
+        assert result.exit_code == 0, result.output
+        mock_run.assert_called_once()
+
+
 class TestAddCommand:
     def test_add_posts_to_daemon(self, tmp_path: Path) -> None:
         """sr add sends POST /repos to daemon."""

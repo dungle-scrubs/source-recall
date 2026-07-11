@@ -77,3 +77,39 @@ def clean_index_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(querier_mod, "get_db_path", patched_get_db_path)
     # sr list / sr clean call get_index_base() directly.
     monkeypatch.setattr(cli_mod, "get_index_base", lambda: index_base)
+
+
+@pytest.fixture(autouse=True)
+def _auth_test_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every ``TestClient`` speak the daemon's auth + host contract.
+
+    The daemon now (a) requires a per-instance auth token on every route
+    and (b) validates the Host header via TrustedHostMiddleware. Rather
+    than touch ~40 client construction sites, this autouse fixture wraps
+    ``TestClient.__init__`` to:
+
+    * pin ``base_url`` to ``http://127.0.0.1`` so the Host header passes
+      TrustedHost (default is the non-loopback ``testserver``), and
+    * forward the app's token (published on ``app.state.sr_token`` by the
+      daemon factory) as ``X-SR-Token`` so requests are authorized.
+
+    Tests that want to exercise the negative paths override per request:
+    strip the header for a 401, or send a bogus ``host`` for a 400.
+    """
+    from fastapi.testclient import TestClient
+
+    orig_init = TestClient.__init__
+
+    def patched_init(
+        self: TestClient, app: object = None, *args: object, **kwargs: object
+    ) -> None:
+        if not args:  # base_url is the first positional after app.
+            kwargs.setdefault("base_url", "http://127.0.0.1")
+        token = getattr(getattr(app, "state", None), "sr_token", None)
+        if token is not None:
+            headers = dict(kwargs.get("headers") or {})  # type: ignore[arg-type]
+            headers.setdefault("X-SR-Token", token)
+            kwargs["headers"] = headers
+        orig_init(self, app, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(TestClient, "__init__", patched_init)

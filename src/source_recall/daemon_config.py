@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
+import secrets
 import tomllib
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from source_recall.models import ConfigError
+
+# Name of the local auth-token file stored alongside repos.toml in the
+# config dir. The token gates every daemon route so a browser or other
+# local process cannot drive the unauthenticated API (DNS-rebinding
+# exfiltration). See ``load_or_create_token``.
+_TOKEN_FILENAME = "token"
 
 
 class DaemonConfig(BaseModel):
@@ -39,12 +48,20 @@ class DaemonConfig(BaseModel):
     config_path: Path | None = None
 
     @classmethod
+    def default_config_dir(cls) -> Path:
+        """Return the default config directory.
+
+        @returns: ~/.config/source-recall
+        """
+        return Path.home() / ".config" / "source-recall"
+
+    @classmethod
     def default_config_path(cls) -> Path:
         """Return the default config file location.
 
         @returns: ~/.config/source-recall/repos.toml
         """
-        return Path.home() / ".config" / "source-recall" / "repos.toml"
+        return cls.default_config_dir() / "repos.toml"
 
     @classmethod
     def from_toml(cls, path: Path) -> DaemonConfig:
@@ -129,3 +146,84 @@ class DaemonConfig(BaseModel):
 
         lines.append("")
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Local auth token
+# ---------------------------------------------------------------------------
+#
+# The daemon binds to loopback but is otherwise unauthenticated. A local
+# auth token defeats two related attacks: (1) a malicious web page can hit
+# 127.0.0.1 from the victim's browser (DNS-rebinding / CSRF) and drive the
+# API; (2) any local process could add an arbitrary path and exfiltrate its
+# contents. Every daemon route requires the token via an ``Authorization:
+# Bearer <token>`` or ``X-SR-Token`` header. The token lives in the config
+# dir with 0600 permissions, next to repos.toml, so the CLI (which owns the
+# same config dir) can read it and forward it transparently.
+
+
+def token_file_path(config_path: Path | None = None) -> Path:
+    """Return the path to the daemon auth-token file.
+
+    The token lives in the same directory as ``repos.toml`` so it shares
+    the config dir's ownership and any operator-set permissions.
+
+    @param config_path: Path to repos.toml (its parent is the config dir).
+        When ``None`` the default config dir is used.
+    @returns: Absolute path to the token file.
+    """
+    config_dir = (
+        config_path.parent
+        if config_path is not None
+        else (DaemonConfig.default_config_dir())
+    )
+    return config_dir / _TOKEN_FILENAME
+
+
+def load_or_create_token(config_path: Path | None = None) -> str:
+    """Load the daemon auth token, generating one on first use.
+
+    The token is a URL-safe random string persisted with 0600 permissions.
+    Regenerating is avoided so a running daemon and later CLI invocations
+    agree on the same secret.
+
+    @param config_path: Path to repos.toml (its parent holds the token).
+    @returns: The auth token string.
+    """
+    path = token_file_path(config_path)
+    if path.is_file():
+        existing = path.read_text().strip()
+        if existing:
+            # Best-effort tighten perms in case the file was created loose.
+            with contextlib.suppress(OSError):
+                os.chmod(path, 0o600)
+            return existing
+
+    token = secrets.token_urlsafe(32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Create with 0600 from the start so the secret is never briefly
+    # world-readable between write and chmod.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, token.encode())
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+    return token
+
+
+def load_token(config_path: Path | None = None) -> str | None:
+    """Read the daemon auth token without creating one.
+
+    Used by the CLI client so ``sr ask`` / ``sr refresh`` can forward the
+    token. Returns ``None`` when no token exists yet (daemon never started).
+
+    @param config_path: Path to repos.toml (its parent holds the token).
+    @returns: The token string, or ``None`` if absent.
+    """
+    path = token_file_path(config_path)
+    if path.is_file():
+        token = path.read_text().strip()
+        return token or None
+    return None

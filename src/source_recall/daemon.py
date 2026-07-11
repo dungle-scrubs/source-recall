@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import signal
 import tempfile
 import threading
@@ -13,10 +14,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from source_recall.daemon_config import DaemonConfig
+from source_recall.daemon_config import DaemonConfig, load_or_create_token
 from source_recall.models import _SENTINEL
 from source_recall.repo_manager import RepoManager, SlotState
 from source_recall.server import (
@@ -170,6 +171,11 @@ def create_daemon_app(
     @param embedder: Embedder instance (omit for auto-create, None for FTS-only).
     @returns: Configured FastAPI application.
     """
+    # Local auth token — generated (or loaded) up front so it is available
+    # to the auth dependency on the very first request, independent of the
+    # lifespan. Stored 0600 in the config dir next to repos.toml.
+    token = load_or_create_token(config.config_path)
+
     state: dict[str, Any] = {
         "manager": None,
         "config": config,
@@ -177,7 +183,30 @@ def create_daemon_app(
         "started_at": 0.0,
         "bg_threads": [],  # Tracked background index threads.
         "bg_threads_lock": threading.Lock(),
+        "token": token,
     }
+
+    def _require_token(
+        authorization: str | None = Header(default=None),
+        x_sr_token: str | None = Header(default=None),
+    ) -> None:
+        """Reject requests without the local auth token.
+
+        Accepts the token via ``Authorization: Bearer <token>`` or the
+        ``X-SR-Token`` header. Compared in constant time. This is the sole
+        gate that stops a browser (DNS-rebinding/CSRF) or another local
+        process from driving the API and exfiltrating indexed source.
+
+        @raises HTTPException: 401 if the token is missing or wrong.
+        """
+        provided = x_sr_token
+        if provided is None and authorization:
+            scheme, _, value = authorization.partition(" ")
+            if scheme.lower() == "bearer":
+                provided = value.strip()
+        expected = state["token"]
+        if not provided or not secrets.compare_digest(provided, expected):
+            raise HTTPException(status_code=401, detail="Missing or invalid auth token")
 
     # Rate limiter for /refresh.
     _REFRESH_MIN_INTERVAL = refresh_min_interval
@@ -308,7 +337,23 @@ def create_daemon_app(
         title="source-recall daemon",
         description="Multi-repo code search daemon.",
         lifespan=lifespan,
+        # Every route requires the local auth token.
+        dependencies=[Depends(_require_token)],
     )
+    # Publish the token so in-process callers (e.g. the test client) can
+    # authenticate without touching the filesystem.
+    app.state.sr_token = token
+
+    # Host-header validation — defeats DNS rebinding, where a page on an
+    # attacker-controlled domain resolves to 127.0.0.1 and the browser
+    # sends that domain as the Host. Only loopback names (plus whatever
+    # host the operator explicitly bound) are accepted.
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+    allowed_hosts = list(
+        dict.fromkeys(["localhost", "127.0.0.1", "0.0.0.0", config.host])
+    )
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 
     # CORS — localhost only.
     from fastapi.middleware.cors import CORSMiddleware
@@ -367,6 +412,35 @@ def create_daemon_app(
             )
 
         return slot.index
+
+    def _repo_path_allowed(path: Path) -> bool:
+        """Containment policy for repos added over the network (POST /repos).
+
+        Accepting *any* absolute path over HTTP turns the daemon into a
+        file-exfiltration primitive (register ``/`` then query its
+        contents). A path is accepted only when it is:
+
+        1. already registered (idempotent re-add), or
+        2. inside the user's home directory, or
+        3. inside a directory that already contains a registered repo —
+           the operator already exposed that tree by registering a repo
+           there, so siblings are within the same trust boundary.
+
+        Everything else (``/etc``, ``/var``, other users' homes, ...) is
+        rejected with 403. This is an opt-in allowlist rather than a
+        blanket accept. Repos loaded from the trusted on-disk config
+        (``RepoManager.from_config``) bypass this check by design.
+
+        @param path: Resolved candidate repo path.
+        @returns: True if the path is within an allowed root.
+        """
+        manager = _get_manager()
+        registered = list(manager.slots.values())
+        if any(slot.path == path for slot in registered):
+            return True
+        roots = {Path.home().resolve()}
+        roots.update(slot.path.parent for slot in registered)
+        return any(path == root or root in path.parents for root in roots)
 
     def _persist_config() -> None:
         """Atomically write current config to repos.toml.
@@ -557,15 +631,29 @@ def create_daemon_app(
     def add_repo(req: AddRepoRequest) -> RepoStateResponse:
         """Register a new repo.
 
+        Paths are constrained by ``_repo_path_allowed`` — arbitrary
+        absolute paths are rejected with 403 so the network API cannot be
+        used to index and exfiltrate files outside the operator's trust
+        boundary.
+
         @param req: Repo path and optional name.
         @returns: Created repo info.
-        @raises HTTPException: 400 if path invalid, 409 if duplicate.
+        @raises HTTPException: 400 if path invalid, 403 if path disallowed,
+            409 if duplicate.
         """
         path = Path(req.path).expanduser().resolve()
         if not path.is_dir():
             raise HTTPException(
                 status_code=400,
                 detail=f"Path does not exist or is not a directory: {path}",
+            )
+        if not _repo_path_allowed(path):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Path is outside the allowed roots (home directory or a "
+                    f"directory already holding a registered repo): {path}"
+                ),
             )
 
         manager = _get_manager()
