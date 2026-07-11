@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
 import secrets
+import stat
 import tomllib
 from pathlib import Path
 
@@ -12,11 +12,21 @@ from pydantic import BaseModel, Field
 
 from source_recall.models import ConfigError
 
-# Name of the local auth-token file stored alongside repos.toml in the
-# config dir. The token gates every daemon route so a browser or other
-# local process cannot drive the unauthenticated API (DNS-rebinding
-# exfiltration). See ``load_or_create_token``.
+# Name of the local auth-token file. The token gates every daemon route so a
+# browser or other local process cannot drive the unauthenticated API
+# (DNS-rebinding exfiltration). It lives at ONE canonical location — the default
+# config dir — independent of any ``--config`` path, so the daemon and the CLI
+# client always agree on the same secret. See ``load_or_create_token``.
 _TOKEN_FILENAME = "token"
+
+
+class TokenSecurityError(RuntimeError):
+    """Raised when the auth-token file cannot be secured to 0600.
+
+    Accepting a world- or group-readable token file would let any local process
+    read the secret and drive the daemon API, so token creation fails closed if
+    the file cannot be confined to owner-only permissions.
+    """
 
 
 class DaemonConfig(BaseModel):
@@ -157,73 +167,193 @@ class DaemonConfig(BaseModel):
 # 127.0.0.1 from the victim's browser (DNS-rebinding / CSRF) and drive the
 # API; (2) any local process could add an arbitrary path and exfiltrate its
 # contents. Every daemon route requires the token via an ``Authorization:
-# Bearer <token>`` or ``X-SR-Token`` header. The token lives in the config
-# dir with 0600 permissions, next to repos.toml, so the CLI (which owns the
-# same config dir) can read it and forward it transparently.
+# Bearer <token>`` or ``X-SR-Token`` header. The token lives at the canonical
+# default config dir with 0600 permissions — NOT beside a custom ``--config``
+# repos.toml — so the CLI client (which always reads the default location) and a
+# custom-config daemon agree on the same secret.
 
 
-def token_file_path(config_path: Path | None = None) -> Path:
-    """Return the path to the daemon auth-token file.
+def token_file_path() -> Path:
+    """Return the canonical path to the daemon auth-token file.
 
-    The token lives in the same directory as ``repos.toml`` so it shares
-    the config dir's ownership and any operator-set permissions.
+    The token always lives in the default config dir, independent of any
+    ``--config`` path, so the daemon and the CLI client never disagree.
 
-    @param config_path: Path to repos.toml (its parent is the config dir).
-        When ``None`` the default config dir is used.
     @returns: Absolute path to the token file.
     """
-    config_dir = (
-        config_path.parent
-        if config_path is not None
-        else (DaemonConfig.default_config_dir())
-    )
-    return config_dir / _TOKEN_FILENAME
+    return DaemonConfig.default_config_dir() / _TOKEN_FILENAME
 
 
-def load_or_create_token(config_path: Path | None = None) -> str:
+def _enforce_owner_only_fd(fd: int, path: Path) -> None:
+    """Confine an OPEN token file to 0600, failing closed if it cannot be.
+
+    Operates on the file descriptor, not the pathname, so it cannot be tricked
+    into chmod-ing a different file the path was swapped to (TOCTOU) or the
+    target of a symlink.
+
+    @param fd: Open descriptor for the token file.
+    @param path: Path (for error messages only).
+    @raises TokenSecurityError: If fchmod fails or the mode is still not 0600.
+    """
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError as e:
+        raise TokenSecurityError(
+            f"Could not set 0600 on auth-token file {path}: {e}. "
+            "Refusing to use a token file that may be readable by others."
+        ) from e
+    mode = stat.S_IMODE(os.fstat(fd).st_mode)
+    if mode != 0o600:
+        raise TokenSecurityError(
+            f"Auth-token file {path} has mode {oct(mode)} after chmod; "
+            "expected 0600. Refusing to use a permissive token file."
+        )
+
+
+def _read_all_fd(fd: int) -> bytes:
+    """Read a small file fully from an open descriptor."""
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def load_or_create_token() -> str:
     """Load the daemon auth token, generating one on first use.
 
     The token is a URL-safe random string persisted with 0600 permissions.
-    Regenerating is avoided so a running daemon and later CLI invocations
-    agree on the same secret.
+    Creation is atomic via ``O_CREAT | O_EXCL`` so concurrent first-starts
+    cannot generate divergent tokens or clobber the file: exactly one caller
+    wins the create; the rest read the winner's token. All permission and
+    read operations go through the file descriptor (``O_NOFOLLOW`` + ``fstat``/
+    ``fchmod``) so a symlink or a pathname swapped underneath us cannot redirect
+    them. Permission tightening is fail-closed — a token that cannot be confined
+    to a regular, owner-only 0600 file is rejected.
 
-    @param config_path: Path to repos.toml (its parent holds the token).
     @returns: The auth token string.
+    @raises TokenSecurityError: If the token file cannot be secured.
     """
-    path = token_file_path(config_path)
-    if path.is_file():
-        existing = path.read_text().strip()
-        if existing:
-            # Best-effort tighten perms in case the file was created loose.
-            with contextlib.suppress(OSError):
-                os.chmod(path, 0o600)
-            return existing
-
-    token = secrets.token_urlsafe(32)
+    path = token_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Create with 0600 from the start so the secret is never briefly
-    # world-readable between write and chmod.
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    token = secrets.token_urlsafe(32)
+
+    try:
+        # O_EXCL refuses to follow an existing symlink and guarantees this
+        # caller is the sole creator; O_NOFOLLOW is belt-and-suspenders.
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+    except FileExistsError:
+        existing = _read_existing_token_secure(path)
+        if existing is not None:
+            return existing
+        # File exists but is empty — a create raced ahead of its write, or the
+        # file is corrupt. Overwriting would risk clobbering a valid token, so
+        # fail closed rather than diverge.
+        raise TokenSecurityError(
+            f"Auth-token file {path} exists but is empty; refusing to "
+            "overwrite a possibly in-progress or corrupt token."
+        ) from None
+
     try:
         os.write(fd, token.encode())
+        _enforce_owner_only_fd(fd, path)
     finally:
         os.close(fd)
-    with contextlib.suppress(OSError):
-        os.chmod(path, 0o600)
     return token
 
 
-def load_token(config_path: Path | None = None) -> str | None:
+def _open_token_no_follow(path: Path) -> int:
+    """Open an existing token file for reading without following symlinks.
+
+    Verifies via ``fstat`` on the descriptor that the target is a regular file
+    owned by the current user, so a planted symlink or a foreign-owned file
+    cannot supply an attacker-known token.
+
+    @param path: Token file path.
+    @returns: Open read-only descriptor.
+    @raises TokenSecurityError: If the path is a symlink, not a regular file, or
+        not owned by the current user.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise TokenSecurityError(
+            f"Refusing to read auth-token file {path}: {e} "
+            "(is it a symlink pointing outside the config dir?)."
+        ) from e
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise TokenSecurityError(
+                f"Auth-token file {path} is not a regular file; refusing to use it."
+            )
+        if st.st_uid != os.getuid():
+            raise TokenSecurityError(
+                f"Auth-token file {path} is not owned by the current user; "
+                "refusing to trust a foreign-owned token."
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_existing_token_secure(path: Path, attempts: int = 20) -> str | None:
+    """Securely read a token another process may still be writing.
+
+    Re-opens with ``O_NOFOLLOW`` each attempt, tightens perms fail-closed on the
+    descriptor, and retries briefly to cover the window between a concurrent
+    ``O_EXCL`` create and its write. Returns ``None`` if the file stays empty.
+
+    @param path: Token file path.
+    @param attempts: Max read attempts before giving up.
+    @returns: The token string, or ``None`` if it never became non-empty.
+    """
+    import time
+
+    for _ in range(attempts):
+        try:
+            fd = _open_token_no_follow(path)
+        except OSError:
+            time.sleep(0.01)
+            continue
+        try:
+            _enforce_owner_only_fd(fd, path)
+            value = _read_all_fd(fd).decode("utf-8", "strict").strip()
+        finally:
+            os.close(fd)
+        if value:
+            return value
+        time.sleep(0.01)
+    return None
+
+
+def load_token() -> str | None:
     """Read the daemon auth token without creating one.
 
     Used by the CLI client so ``sr ask`` / ``sr refresh`` can forward the
-    token. Returns ``None`` when no token exists yet (daemon never started).
+    token. Reads the canonical default location without following symlinks.
+    Returns ``None`` when no token exists yet (daemon never started).
 
-    @param config_path: Path to repos.toml (its parent holds the token).
     @returns: The token string, or ``None`` if absent.
     """
-    path = token_file_path(config_path)
-    if path.is_file():
-        token = path.read_text().strip()
-        return token or None
-    return None
+    path = token_file_path()
+    if not path.exists():
+        return None
+    try:
+        fd = _open_token_no_follow(path)
+    except TokenSecurityError:
+        raise
+    except OSError:
+        return None
+    try:
+        value = _read_all_fd(fd).decode("utf-8", "strict").strip()
+    finally:
+        os.close(fd)
+    return value or None

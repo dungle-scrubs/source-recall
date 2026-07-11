@@ -236,6 +236,55 @@ class TestDaemonAuth:
             resp = client.get("/health", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 200
 
+    def test_openapi_schema_not_served(self, daemon_client: TestClient) -> None:
+        """The built-in /openapi.json route is disabled on the machine API.
+
+        FastAPI's schema/docs routes sit outside the auth dependency, so they
+        must not be served on the daemon app.
+        """
+        resp = daemon_client.get("/openapi.json")
+        assert resp.status_code == 404
+
+    def test_docs_routes_not_served(self, daemon_client: TestClient) -> None:
+        """/docs and /redoc are disabled on the daemon app."""
+        assert daemon_client.get("/docs").status_code == 404
+        assert daemon_client.get("/redoc").status_code == 404
+
+    def test_token_canonical_regardless_of_custom_config(
+        self, py_app_path: Path, tmp_path: Path
+    ) -> None:
+        """The daemon token lives at the canonical default location.
+
+        A daemon started with a custom --config must store its token at the
+        default config dir (where the CLI client reads it), not beside the
+        custom repos.toml — otherwise the CLI 401s a custom-config daemon.
+        """
+        from source_recall.daemon import create_daemon_app
+        from source_recall.daemon_config import (
+            DaemonConfig,
+            load_token,
+            token_file_path,
+        )
+
+        custom_dir = tmp_path / "elsewhere"
+        custom_dir.mkdir()
+        custom_config = custom_dir / "repos.toml"
+        custom_config.write_text("[daemon]\n")
+
+        cfg = DaemonConfig(
+            repos=[DaemonConfig.RepoEntry(path=py_app_path, name=py_app_path.name)],
+            config_path=custom_config,
+        )
+        emb = BagOfWordsEmbedder(dimensions=64)
+        app = create_daemon_app(cfg, embedder=emb)
+
+        # CLI reads the default (canonical) location and must get the same token
+        # the daemon published — proving they agree.
+        assert load_token() == app.state.sr_token
+        # And the token is NOT written beside the custom config.
+        assert not (custom_dir / "token").exists()
+        assert token_file_path().parent != custom_dir
+
 
 class TestDaemonWarmup:
     def test_startup_warms_embedder(self, daemon_config: DaemonConfig) -> None:

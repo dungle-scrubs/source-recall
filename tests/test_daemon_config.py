@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -139,11 +141,138 @@ port = 7249
 
 
 class TestDefaultConfigPath:
-    def test_default_path(self) -> None:
-        """Default config path is ~/.config/source-recall/repos.toml."""
-        assert DaemonConfig.default_config_path() == (
-            Path.home() / ".config" / "source-recall" / "repos.toml"
+    def test_default_path_composes_from_dir(self) -> None:
+        """default_config_path() is default_config_dir()/repos.toml."""
+        assert (
+            DaemonConfig.default_config_path()
+            == DaemonConfig.default_config_dir() / "repos.toml"
         )
+
+    def test_canonical_default_dir_is_config_home(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The real (unpatched) default dir is ~/.config/source-recall."""
+        # Undo the autouse config-dir isolation so we can assert the real
+        # canonical location this test exists to regression-guard.
+        monkeypatch.undo()
+        assert DaemonConfig.default_config_dir() == (
+            Path.home() / ".config" / "source-recall"
+        )
+
+
+class TestTokenLifecycle:
+    """load_or_create_token: atomic O_EXCL create + fail-closed permissions."""
+
+    def test_creates_token_with_0600(self, tmp_path: Path) -> None:
+        """A freshly created token file is owner-read/write only."""
+        from source_recall.daemon_config import (
+            load_or_create_token,
+            token_file_path,
+        )
+
+        token = load_or_create_token()
+        assert token
+        path = token_file_path()
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600
+
+    def test_existing_token_not_overwritten(self, tmp_path: Path) -> None:
+        """When the token file already exists, its value is read, not clobbered.
+
+        This is the O_EXCL path: create fails with FileExistsError, so we must
+        fall back to reading the existing secret rather than generating a new
+        one (which would diverge from an already-running daemon).
+        """
+        from source_recall.daemon_config import (
+            load_or_create_token,
+            token_file_path,
+        )
+
+        path = token_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(fd, b"preexisting-token")
+        os.close(fd)
+
+        assert load_or_create_token() == "preexisting-token"
+
+    def test_concurrent_first_start_agree_on_one_token(self, tmp_path: Path) -> None:
+        """Concurrent first-starts converge on a single token, never diverge."""
+        import threading
+
+        from source_recall.daemon_config import load_or_create_token
+
+        results: list[str] = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(8)
+
+        def worker() -> None:
+            barrier.wait()
+            tok = load_or_create_token()
+            with lock:
+                results.append(tok)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(set(results)) == 1
+
+    def test_fail_closed_when_chmod_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the token file cannot be made 0600, creation fails closed."""
+        from source_recall import daemon_config as dc
+
+        def boom(*_a: object, **_k: object) -> None:
+            raise OSError("chmod refused")
+
+        monkeypatch.setattr(dc.os, "fchmod", boom)
+        with pytest.raises(dc.TokenSecurityError):
+            dc.load_or_create_token()
+
+    def test_fail_closed_when_perms_stay_permissive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If perms remain permissive after chmod, creation fails closed."""
+        from source_recall import daemon_config as dc
+
+        # fchmod is a no-op, so the file keeps whatever mode os.open gave it,
+        # which the fail-closed check must reject if it is not 0600.
+        monkeypatch.setattr(dc.os, "fchmod", lambda *_a, **_k: None)
+
+        real_fstat = os.fstat
+
+        def fake_fstat(fd: int, *a: object, **k: object) -> object:
+            st = real_fstat(fd, *a, **k)
+
+            class _S:
+                st_mode = (st.st_mode & ~0o777) | 0o644
+
+            return _S()
+
+        monkeypatch.setattr(dc.os, "fstat", fake_fstat)
+        with pytest.raises(dc.TokenSecurityError):
+            dc.load_or_create_token()
+
+    def test_symlink_token_rejected(self, tmp_path: Path) -> None:
+        """A token path that is a symlink is refused (no symlink following)."""
+        from source_recall.daemon_config import (
+            TokenSecurityError,
+            load_or_create_token,
+            token_file_path,
+        )
+
+        target = tmp_path / "attacker-token"
+        target.write_text("attacker-known-token")
+        path = token_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target)
+
+        with pytest.raises(TokenSecurityError):
+            load_or_create_token()
 
 
 class TestToToml:

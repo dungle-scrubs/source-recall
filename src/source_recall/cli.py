@@ -240,8 +240,10 @@ def _try_daemon_query(
         if resp.status_code == 200:
             return resp
         # Daemon is up but returned an error — bubble it instead of
-        # falling back to in-process with wrong repo context.
-        if resp.status_code in (400, 404, 503):
+        # falling back to in-process with wrong repo context. 401/403 are
+        # included so an auth failure (e.g. a token-path mismatch) surfaces
+        # as a clear error rather than silently querying the local index.
+        if resp.status_code in (400, 401, 403, 404, 503):
             return resp
     except Exception:
         pass
