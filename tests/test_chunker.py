@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from source_recall.chunker import chunk_file
+from source_recall.chunker import _split_into_sub_chunks, chunk_file
 from source_recall.models import SearchQuality, SymbolType
 
 
@@ -225,6 +225,28 @@ class TestSubChunkOverlap:
             overlap = tail & head
             assert len(overlap) > 0, f"No overlap between sub-chunk {i} and {i + 1}"
 
+    def test_multiline_signature_drops_no_lines(self) -> None:
+        """A long multi-line signature must not let the overlap clamp jump
+        the cursor forward past unemitted lines and silently drop them."""
+        # A 5-line signature whose lines are individually long enough that
+        # the first sub-chunk cannot fit them all.  The old clamp rewound
+        # ``i`` forward to ``sig_line_count`` (== len(lines)), ending the
+        # loop before the remaining lines were ever emitted.
+        lines = [
+            "def process(",
+            "    aaa=" + "x" * 600 + ",",
+            "    bbb=" + "y" * 600 + ",",
+            "    ccc=" + "z" * 600 + ",",
+            "):",
+        ]
+        content = "\n".join(lines)
+
+        subs = _split_into_sub_chunks(content, 2000, "process")
+        union = "\n".join(text for text, _, _ in subs)
+
+        for line in lines:
+            assert line in union, f"Source line dropped from sub-chunks: {line[:24]!r}"
+
 
 class TestEdgeCaseFiles:
     def test_empty_file_returns_no_chunks(self) -> None:
@@ -258,6 +280,31 @@ class TestErrorNodeDensity:
         code = "export %%% broken {{{{ syntax !!! @@@\n" * 20
         chunks, quality = chunk_file("broken.ts", code)
         assert quality == SearchQuality.TEXT_FALLBACK
+
+
+class TestDeepASTResilience:
+    def test_deeply_nested_ast_does_not_recurse(self) -> None:
+        """Deeply nested nodes must not raise RecursionError in AST scans."""
+        from tree_sitter_language_pack import get_parser
+
+        from source_recall.chunker import (
+            _contains_any_node_type,
+            _contains_node_type,
+            _has_react_wrapper,
+        )
+
+        depth = 3000
+        code = "[" * depth + "1" + "]" * depth
+        tree = get_parser("javascript").parse(code.encode())
+        root = tree.root_node
+
+        # None of these should raise; a straight recursive walk would blow
+        # the interpreter stack well before this depth.
+        assert _contains_node_type(root, "array") is True
+        assert _contains_node_type(root, "jsx_element") is False
+        assert _contains_any_node_type(root, {"array"}) is True
+        assert _contains_any_node_type(root, {"jsx_element"}) is False
+        assert _has_react_wrapper(root) is False
 
 
 class TestParserCache:

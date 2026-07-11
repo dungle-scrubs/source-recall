@@ -508,3 +508,45 @@ class TestVecFailureTracking:
             store.run_migrations()
             dirty = store.get_meta("vec_dirty")
             assert dirty == "", "vec_dirty should be cleared after successful refresh"
+
+
+class TestMalformedFileSkipped:
+    def test_build_skips_file_that_raises_during_chunking(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """One file that raises during chunking is skipped, not fatal."""
+        import source_recall.builder as builder_mod
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init(repo, marker="malformed")
+        (repo / "good.py").write_text("def good(): return 1\n")
+        (repo / "bad.py").write_text("def bad(): return 2\n")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "two files"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        real_chunk = builder_mod.chunk_file_with_refs
+
+        def flaky_chunk(rel_path: str, content: str, **kwargs):
+            if rel_path == "bad.py":
+                raise ValueError("simulated malformed file")
+            return real_chunk(rel_path, content, **kwargs)
+
+        monkeypatch.setattr(builder_mod, "chunk_file_with_refs", flaky_chunk)
+
+        config = resolve_config(str(repo))
+        builder = IndexBuilder(repo, config)
+        # Must not raise despite bad.py blowing up.
+        builder.build()
+
+        with IndexStore(get_db_path(repo)) as store:
+            store.run_migrations()
+            # good.py (and init.py) indexed; bad.py skipped.
+            assert store.get_file_hash("good.py") is not None
+            assert store.get_file_hash("bad.py") is None
+            assert store.get_chunk_count() > 0

@@ -710,19 +710,17 @@ class IndexBuilder:
         if blob_sha is not None and not is_dirty:
             stored = store.get_file_hash(rel_path)
             if stored is not None and stored.content_hash == blob_sha:
-                # Content identical — just update branches on existing chunks.
-                existing_chunks = store.conn.execute(
-                    "SELECT id FROM chunks WHERE file_path = ?",
-                    (rel_path,),
-                ).fetchall()
-                if existing_chunks and branch:
-                    for row in existing_chunks:
-                        cid = row[0]
-                        br_row = store.conn.execute(
-                            "SELECT branches FROM chunks WHERE id = ?",
-                            (cid,),
-                        ).fetchone()
-                        current = br_row[0] if br_row else ""
+                # Content identical — just update branches on existing
+                # chunks.  Select id + branches together (one query, not
+                # N+1) and only UPDATE rows whose branch set actually
+                # changed, mirroring _update_branches_only.
+                if branch:
+                    rows = store.conn.execute(
+                        "SELECT id, branches FROM chunks WHERE file_path = ?",
+                        (rel_path,),
+                    ).fetchall()
+                    updated = False
+                    for cid, current in rows:
                         current_set = set(current.split(",")) if current else set()
                         if branch not in current_set:
                             current_set.add(branch)
@@ -731,10 +729,12 @@ class IndexBuilder:
                                 "UPDATE chunks SET branches = ? WHERE id = ?",
                                 (new_branches, cid),
                             )
-                    # Use _auto_commit (not raw conn.commit) so this
-                    # path is safe inside batch_mode — a raw commit would
-                    # prematurely flush the outer batch transaction (H-1).
-                    store._auto_commit()
+                            updated = True
+                    if updated:
+                        # Use _auto_commit (not raw conn.commit) so this
+                        # path is safe inside batch_mode — a raw commit would
+                        # prematurely flush the outer batch transaction (H-1).
+                        store._auto_commit()
                 # Update branch on file_hashes too.
                 store.upsert_file_hash(
                     FileRecord(
@@ -776,10 +776,21 @@ class IndexBuilder:
         else:
             content_hash = hashlib.sha256(content.encode()).hexdigest()
 
-        # Chunk the file and extract refs.
-        chunks, quality, refs = chunk_file_with_refs(
-            rel_path, content, max_chars=self.config.chunk_max_chars
-        )
+        # Chunk the file and extract refs.  A malformed file (unparseable
+        # content, a chunker bug) must be SKIPPED, not fatal — one bad file
+        # cannot be allowed to abort the whole build's transaction.  The
+        # guard is scoped to chunking only: storage failures below (SQLite
+        # errors, disk exhaustion) still propagate so a partial index is
+        # never published as a successful build.
+        try:
+            chunks, quality, refs = chunk_file_with_refs(
+                rel_path, content, max_chars=self.config.chunk_max_chars
+            )
+        except Exception:
+            logger.warning(
+                "Skipping file that failed to chunk: %s", rel_path, exc_info=True
+            )
+            return []
 
         chunk_pairs: list[tuple[str, str]] = []
         if chunks:
@@ -1204,15 +1215,14 @@ class IndexBuilder:
                 full = self.repo_path / path
                 if not full.is_file():
                     continue
-                try:
-                    content = full.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                # Compute synthetic blob SHA.
+                # Hash the RAW file bytes so the synthetic blob SHA matches
+                # git's real blob SHA. Reading as utf-8-replaced text (the
+                # old approach) mangles non-UTF8 bytes, yielding a SHA that
+                # never equals the committed blob and forcing a re-index on
+                # every refresh.
                 sha = _git_cmd(
                     self.repo_path,
-                    ["git", "hash-object", "--stdin"],
-                    stdin=content,
+                    ["git", "hash-object", str(full)],
                 )
                 if sha:
                     dirty[path] = sha

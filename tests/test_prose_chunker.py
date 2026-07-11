@@ -106,6 +106,52 @@ class TestPdfChunker:
         assert chunks[0].symbol_name == "Page 1"
         assert chunks[1].symbol_name == "Page 2"
 
+    def test_page_count_is_capped(self, monkeypatch, tmp_path: Path) -> None:
+        """A PDF exceeding the page cap yields no more chunks than the cap."""
+        import fitz
+
+        from source_recall import chunker
+        from source_recall.chunker import chunk_pdf
+
+        monkeypatch.setattr(chunker, "_PDF_MAX_PAGES", 3)
+
+        tmp = tmp_path / "big.pdf"
+        doc = fitz.open()
+        for n in range(10):
+            page = doc.new_page()
+            page.insert_text((72, 72), f"page number {n} content here")
+        doc.save(str(tmp))
+        doc.close()
+
+        chunks, _ = chunk_pdf("big.pdf", tmp)
+        assert len(chunks) <= 3
+
+    def test_cumulative_char_cap_truncates_pages(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """Extraction never retains more than the cumulative char cap."""
+        import fitz
+
+        from source_recall import chunker
+        from source_recall.chunker import chunk_pdf
+
+        monkeypatch.setattr(chunker, "_PDF_MAX_CHARS", 40)
+
+        tmp = tmp_path / "verbose.pdf"
+        doc = fitz.open()
+        for n in range(5):
+            page = doc.new_page()
+            # Each page carries well over the cap on its own.
+            page.insert_text((72, 72), f"line {n} " + "A" * 200)
+        doc.save(str(tmp))
+        doc.close()
+
+        chunks, _ = chunk_pdf("verbose.pdf", tmp)
+        total = sum(len(c.content) for c in chunks)
+        assert total <= 40
+        for c in chunks:
+            assert len(c.content) <= 40
+
     def test_empty_pdf_returns_no_chunks(self) -> None:
         """PDF with only empty pages returns empty list."""
         import fitz

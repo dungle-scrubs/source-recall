@@ -27,7 +27,10 @@ def test_failed_build_removes_tmp_file(tmp_path: Path) -> None:
 
     builder = IndexBuilder(repo, resolve_config())
 
-    # Force an error during the build's per-file indexing.
+    # Force an error during the build's per-file indexing.  Patching
+    # ``_index_file`` wholesale bypasses its internal chunk-only guard, so
+    # this simulates an unexpected failure of the indexing stage and
+    # exercises the tmp-cleanup finally block.
     with patch.object(builder, "_index_file") as m:
         m.side_effect = RuntimeError("simulated index failure")
 

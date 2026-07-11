@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import bisect
+import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from source_recall.models import ChunkData, RefData, RefType, SearchQuality, SymbolType
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from tree_sitter import Node
 
 # ---------------------------------------------------------------------------
@@ -28,6 +33,12 @@ _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 
 # Overlap lines between consecutive sub-chunks.
 _SUB_CHUNK_OVERLAP = 8
+
+# Resource-exhaustion guards for PDF extraction. A hostile or degenerate
+# PDF can carry an enormous page count or per-page text volume; bound both
+# so a single file cannot exhaust memory during a build.
+_PDF_MAX_PAGES = 5000
+_PDF_MAX_CHARS = 20_000_000
 
 
 def chunk_file(
@@ -816,12 +827,46 @@ def chunk_pdf(file_path: str, pdf_path: Path) -> tuple[list[ChunkData], SearchQu
     doc = fitz.open(str(pdf_path))
 
     try:
-        for page_num in range(len(doc)):
+        page_limit = min(len(doc), _PDF_MAX_PAGES)
+        if len(doc) > _PDF_MAX_PAGES:
+            logger.warning(
+                "PDF %s has %d pages; capping extraction at %d",
+                file_path,
+                len(doc),
+                _PDF_MAX_PAGES,
+            )
+
+        total_chars = 0
+        for page_num in range(page_limit):
+            remaining = _PDF_MAX_CHARS - total_chars
+            if remaining <= 0:
+                logger.warning(
+                    "PDF %s exceeded the %d-char extraction cap at page %d; "
+                    "remaining pages skipped",
+                    file_path,
+                    _PDF_MAX_CHARS,
+                    page_num + 1,
+                )
+                break
+
             page = doc[page_num]
             text = page.get_text().strip()
             if not text:
                 continue
 
+            # Truncate a single oversized page so no chunk — and the total
+            # extracted text — can exceed the cap, even for a PDF with one
+            # enormous text stream.
+            if len(text) > remaining:
+                text = text[:remaining]
+                logger.warning(
+                    "PDF %s page %d truncated to the %d-char extraction cap",
+                    file_path,
+                    page_num + 1,
+                    _PDF_MAX_CHARS,
+                )
+
+            total_chars += len(text)
             chunks.append(
                 ChunkData(
                     file_path=file_path,
@@ -1237,9 +1282,17 @@ def _split_into_sub_chunks(
 
         # Apply overlap — rewind by _SUB_CHUNK_OVERLAP lines, but never
         # back into the signature area (which is prepended separately).
+        #
+        # The clamp must only move the cursor BACKWARD.  Capping the
+        # signature guard at the lines actually consumed keeps it from
+        # exceeding ``i``; otherwise a signature spanning more lines than
+        # the first sub-chunk could jump the cursor forward, silently
+        # dropping (or, when it lands past ``len(lines)``, never emitting)
+        # the intervening source lines.
         if i < len(lines):
-            min_rewind = max(start_i + 1, sig_line_count)
-            i = max(min_rewind, i - _SUB_CHUNK_OVERLAP)
+            sig_guard = min(sig_line_count, i)
+            lower_bound = max(start_i + 1, sig_guard)
+            i = max(lower_bound, min(i, i - _SUB_CHUNK_OVERLAP))
 
     return result
 
@@ -1424,6 +1477,34 @@ def _has_jsx(node: Node) -> bool:
 _REACT_WRAPPER_RE = re.compile(r"(?:^|\.)(memo|forwardRef|lazy)$")
 
 
+def _iter_nodes(node: Node) -> Iterator[Node]:
+    """Yield ``node`` and every descendant via an iterative cursor walk.
+
+    Mirrors ``_count_nodes`` so deeply-nested files cannot raise
+    ``RecursionError`` (a resource-exhaustion surface on hostile input).
+
+    @param node: tree-sitter Node to start from.
+    @returns: Iterator over the node and all its descendants.
+    """
+    cursor = node.walk()
+    reached_root = False
+    while not reached_root:
+        yield cursor.node
+
+        if cursor.goto_first_child():
+            continue
+        if cursor.goto_next_sibling():
+            continue
+
+        retracing = True
+        while retracing:
+            if not cursor.goto_parent():
+                retracing = False
+                reached_root = True
+            elif cursor.goto_next_sibling():
+                retracing = False
+
+
 def _has_react_wrapper(node: Node) -> bool:
     """Check if a node contains React.memo/forwardRef/lazy calls.
 
@@ -1433,15 +1514,14 @@ def _has_react_wrapper(node: Node) -> bool:
     @param node: tree-sitter Node.
     @returns: True if a React wrapper call is found.
     """
-    for child in node.named_children:
-        if child.type == "call_expression":
-            func = child.child_by_field_name("function")
-            if func is not None:
-                text = (func.text or b"").decode("utf-8", errors="replace")
-                if _REACT_WRAPPER_RE.search(text):
-                    return True
-        if _has_react_wrapper(child):
-            return True
+    for descendant in _iter_nodes(node):
+        if descendant.type != "call_expression":
+            continue
+        func = descendant.child_by_field_name("function")
+        if func is not None:
+            text = (func.text or b"").decode("utf-8", errors="replace")
+            if _REACT_WRAPPER_RE.search(text):
+                return True
     return False
 
 
@@ -1452,9 +1532,7 @@ def _contains_node_type(node: Node, node_type: str) -> bool:
     @param node_type: Type string to look for.
     @returns: True if found.
     """
-    if node.type == node_type:
-        return True
-    return any(_contains_node_type(child, node_type) for child in node.children)
+    return any(n.type == node_type for n in _iter_nodes(node))
 
 
 def _contains_any_node_type(node: Node, node_types: set[str]) -> bool:
@@ -1464,9 +1542,7 @@ def _contains_any_node_type(node: Node, node_types: set[str]) -> bool:
     @param node_types: Set of type strings.
     @returns: True if any found.
     """
-    if node.type in node_types:
-        return True
-    return any(_contains_any_node_type(child, node_types) for child in node.children)
+    return any(n.type in node_types for n in _iter_nodes(node))
 
 
 def _is_pascal_case(name: str) -> bool:

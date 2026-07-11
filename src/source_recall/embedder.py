@@ -63,6 +63,12 @@ _CODERANK_CONFIG_SHA256 = (
 )
 _QUERY_PREFIX = "Represent this query for searching relevant code: "
 
+# Upper bound on the sentence-transformers encode batch size.  Sequences
+# are truncated to 512 tokens (see ``max_seq_length`` below), so attention
+# matrices are bounded per sequence; the batch dimension still multiplies
+# peak memory, so cap it to keep long-chunk builds from exhausting RAM.
+_MAX_ENCODE_BATCH = 32
+
 
 class CodeRankEmbedder:
     """Local CodeRankEmbed via sentence-transformers + ONNX Runtime.
@@ -71,10 +77,16 @@ class CodeRankEmbedder:
     ``~/.cache/huggingface/``.
 
     @param show_progress: Show download progress bar (default: True).
+    @param encode_batch_size: Batch size handed to ``model.encode``.
+        Clamped to ``[1, _MAX_ENCODE_BATCH]`` so an over-large config value
+        cannot trigger an attention-matrix OOM.
     """
 
-    def __init__(self, *, show_progress: bool = True) -> None:
+    def __init__(
+        self, *, show_progress: bool = True, encode_batch_size: int = 32
+    ) -> None:
         self._show_progress = show_progress
+        self._encode_batch_size = max(1, min(int(encode_batch_size), _MAX_ENCODE_BATCH))
         self._model: object | None = None
 
     def _load_model(self) -> object:
@@ -126,9 +138,13 @@ class CodeRankEmbedder:
         if not texts:
             return []
         model = self._load_model()
-        # Use small encode batch to limit peak memory from attention
-        # matrices on long code chunks (up to 6000 chars / 8192 tokens).
-        embeddings = model.encode(texts, show_progress_bar=False, batch_size=8)  # type: ignore[union-attr]
+        # Batch size comes from config (embed_batch_size), clamped in
+        # __init__ to a safe max.  Sequences are truncated to 512 tokens,
+        # so the per-sequence attention matrix is bounded; the clamp keeps
+        # the batch dimension from multiplying peak memory unboundedly.
+        embeddings = model.encode(  # type: ignore[union-attr]
+            texts, show_progress_bar=False, batch_size=self._encode_batch_size
+        )
         return embeddings.tolist()  # type: ignore[union-attr]
 
     def embed_query(self, query: str) -> list[float]:

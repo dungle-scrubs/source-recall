@@ -426,3 +426,123 @@ class TestRefreshBranchSwitch:
         assert total_embedded == 0, (
             f"Expected 0 re-embeddings switching back, got {total_embedded}"
         )
+
+
+class TestNonUtf8DirtyHash:
+    def test_committed_non_utf8_file_not_reindexed(self, tmp_path: Path) -> None:
+        """A non-UTF8 file, once committed unchanged, is not re-classified.
+
+        The synthetic dirty-file blob SHA must be computed from the raw
+        bytes (matching git's real blob SHA), not from utf-8-replaced text.
+        Otherwise the stored hash never matches git's committed blob SHA and
+        the file is re-indexed on every refresh.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init(repo, marker="nonutf8")
+
+        # Untracked file with non-UTF8 bytes — enters the build via the
+        # dirty-file path, which computes the synthetic blob SHA.
+        (repo / "weird.py").write_bytes(
+            b"\xff\xfe\x00 bad bytes \x80\x81 def f(): pass\n"
+        )
+
+        builder = _make_builder(repo)
+        builder.build()
+
+        # Commit the file with identical content.
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add weird"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        # Stored hash must equal git's real committed blob SHA.
+        real_blob = subprocess.run(
+            ["git", "rev-parse", "HEAD:weird.py"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+        with IndexStore(get_db_path(repo)) as store:
+            store.run_migrations()
+            rec = store.get_file_hash("weird.py")
+            assert rec is not None
+            assert rec.content_hash == real_blob
+
+        # Refresh must see nothing changed for the now-committed file.
+        changed = builder.refresh()
+        assert changed == 0, f"Unchanged non-UTF8 file re-indexed: {changed} changes"
+
+
+class TestFastPathBranchUpdateBatched:
+    def test_branch_update_avoids_per_chunk_select(self, tmp_path: Path) -> None:
+        """The unchanged-content fast path must not issue an N+1 branch query.
+
+        Branch data should be fetched alongside the chunk id in one query,
+        mirroring _update_branches_only, instead of a per-chunk SELECT.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init(repo, marker="fastpath")
+        # Many functions → many chunks for the same file.
+        body = "\n".join(f"def fn_{n}():\n    return {n}\n" for n in range(30))
+        (repo / "many.py").write_text(body)
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "many funcs"],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        builder = _make_builder(repo)
+        builder.build()
+
+        db_path = get_db_path(repo)
+        with IndexStore(db_path) as store:
+            store.run_migrations()
+            rec = store.get_file_hash("many.py")
+            assert rec is not None
+            blob_sha = rec.content_hash
+            n_chunks = len(
+                store.conn.execute(
+                    "SELECT id FROM chunks WHERE file_path = ?", ("many.py",)
+                ).fetchall()
+            )
+            assert n_chunks >= 10
+
+            # Count the per-chunk branch SELECT that the N+1 path issued.
+            per_chunk_selects = 0
+
+            def trace(sql: str) -> None:
+                nonlocal per_chunk_selects
+                if "SELECT branches FROM chunks WHERE id" in sql:
+                    per_chunk_selects += 1
+
+            store.conn.set_trace_callback(trace)
+            try:
+                builder._index_file(
+                    store,
+                    "many.py",
+                    branch="feature",
+                    blob_sha=blob_sha,
+                    is_dirty=False,
+                )
+            finally:
+                store.conn.set_trace_callback(None)
+
+            assert per_chunk_selects == 0, (
+                f"Fast path issued {per_chunk_selects} per-chunk branch queries"
+            )
+
+            # Branch update is still correct: every chunk now carries feature.
+            rows = store.conn.execute(
+                "SELECT branches FROM chunks WHERE file_path = ?", ("many.py",)
+            ).fetchall()
+            for (branches,) in rows:
+                assert "feature" in branches.split(",")
