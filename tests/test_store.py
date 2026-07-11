@@ -123,7 +123,7 @@ class TestFTSTriggers:
         # FTS search should find it.
         results = store.fts_search("AuthService")
         assert len(results) == 1
-        assert results[0]["symbol_name"] == "AuthService"
+        assert results[0].symbol_name == "AuthService"
 
     def test_delete_removes_from_fts(self, store: IndexStore) -> None:
         """FTS entries are removed via trigger on DELETE."""
@@ -167,8 +167,8 @@ class TestFTSTriggers:
 
         results = store.fts_search("payment")
         assert len(results) >= 1
-        assert results[0]["symbol_name"] == "process_payment"
-        assert results[0]["score"] > 0
+        assert results[0].symbol_name == "process_payment"
+        assert results[0].score > 0
 
 
 class TestSymbolSearch:
@@ -196,8 +196,8 @@ class TestSymbolSearch:
 
         results = store.symbol_search("UserService")
         assert len(results) == 1
-        assert results[0]["symbol_name"] == "UserService"
-        assert results[0]["score"] == 100.0
+        assert results[0].symbol_name == "UserService"
+        assert results[0].score == 100.0
 
     def test_case_insensitive(self, store: IndexStore) -> None:
         """Symbol search is case-insensitive."""
@@ -215,6 +215,44 @@ class TestSymbolSearch:
 
         results = store.symbol_search("myclass")
         assert len(results) == 1
+
+
+class TestTypedSearchRows:
+    def test_search_methods_return_search_rows(self, store: IndexStore) -> None:
+        """The four search methods return typed SearchRow instances.
+
+        The store->querier boundary is a single frozen dataclass so the
+        column->field mapping lives in one place and consumers are
+        ty-guarded (finding B).
+        """
+        from source_recall.models import SearchRow
+
+        chunk = ChunkData(
+            file_path="a.py",
+            symbol_name="TypedThing",
+            symbol_type=SymbolType.CLASS,
+            content="class TypedThing:\n    def go(self): ...",
+            start_line=1,
+            end_line=2,
+        )
+        store.insert_chunks([chunk])
+        store.insert_symbol_lookups([(chunk.chunk_id, "TypedThing", "a.py")])
+
+        fts = store.fts_search("TypedThing")
+        sym = store.symbol_search("TypedThing")
+        lookup = store.lookup_symbol("TypedThing")
+
+        for rows in (fts, sym, lookup):
+            assert len(rows) == 1
+            row = rows[0]
+            assert isinstance(row, SearchRow)
+            assert row.chunk_id == chunk.chunk_id
+            assert row.symbol_name == "TypedThing"
+            assert row.file_path == "a.py"
+
+        # FTS carries a BM25 score; symbol_search marks exact matches 100.0.
+        assert fts[0].score != 0.0
+        assert sym[0].score == 100.0
 
 
 class TestDuplicateChunkInsert:
@@ -390,6 +428,31 @@ class TestSymbolLookup:
         self._seed_definitions(store, "widget", 5)
         rows = store.lookup_symbol("widget", limit=2)
         assert len(rows) == 2
+
+    def test_lookup_symbols_batches_names(self, store: IndexStore) -> None:
+        """lookup_symbols resolves multiple names in one query, deduping names."""
+        self._seed_definitions(store, "alpha", 2)
+        self._seed_definitions(store, "beta", 3)
+        # Duplicate name in the request must not double-count rows.
+        rows = store.lookup_symbols(["alpha", "beta", "alpha"])
+        assert {r.symbol_name for r in rows} == {"alpha", "beta"}
+        assert len(rows) == 5
+
+    def test_lookup_symbols_limit_is_per_name(self, store: IndexStore) -> None:
+        """lookup_symbols applies the limit per name, not globally.
+
+        A global LIMIT would let a hot symbol starve later names; the
+        per-name cap keeps every requested name represented.
+        """
+        self._seed_definitions(store, "alpha", 5)
+        self._seed_definitions(store, "beta", 5)
+        rows = store.lookup_symbols(["alpha", "beta"], limit=2)
+        # 2 per name, and results are grouped in request order.
+        assert [r.symbol_name for r in rows] == ["alpha", "alpha", "beta", "beta"]
+
+    def test_lookup_symbols_empty(self, store: IndexStore) -> None:
+        """An empty name list returns no rows and issues no query."""
+        assert store.lookup_symbols([]) == []
 
 
 class TestHasVecTableMemo:

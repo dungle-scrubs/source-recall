@@ -99,7 +99,7 @@ class TestRefStore:
 
         results = store.lookup_symbol("UserModel")
         assert len(results) == 1
-        assert results[0]["chunk_id"] == chunk.chunk_id
+        assert results[0].chunk_id == chunk.chunk_id
 
         store.close()
 

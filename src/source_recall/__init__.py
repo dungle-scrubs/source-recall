@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
-import threading
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from source_recall.concurrency import ReaderWriterLock
 from source_recall.config import SRConfig, resolve_config
 from source_recall.models import (
     _SENTINEL,
@@ -35,51 +35,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-class _ReaderWriterLock:
-    """Minimal reader/writer lock built on a condition variable.
-
-    Multiple readers may hold the lock concurrently; a writer waits until
-    no readers (or writers) are active.  Used by ``Index`` so concurrent
-    ``query``/``status`` calls proceed in parallel while ``refresh`` /
-    ``build`` / ``close`` take an exclusive write lock to swap the
-    underlying querier (M-2 fix).
-
-    Writers are preferred once waiting to avoid starving refreshes under
-    heavy read load.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._cond = threading.Condition(self._lock)
-        self._readers = 0
-        self._writers = 0
-        self._writer_active = False
-
-    def acquire_read(self) -> None:
-        with self._cond:
-            while self._writers > 0 or self._writer_active:
-                self._cond.wait()
-            self._readers += 1
-
-    def release_read(self) -> None:
-        with self._cond:
-            self._readers -= 1
-            if self._readers == 0:
-                self._cond.notify_all()
-
-    def acquire_write(self) -> None:
-        with self._cond:
-            self._writers += 1
-            while self._readers > 0 or self._writer_active:
-                self._cond.wait()
-            self._writers -= 1
-            self._writer_active = True
-
-    def release_write(self) -> None:
-        with self._cond:
-            self._writer_active = False
-            self._cond.notify_all()
+# Shared reader/writer lock (moved to source_recall.concurrency so the
+# querier can reuse it for its own store-lifetime lock).  ``Index`` uses
+# it so concurrent query/status run in parallel while refresh/build/close
+# take an exclusive write lock to swap the underlying querier (M-2 fix).
+_ReaderWriterLock = ReaderWriterLock
 
 
 __all__ = [

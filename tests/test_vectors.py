@@ -6,10 +6,25 @@ from pathlib import Path
 
 import pytest
 
+from source_recall.concurrency import ReaderWriterLock
 from source_recall.embedder import BagOfWordsEmbedder
-from source_recall.models import ChunkData, SymbolType
+from source_recall.models import ChunkData, SearchRow, SymbolType
 from source_recall.querier import _rrf_merge
 from source_recall.store import IndexStore
+
+
+def _rrf_row(chunk_id: str) -> SearchRow:
+    """Build a minimal SearchRow for RRF-merge tests (rank-based)."""
+    return SearchRow(
+        chunk_id=chunk_id,
+        file_path=f"{chunk_id}.py",
+        symbol_name=chunk_id,
+        symbol_type="function",
+        content="",
+        start_line=1,
+        end_line=1,
+        search_quality="ast",
+    )
 
 
 @pytest.fixture
@@ -104,7 +119,7 @@ class TestVecChunksStore:
 
         assert len(results) == 2
         # Auth chunk should rank first (lower distance).
-        assert results[0]["symbol_name"] == "authenticate"
+        assert results[0].symbol_name == "authenticate"
 
     def test_delete_vectors_by_file(
         self, vec_store: IndexStore, embedder: BagOfWordsEmbedder
@@ -260,10 +275,7 @@ class TestSchemaMigration:
 class TestRRFMerge:
     def test_single_list(self) -> None:
         """RRF with empty second list returns scores from first."""
-        fts = [
-            {"chunk_id": "a", "score": 10},
-            {"chunk_id": "b", "score": 5},
-        ]
+        fts = [_rrf_row("a"), _rrf_row("b")]
         scores = _rrf_merge(fts, [], k=15)
         assert "a" in scores
         assert "b" in scores
@@ -271,14 +283,8 @@ class TestRRFMerge:
 
     def test_two_lists_overlap(self) -> None:
         """Chunks appearing in both lists get boosted."""
-        fts = [
-            {"chunk_id": "a", "score": 10},
-            {"chunk_id": "b", "score": 5},
-        ]
-        vec = [
-            {"chunk_id": "b", "distance": 0.1},
-            {"chunk_id": "c", "distance": 0.5},
-        ]
+        fts = [_rrf_row("a"), _rrf_row("b")]
+        vec = [_rrf_row("b"), _rrf_row("c")]
         scores = _rrf_merge(fts, vec, k=15)
 
         # b appears in both → boosted above a (which only appears in fts).
@@ -287,8 +293,8 @@ class TestRRFMerge:
 
     def test_k_parameter_affects_scores(self) -> None:
         """Smaller k gives more weight to top ranks."""
-        fts = [{"chunk_id": "a"}, {"chunk_id": "b"}]
-        vec: list[dict[str, object]] = []
+        fts = [_rrf_row("a"), _rrf_row("b")]
+        vec: list[SearchRow] = []
 
         scores_k5 = _rrf_merge(fts, vec, k=5)
         scores_k50 = _rrf_merge(fts, vec, k=50)
@@ -402,7 +408,7 @@ class TestHybridQuery:
         results = vec_store.search_vectors(query_vec, top_k=2)
 
         assert len(results) == 2
-        assert results[0]["symbol_name"] == "check_auth"
+        assert results[0].symbol_name == "check_auth"
 
     def test_fts_fallback_when_no_vectors(self, tmp_path: Path) -> None:
         """Querier falls back to FTS-only when vec_chunks doesn't exist."""
@@ -434,6 +440,7 @@ class TestHybridQuery:
         querier.config = config
         querier.embedder = BagOfWordsEmbedder()
         querier.reranker = None
+        querier._store_rwlock = ReaderWriterLock()
         querier._store = IndexStore(db_path)
         querier._store.open()
 

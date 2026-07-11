@@ -112,6 +112,43 @@ class ChunkData:
 
 
 @dataclass(frozen=True, slots=True)
+class SearchRow:
+    """One row returned by an IndexStore search method.
+
+    The single typed boundary between the store's SELECTs
+    (``fts_search``, ``symbol_search``, ``search_vectors``,
+    ``lookup_symbol``) and the querier.  The column->field mapping lives
+    here so it exists in exactly one place and ``ty`` guards every
+    consumer, replacing four duplicated ``dict[str, Any]`` shapes.
+
+    @param chunk_id: Unique chunk identifier.
+    @param file_path: Repo-relative path.
+    @param symbol_name: Symbol name (may be empty).
+    @param symbol_type: Structural classification (stored as text).
+    @param content: Full chunk text.
+    @param start_line: 1-indexed first line.
+    @param end_line: 1-indexed last line.
+    @param search_quality: Parse fidelity.
+    @param branches: Comma-separated branch membership (empty = legacy).
+    @param score: Retrieval score — BM25 for FTS, 100.0 for exact symbol
+        matches, 0.0 when not applicable.
+    @param distance: Vector distance (only set by ``search_vectors``).
+    """
+
+    chunk_id: str
+    file_path: str
+    symbol_name: str
+    symbol_type: str
+    content: str
+    start_line: int
+    end_line: int
+    search_quality: str
+    branches: str = ""
+    score: float = 0.0
+    distance: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RefData:
     """A cross-reference from one chunk to a symbol.
 

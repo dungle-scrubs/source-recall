@@ -43,6 +43,9 @@ class SRConfig(BaseSettings):
     @param chunk_max_chars: Character threshold for sub-chunking.
     @param auto_refresh: Refresh stale indexes before queries.
     @param exclude_patterns: Glob patterns to exclude from indexing.
+    @param graph_expand_enabled: Expand top results along the ref graph.
+        Set ``SR_GRAPH_EXPAND_ENABLED=false`` (or in TOML) to skip
+        expansion entirely and avoid its ref-graph round-trips.
     """
 
     model_config = SettingsConfigDict(
@@ -60,6 +63,7 @@ class SRConfig(BaseSettings):
     embed_enabled: bool = True
     embed_batch_size: int = Field(default=32, gt=0, le=512)
     rerank_enabled: bool = False
+    graph_expand_enabled: bool = True
 
     @field_validator("exclude_patterns", mode="before")
     @classmethod
@@ -145,6 +149,9 @@ def format_config(config: SRConfig) -> str:
     lines.append(f"embed_enabled = {'true' if config.embed_enabled else 'false'}")
     lines.append(f"embed_batch_size = {config.embed_batch_size}")
     lines.append(f"rerank_enabled = {'true' if config.rerank_enabled else 'false'}")
+    lines.append(
+        f"graph_expand_enabled = {'true' if config.graph_expand_enabled else 'false'}"
+    )
 
     excludes = ", ".join(f'"{p}"' for p in config.exclude_patterns)
     lines.append(f"exclude_patterns = [{excludes}]")
