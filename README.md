@@ -175,7 +175,7 @@ Query
   → Vector cosine search (top 30)
   → Symbol exact match (if query looks like a symbol)
   → RRF merge (k=15)
-  → Cross-encoder rerank (if enabled, top 20 candidates)
+  → Cross-encoder rerank (if enabled, top 3x top_k candidates)
   → Graph expansion (top 5 → follow refs → resolve symbols)
   → Return top_k
 ```

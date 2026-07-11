@@ -36,7 +36,11 @@ dependencies = [
     "sqlite-vec==0.1.6",
     "fastapi>=0.115.0",
     "uvicorn>=0.32.0",
-    "pymupdf>=1.24.0",
+    # PDF parsing surface: pymupdf parses untrusted, attacker-controlled
+    # PDFs (CVE surface). Kept to a conservative major-version ceiling;
+    # the exact resolved version is pinned via uv.lock, so upgrades are
+    # explicit and reviewed rather than silent.
+    "pymupdf>=1.24.0,<2.0.0",
     # L6: apsw bundles its own SQLite.  A major upgrade could bundle a
     # version incompatible with stdlib sqlite3 (both access the same
     # WAL file).  Pin conservatively.  apsw is required on all
