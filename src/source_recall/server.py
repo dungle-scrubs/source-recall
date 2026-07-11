@@ -19,6 +19,49 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Host-header (TrustedHost) policy
+# ---------------------------------------------------------------------------
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Whether ``host`` names only the local machine.
+
+    ``0.0.0.0`` / ``::`` (bind-all) and any routable address are treated as
+    non-loopback.
+
+    @param host: Host string the server will bind to.
+    @returns: True only for localhost / 127.0.0.0/8 / ::1.
+    """
+    import ipaddress
+
+    if host in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def trusted_allowed_hosts(host: str) -> list[str]:
+    """Compute the ``TrustedHostMiddleware`` allow-list for a bind host.
+
+    A loopback bind keeps a strict allow-list (loopback names plus the bound
+    host) so a DNS-rebinding page cannot reach the server via a spoofed Host
+    header. A non-loopback bind means the operator has deliberately exposed
+    the server to the network (``--insecure``); clients then reach it via the
+    LAN IP or hostname, which cannot be enumerated ahead of time, so a fixed
+    allow-list would reject every real request and make the bind unusable.
+    In that case Host protection is intentionally disabled with a wildcard.
+
+    @param host: Host the server binds to.
+    @returns: ``["*"]`` for a non-loopback bind, else the strict allow-list.
+    """
+    if not _is_loopback_host(host):
+        return ["*"]
+    return list(dict.fromkeys(["localhost", "127.0.0.1", "0.0.0.0", host]))
+
+
+# ---------------------------------------------------------------------------
 # Model warmup — kill the first-query cold spike
 # ---------------------------------------------------------------------------
 
@@ -296,8 +339,7 @@ def create_app(
     # explicitly bound host are accepted.
     from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-    allowed_hosts = list(dict.fromkeys(["localhost", "127.0.0.1", "0.0.0.0", host]))
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_allowed_hosts(host))
 
     # Allow cross-origin requests from browser-based coding tools (M3).
     # Restricted to localhost origins to prevent exfiltration of source

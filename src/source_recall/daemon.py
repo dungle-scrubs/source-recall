@@ -363,7 +363,9 @@ def create_daemon_app(
         for t in threads:
             t.join(timeout=config.shutdown_timeout_s)
 
-        manager.close_all()
+        # Bound the final close so a refresh still holding a slot lock after
+        # the join above cannot hang shutdown past the configured budget.
+        manager.close_all(lock_timeout_s=config.shutdown_timeout_s)
 
     app = FastAPI(
         title="source-recall daemon",
@@ -388,10 +390,11 @@ def create_daemon_app(
     # host the operator explicitly bound) are accepted.
     from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-    allowed_hosts = list(
-        dict.fromkeys(["localhost", "127.0.0.1", "0.0.0.0", config.host])
+    from source_recall.server import trusted_allowed_hosts
+
+    app.add_middleware(
+        TrustedHostMiddleware, allowed_hosts=trusted_allowed_hosts(config.host)
     )
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 
     # CORS — localhost only.
     from fastapi.middleware.cors import CORSMiddleware

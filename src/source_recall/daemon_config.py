@@ -261,7 +261,12 @@ def load_or_create_token() -> str:
         ) from None
 
     try:
-        os.write(fd, token.encode())
+        # os.write may perform a short write; loop until every byte lands so
+        # a concurrent reader never sees a truncated token.
+        data = token.encode()
+        written = 0
+        while written < len(data):
+            written += os.write(fd, data[written:])
         _enforce_owner_only_fd(fd, path)
     finally:
         os.close(fd)

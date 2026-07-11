@@ -760,6 +760,38 @@ class IndexBuilder:
 
     # -- File indexing ------------------------------------------------------
 
+    def _read_file_content(
+        self,
+        rel_path: str,
+        full: Path,
+        *,
+        blob_sha: str | None,
+        is_dirty: bool,
+    ) -> str:
+        """Read a file's text from its git blob or the working tree.
+
+        Reading from the git blob is preferred when a clean ``blob_sha`` is
+        available; a blob-read miss falls back to disk. A working-tree read
+        that fails raises ``OSError`` so the caller can decide whether to skip
+        (full build) or preserve prior data (refresh) — this method never
+        silently swallows a read error into empty content.
+
+        @param rel_path: Repo-relative path (for logging).
+        @param full: Absolute path to the file on disk.
+        @param blob_sha: Git blob SHA, or None to read the working tree.
+        @param is_dirty: True if the working tree copy differs from the blob.
+        @returns: Decoded file content.
+        @raises OSError: If the working-tree read fails.
+        """
+        if blob_sha is not None and not is_dirty:
+            content = self._read_git_blob(blob_sha)
+            if content is not None:
+                return content
+            logger.warning(
+                "Failed to read git blob for %s — falling back to disk", rel_path
+            )
+        return full.read_text(encoding="utf-8", errors="replace")
+
     def _index_file(
         self,
         store: IndexStore,
@@ -845,27 +877,20 @@ class IndexBuilder:
                 return []  # No new chunks to embed.
 
         # --- Read content ---
-        if blob_sha is not None and not is_dirty:
-            # Read from git blob.
-            content = self._read_git_blob(blob_sha)
-            if content is None:
-                logger.warning(
-                    "Failed to read git blob for %s — falling back to disk", rel_path
-                )
-                try:
-                    content = full.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    logger.warning(
-                        "Skipping unreadable file: %s", rel_path, exc_info=True
-                    )
-                    return []
-        else:
-            # Read from working tree (dirty file or no blob_sha).
-            try:
-                content = full.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                logger.warning("Skipping unreadable file: %s", rel_path, exc_info=True)
-                return []
+        # A read failure is treated exactly like a chunk failure: in refresh
+        # mode (swallow_chunk_errors=False) it MUST raise _ChunkFailedError so
+        # the caller's savepoint rolls back the pre-delete and the file keeps
+        # its prior chunks/hashes/vectors. Returning [] here would commit the
+        # delete with no replacement — permanent data loss via the read path.
+        try:
+            content = self._read_file_content(
+                rel_path, full, blob_sha=blob_sha, is_dirty=is_dirty
+            )
+        except OSError as exc:
+            if not swallow_chunk_errors:
+                raise _ChunkFailedError(rel_path) from exc
+            logger.warning("Skipping unreadable file: %s", rel_path, exc_info=True)
+            return []
 
         # Use blob SHA as content_hash when available, else sha256.
         if blob_sha is not None:
