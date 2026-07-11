@@ -55,11 +55,14 @@ _CODERANK_DIMENSIONS = 768
 # trust_remote_code=True.  Bump only after auditing the diff.
 _CODERANK_REVISION = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
 # SHA-256 of the model's config.json at the pinned revision.
-# Defense-in-depth: if the HuggingFace CDN is compromised at this
-# exact revision, the checksum catches tampered config files.
-# Bump when updating _CODERANK_REVISION after auditing the diff.
+# Defense-in-depth: config.json carries the ``auto_map`` that wires the
+# ``trust_remote_code=True`` model + config classes, so a tampered config
+# at this exact revision is a supply-chain vector.  ``_verify_config_checksum``
+# recomputes this over the cached bytes before the model loads and refuses
+# to proceed on mismatch.  Bump after auditing the diff when updating
+# _CODERANK_REVISION.
 _CODERANK_CONFIG_SHA256 = (
-    "c5c4beb205d1e44581a60dd1ef14e35e04c8fd4bdd07a42c2ac944e886f4e97b"
+    "5ff856a41d0f53ef2d74520627d464bd75c2efd8f26f381bd528654895c29b6c"
 )
 _QUERY_PREFIX = "Represent this query for searching relevant code: "
 
@@ -68,6 +71,15 @@ _QUERY_PREFIX = "Represent this query for searching relevant code: "
 # matrices are bounded per sequence; the batch dimension still multiplies
 # peak memory, so cap it to keep long-chunk builds from exhausting RAM.
 _MAX_ENCODE_BATCH = 32
+
+
+class EmbedderVerificationError(RuntimeError):
+    """Raised when a downloaded model artifact fails integrity verification.
+
+    Signals that the cached ``config.json`` for the pinned revision does not
+    match ``_CODERANK_CONFIG_SHA256``, so the model is refused rather than
+    loaded via its ``trust_remote_code`` path against unverified config.
+    """
 
 
 class CodeRankEmbedder:
@@ -99,6 +111,11 @@ class CodeRankEmbedder:
 
         import os
 
+        # Verify config.json integrity BEFORE constructing the model: the
+        # config drives the trust_remote_code auto_map, so it must match the
+        # pinned checksum before any remote code is trusted.
+        self._verify_config_checksum()
+
         from sentence_transformers import SentenceTransformer
 
         # Force CPU.  MPS (Apple Silicon GPU) shares memory with the
@@ -108,7 +125,7 @@ class CodeRankEmbedder:
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
         logger.info("Loading %s (first run downloads ~522 MB)...", _CODERANK_MODEL)
-        self._model = SentenceTransformer(
+        model = SentenceTransformer(
             _CODERANK_MODEL,
             trust_remote_code=True,
             revision=_CODERANK_REVISION,
@@ -118,8 +135,46 @@ class CodeRankEmbedder:
         # long sequences explode memory (9.7 GB at 8192, 1.7 GB at 512).
         # 512 tokens covers most function signatures + bodies and keeps
         # builds fast (~134ms/chunk vs 1825ms at full context).
-        self._model.max_seq_length = 512
+        model.max_seq_length = 512
+        self._model = model
         return self._model
+
+    def _verify_config_checksum(self) -> None:
+        """Verify the pinned revision's config.json matches its checksum.
+
+        Resolves the cached ``config.json`` for ``_CODERANK_REVISION`` (via
+        the HuggingFace cache, downloading it alone if not yet present),
+        hashes its bytes, and compares against ``_CODERANK_CONFIG_SHA256``.
+
+        @raises EmbedderVerificationError: If the config cannot be located or
+            its SHA-256 does not match the pinned constant.
+        """
+        import hashlib
+
+        from huggingface_hub import hf_hub_download, try_to_load_from_cache
+
+        cached = try_to_load_from_cache(
+            _CODERANK_MODEL, "config.json", revision=_CODERANK_REVISION
+        )
+        # try_to_load_from_cache returns the file path (str) when cached, a
+        # _CACHED_NO_EXIST sentinel when known-absent, or None when unknown.
+        # Fall back to fetching just config.json for the pinned revision.
+        if isinstance(cached, str):
+            config_path = cached
+        else:
+            config_path = hf_hub_download(
+                _CODERANK_MODEL, "config.json", revision=_CODERANK_REVISION
+            )
+
+        with open(config_path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()
+
+        if digest != _CODERANK_CONFIG_SHA256:
+            raise EmbedderVerificationError(
+                f"config.json checksum mismatch for {_CODERANK_MODEL}"
+                f"@{_CODERANK_REVISION}: expected {_CODERANK_CONFIG_SHA256}, "
+                f"got {digest}. Refusing to load a possibly tampered model."
+            )
 
     @property
     def dimensions(self) -> int:
