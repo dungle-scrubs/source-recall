@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 from collections.abc import Generator
 from pathlib import Path
 
@@ -188,3 +190,73 @@ class TestDaemonRefresh:
         resp = daemon_client.post(f"/refresh?repo={py_app_path.name}")
         assert resp.status_code == 200
         assert "files_updated" in resp.json()
+
+
+class TestDaemonAuth:
+    def test_request_without_token_returns_401(
+        self, daemon_config: DaemonConfig
+    ) -> None:
+        """Every route requires the local auth token."""
+        from source_recall.daemon import create_daemon_app
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        app = create_daemon_app(daemon_config, embedder=emb)
+        with TestClient(app, base_url="http://127.0.0.1") as client:
+            # Strip the token the autouse fixture injects.
+            client.headers.pop("x-sr-token", None)
+            resp = client.get("/health")
+        assert resp.status_code == 401
+
+    def test_request_with_wrong_token_returns_401(
+        self, daemon_config: DaemonConfig
+    ) -> None:
+        """A bad token is rejected."""
+        from source_recall.daemon import create_daemon_app
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        app = create_daemon_app(daemon_config, embedder=emb)
+        with TestClient(app, base_url="http://127.0.0.1") as client:
+            resp = client.get("/health", headers={"X-SR-Token": "nope"})
+        assert resp.status_code == 401
+
+    def test_request_with_token_returns_200(self, daemon_client: TestClient) -> None:
+        """The correct token (injected by the fixture) authorizes."""
+        resp = daemon_client.get("/health")
+        assert resp.status_code == 200
+
+    def test_bearer_token_authorizes(self, daemon_config: DaemonConfig) -> None:
+        """The Authorization: Bearer form is also accepted."""
+        from source_recall.daemon import create_daemon_app
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        app = create_daemon_app(daemon_config, embedder=emb)
+        token = app.state.sr_token
+        with TestClient(app, base_url="http://127.0.0.1") as client:
+            client.headers.pop("x-sr-token", None)
+            resp = client.get("/health", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+
+
+class TestDaemonHostValidation:
+    def test_foreign_host_header_rejected(self, daemon_client: TestClient) -> None:
+        """A non-loopback Host header is rejected (DNS-rebinding defense)."""
+        resp = daemon_client.get("/health", headers={"host": "evil.example.com"})
+        assert resp.status_code == 400
+
+    def test_loopback_host_accepted(self, daemon_client: TestClient) -> None:
+        """localhost Host header passes."""
+        resp = daemon_client.get("/health", headers={"host": "localhost"})
+        assert resp.status_code == 200
+
+
+class TestAddRepoContainment:
+    def test_add_repo_rejects_disallowed_path(self, daemon_client: TestClient) -> None:
+        """A real directory outside the allowed roots is rejected with 403."""
+        # mkdtemp lands in the system temp dir — outside the user's home and
+        # outside the pytest tmp tree that holds the registered repo.
+        outside = tempfile.mkdtemp()
+        try:
+            resp = daemon_client.post("/repos", json={"path": outside})
+            assert resp.status_code == 403
+        finally:
+            os.rmdir(outside)

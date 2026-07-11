@@ -190,6 +190,23 @@ def _daemon_url() -> str:
     return os.environ.get("SR_DAEMON_URL", _DEFAULT_DAEMON_URL)
 
 
+def _daemon_headers() -> dict[str, str]:
+    """Auth headers for daemon requests.
+
+    Loads the local token the daemon wrote to the config dir and forwards
+    it as ``X-SR-Token`` so ``sr ask`` / ``sr refresh`` / ``sr add`` keep
+    working transparently. Returns an empty dict when no token exists yet
+    (daemon never started) — the request will then get a 401, which the
+    callers surface as an error.
+
+    @returns: Header dict (possibly empty).
+    """
+    from source_recall.daemon_config import load_token
+
+    token = load_token()
+    return {"X-SR-Token": token} if token else {}
+
+
 def _try_daemon_query(
     question: str,
     *,
@@ -217,7 +234,7 @@ def _try_daemon_query(
         payload["branch"] = branch
 
     try:
-        resp = httpx.post(url, json=payload, timeout=10)
+        resp = httpx.post(url, json=payload, timeout=10, headers=_daemon_headers())
         # Return any successful response or a daemon-side error that
         # the caller should handle (not silently fall back).
         if resp.status_code == 200:
@@ -778,6 +795,25 @@ def config_show(
 # ---------------------------------------------------------------------------
 
 
+def _is_loopback_host(host: str) -> bool:
+    """Whether ``host`` binds only to the local machine.
+
+    ``0.0.0.0`` / ``::`` (bind-all) and any routable address are treated as
+    non-loopback so they trip the ``serve`` exposure guard.
+
+    @param host: Host string from --host.
+    @returns: True only for localhost / 127.0.0.0/8 / ::1.
+    """
+    import ipaddress
+
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 @app.command()
 def serve(
     paths: list[str] = typer.Argument(
@@ -790,6 +826,11 @@ def serve(
     ),
     rerank: bool = typer.Option(
         False, "--rerank", help="Enable cross-encoder reranking."
+    ),
+    insecure: bool = typer.Option(
+        False,
+        "--insecure",
+        help="Allow binding to a non-loopback host (unauthenticated API).",
     ),
 ) -> None:
     """Start a persistent query server (HTTP/JSON).
@@ -815,6 +856,24 @@ def serve(
 
     from source_recall.server import create_app
 
+    # The query server is unauthenticated. Binding it to a non-loopback
+    # host exposes every repo's source to the network — refuse unless the
+    # operator explicitly opts in with --insecure.
+    if not _is_loopback_host(host):
+        if not insecure:
+            err_console.print(
+                f"[red]Refusing to bind to non-loopback host '{host}':[/red] "
+                "the query server is unauthenticated and would expose your "
+                "source to the network. Re-run with [bold]--insecure[/bold] "
+                "if you understand the risk (prefer an SSH tunnel instead)."
+            )
+            raise typer.Exit(1)
+        err_console.print(
+            f"[yellow]⚠ WARNING:[/yellow] serving on non-loopback host "
+            f"'{host}' without authentication (--insecure). Anyone who can "
+            "reach this host can read your indexed source."
+        )
+
     if not paths:
         paths = ["."]
 
@@ -838,9 +897,11 @@ def serve(
 
     # Build the app with explicit config instead of mutating os.environ.
     if no_embed:
-        server_app = create_app(repo_paths, embedder=None, rerank_enabled=rerank)
+        server_app = create_app(
+            repo_paths, embedder=None, rerank_enabled=rerank, host=host
+        )
     else:
-        server_app = create_app(repo_paths, rerank_enabled=rerank)
+        server_app = create_app(repo_paths, rerank_enabled=rerank, host=host)
 
     err_console.print(f"  Listening on [cyan]http://{host}:{port}[/cyan]")
     err_console.print()
@@ -952,7 +1013,7 @@ def _wait_for_health(url: str, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            resp = httpx.get(f"{url}/health", timeout=2)
+            resp = httpx.get(f"{url}/health", timeout=2, headers=_daemon_headers())
             if resp.status_code == 200 and resp.json().get("ok"):
                 return True
         except Exception:
@@ -1104,7 +1165,9 @@ def _daemon_get(path: str) -> object:
     import httpx
 
     try:
-        return httpx.get(f"{_daemon_url()}{path}", timeout=10)
+        return httpx.get(
+            f"{_daemon_url()}{path}", timeout=10, headers=_daemon_headers()
+        )
     except httpx.ConnectError as e:
         raise ConnectionError(f"Daemon not running at {_daemon_url()}") from e
 
@@ -1119,8 +1182,11 @@ def _daemon_post(path: str, **kwargs: object) -> object:
     """
     import httpx
 
+    headers = {**_daemon_headers(), **(kwargs.pop("headers", None) or {})}  # type: ignore[dict-item]
     try:
-        return httpx.post(f"{_daemon_url()}{path}", timeout=10, **kwargs)  # type: ignore[arg-type]
+        return httpx.post(
+            f"{_daemon_url()}{path}", timeout=10, headers=headers, **kwargs
+        )  # type: ignore[arg-type]
     except httpx.ConnectError as e:
         raise ConnectionError(f"Daemon not running at {_daemon_url()}") from e
 
@@ -1135,7 +1201,9 @@ def _daemon_delete(path: str) -> object:
     import httpx
 
     try:
-        return httpx.delete(f"{_daemon_url()}{path}", timeout=10)
+        return httpx.delete(
+            f"{_daemon_url()}{path}", timeout=10, headers=_daemon_headers()
+        )
     except httpx.ConnectError as e:
         raise ConnectionError(f"Daemon not running at {_daemon_url()}") from e
 

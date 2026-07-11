@@ -161,15 +161,24 @@ def create_app(
     embedder: Any | None = _SENTINEL,
     *,
     rerank_enabled: bool = False,
+    host: str = "127.0.0.1",
 ) -> FastAPI:
     """Create a FastAPI app serving one or more repository indexes.
 
     Loads the embedder and opens indexes on startup. All query
     requests share the pre-loaded model — no per-request load cost.
 
+    Unlike the daemon this server is unauthenticated (it predates the
+    token scheme and is driven by trusted local agents), but it shares the
+    daemon's Host-header defense: TrustedHostMiddleware rejects any Host
+    other than loopback (plus the explicitly bound ``host``), so a
+    DNS-rebinding page cannot reach it. Callers should keep it on loopback;
+    ``sr serve`` refuses non-loopback binds without ``--insecure``.
+
     @param repo_paths: One or more repo root paths to serve.
     @param embedder: Embedder instance (omit for auto-create, None for FTS-only).
     @param rerank_enabled: Whether to enable cross-encoder reranking.
+    @param host: Host the server will bind to (added to the allowed-Host set).
     @returns: Configured FastAPI application.
     """
     if isinstance(repo_paths, Path):
@@ -203,6 +212,10 @@ def create_app(
         logger.info(
             "Server ready (%d repos loaded in %.1fs): %s", len(names), elapsed, names
         )
+        logger.warning(
+            "Query server is UNAUTHENTICATED — keep it bound to loopback. "
+            "Use the daemon (token-authenticated) for anything less trusted."
+        )
         yield
 
         # Shutdown: close all Index connections (H2).
@@ -214,6 +227,14 @@ def create_app(
         description="Code search and retrieval server.",
         lifespan=lifespan,
     )
+
+    # Host-header validation — defeats DNS rebinding (a page on an
+    # attacker domain resolving to 127.0.0.1). Only loopback names plus the
+    # explicitly bound host are accepted.
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+    allowed_hosts = list(dict.fromkeys(["localhost", "127.0.0.1", "0.0.0.0", host]))
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 
     # Allow cross-origin requests from browser-based coding tools (M3).
     # Restricted to localhost origins to prevent exfiltration of source
