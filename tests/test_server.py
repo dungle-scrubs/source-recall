@@ -31,6 +31,39 @@ def indexed_app(py_app_path: Path) -> Generator[TestClient, None, None]:
         yield client
 
 
+class TestWarmup:
+    def test_startup_warms_embedder(
+        self, py_app_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Server startup spawns a thread that warms the embedder.
+
+        The warmup must run (embed_query called) but must not block the
+        lifespan startup — it happens on a background daemon thread.
+        """
+        from source_recall import Index
+        from source_recall.server import create_app
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        Index(py_app_path, embedder=emb).build()
+
+        calls: list[str] = []
+        orig = emb.embed_query
+
+        def spy(q: str) -> list[float]:
+            calls.append(q)
+            return orig(q)
+
+        monkeypatch.setattr(emb, "embed_query", spy)
+
+        app = create_app(py_app_path, embedder=emb)
+        with TestClient(app):
+            warmup = app.state.warmup_thread
+            assert warmup is not None
+            warmup.join(timeout=5)
+
+        assert "warmup" in calls
+
+
 class TestQueryEndpoint:
     def test_returns_ranked_results(self, indexed_app: TestClient) -> None:
         """POST /query returns results array with query_ms."""

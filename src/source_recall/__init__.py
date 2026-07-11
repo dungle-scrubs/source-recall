@@ -275,6 +275,7 @@ class Index:
         *,
         top_k: int | None = None,
         branch: str | None = None,
+        query_vec: list[float] | None = None,
     ) -> list[QueryResult]:
         """Search the index.
 
@@ -287,11 +288,16 @@ class Index:
         @param question: Natural language or symbol query.
         @param top_k: Override number of results.
         @param branch: Filter to this branch. None = active branch.
+        @param query_vec: Precomputed query embedding to reuse for vector
+            search (skips re-embedding). Callers fanning one query across
+            several indexes that share an embedder pass it to embed once.
         @returns: Ranked list of QueryResult.
         """
         querier, lock = self._with_querier()
         try:
-            return querier.query(question, top_k=top_k, branch=branch)  # type: ignore[union-attr]
+            return querier.query(  # type: ignore[union-attr]
+                question, top_k=top_k, branch=branch, query_vec=query_vec
+            )
         finally:
             lock.release_read()
 

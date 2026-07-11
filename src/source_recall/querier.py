@@ -328,6 +328,7 @@ class IndexQuerier:
         *,
         top_k: int | None = None,
         branch: str | None = None,
+        query_vec: list[float] | None = None,
     ) -> list[QueryResult]:
         """Search the index using FTS + vectors + symbol matching.
 
@@ -339,13 +340,20 @@ class IndexQuerier:
         @param top_k: Override number of results (default: config.top_k).
         @param branch: Filter results to this branch. None = use active_branch
             from meta; empty string = no filtering (all branches).
+        @param query_vec: Precomputed query embedding. When provided, the
+            embedder is not re-invoked for vector search — a multi-repo
+            fan-out embeds the query once and reuses the vector across every
+            repo (they share the same embedder). Must have been produced by
+            an embedder with the same dimensions as this index.
         @returns: Ranked list of QueryResult.
         """
         # Hold the store read lock for the whole query so a concurrent
         # swap-triggered reopen cannot close the connection mid-flight.
         store = self._enter_store()
         try:
-            return self._run_query(store, question, top_k=top_k, branch=branch)
+            return self._run_query(
+                store, question, top_k=top_k, branch=branch, query_vec=query_vec
+            )
         finally:
             self._store_rwlock.release_read()
 
@@ -356,6 +364,7 @@ class IndexQuerier:
         *,
         top_k: int | None,
         branch: str | None,
+        query_vec: list[float] | None = None,
     ) -> list[QueryResult]:
         """Execute a query against an already-acquired store.
 
@@ -365,6 +374,7 @@ class IndexQuerier:
         @param question: Natural language or symbol query.
         @param top_k: Override number of results (default: config.top_k).
         @param branch: Branch filter (see ``query``).
+        @param query_vec: Precomputed query embedding (see ``query``).
         @returns: Ranked list of QueryResult.
         """
         k = top_k if top_k is not None else self.config.top_k
@@ -381,8 +391,14 @@ class IndexQuerier:
         vec_results: list[SearchRow] = []
         if self.embedder is not None and store.has_vec_table() and question.strip():
             try:
-                query_vec = self.embedder.embed_query(question)
-                vec_results = store.search_vectors(query_vec, top_k=30)
+                # Reuse a caller-supplied embedding (multi-repo fan-out
+                # computes it once) instead of re-embedding per repo.
+                vec = (
+                    query_vec
+                    if query_vec is not None
+                    else self.embedder.embed_query(question)
+                )
+                vec_results = store.search_vectors(vec, top_k=30)
             except Exception:
                 logger.warning("Vector search failed", exc_info=True)
 

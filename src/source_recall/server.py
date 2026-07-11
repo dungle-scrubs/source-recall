@@ -19,6 +19,44 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Model warmup — kill the first-query cold spike
+# ---------------------------------------------------------------------------
+
+
+def _warm_embedder(embedder: Any) -> None:
+    """Run one throwaway embed so the model loads off the hot path.
+
+    Embedding and reranker models load lazily on first use (~12s cold
+    spike on the first query). Warming them on a background thread at
+    startup moves that cost off the first request. Never raises — a model
+    that cannot load is logged and skipped so warmup can't crash startup.
+
+    @param embedder: Embedder to warm (None is a no-op).
+    """
+    if embedder is None:
+        return
+    try:
+        embedder.embed_query("warmup")
+    except Exception:
+        logger.warning("Embedder warmup failed", exc_info=True)
+
+
+def _warm_reranker(reranker: Any) -> None:
+    """Run one throwaway rerank so the cross-encoder loads off the hot path.
+
+    Never raises (see ``_warm_embedder``).
+
+    @param reranker: Reranker to warm (None is a no-op).
+    """
+    if reranker is None:
+        return
+    try:
+        reranker.rerank("warmup", [{"chunk_id": "warmup", "content": "warmup"}])
+    except Exception:
+        logger.warning("Reranker warmup failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Request / response models
 # ---------------------------------------------------------------------------
 
@@ -216,6 +254,31 @@ def create_app(
             "Query server is UNAUTHENTICATED — keep it bound to loopback. "
             "Use the daemon (token-authenticated) for anything less trusted."
         )
+
+        # Warm the embedder (and reranker, when enabled) on a background
+        # daemon thread so the first query does not pay the model-load cold
+        # spike. Does not block startup; failures are logged and ignored.
+        def _warmup() -> None:
+            seen: set[int] = set()
+            for entry in state["indexes"].values():
+                idx = entry["index"]
+                emb = getattr(idx, "_embedder", None)
+                if emb is not None and id(emb) not in seen:
+                    seen.add(id(emb))
+                    _warm_embedder(emb)
+                try:
+                    reranker = idx._get_reranker()
+                except Exception:
+                    reranker = None
+                    logger.warning("Reranker warmup failed", exc_info=True)
+                if reranker is not None and id(reranker) not in seen:
+                    seen.add(id(reranker))
+                    _warm_reranker(reranker)
+
+        warmup_thread = threading.Thread(target=_warmup, daemon=True, name="sr-warmup")
+        warmup_thread.start()
+        _app.state.warmup_thread = warmup_thread
+
         yield
 
         # Shutdown: close all Index connections (H2).

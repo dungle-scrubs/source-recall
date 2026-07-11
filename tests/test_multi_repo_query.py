@@ -77,3 +77,50 @@ class TestMultiRepoQuery:
         assert len(results) > 0
         # All results from the specified repo.
         assert all(r.get("repo_name") == py_app_path.name for r in results)
+
+    def test_fanout_embeds_query_once(self, py_app_path: Path, tmp_path: Path) -> None:
+        """A multi-repo fan-out embeds the query exactly once, not per repo.
+
+        The daemon computes the query vector once and reuses it across all
+        repos (they share ``state['embedder']``).
+        """
+        import shutil
+
+        from source_recall import Index
+        from source_recall.daemon import create_daemon_app
+
+        emb = BagOfWordsEmbedder(dimensions=64)
+        Index(py_app_path, embedder=emb).build()
+        repo2 = tmp_path / "repo2"
+        shutil.copytree(py_app_path, repo2)
+        Index(repo2, embedder=emb).build()
+
+        config = DaemonConfig(
+            repos=[
+                DaemonConfig.RepoEntry(path=py_app_path, name=py_app_path.name),
+                DaemonConfig.RepoEntry(path=repo2, name="repo2"),
+            ],
+            config_path=tmp_path / "repos.toml",
+        )
+        app = create_daemon_app(config, embedder=emb)
+
+        calls: list[str] = []
+        orig = emb.embed_query
+
+        def spy(q: str) -> list[float]:
+            calls.append(q)
+            return orig(q)
+
+        emb.embed_query = spy  # type: ignore[method-assign]
+
+        with TestClient(app) as client:
+            # Drain the startup warmup (which also embeds) before counting.
+            warmup = getattr(app.state, "warmup_thread", None)
+            if warmup is not None:
+                warmup.join(timeout=5)
+            before = len(calls)
+            resp = client.post("/query", json={"question": "authenticate"})
+            assert resp.status_code == 200
+            # Two ready repos → fan-out, but only one embed call.
+            assert len(resp.json()["results"]) > 0
+            assert len(calls) - before == 1
