@@ -590,21 +590,6 @@ class IndexBuilder:
         if stored is not None:
             store.upsert_file_hash(stored, branch=branch)
 
-    # -- File cleanup -------------------------------------------------------
-
-    @staticmethod
-    def _remove_file_data(store: IndexStore, rel_path: str, vec_enabled: bool) -> None:
-        """Remove all indexed data for a file (vectors, chunks, file hash).
-
-        @param store: Active IndexStore.
-        @param rel_path: Repo-relative file path.
-        @param vec_enabled: Whether vector table is available.
-        """
-        if vec_enabled:
-            store.delete_vectors_by_file(rel_path)
-        store.delete_chunks_for_file(rel_path)
-        store.delete_file_hash(rel_path)
-
     # -- File discovery -----------------------------------------------------
 
     def _discover_files(self) -> list[str]:
