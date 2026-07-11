@@ -6,6 +6,7 @@ import copy
 import enum
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -276,16 +277,43 @@ class RepoManager:
         with self._lock:
             return [(slot.name, slot.path) for slot in self.slots.values()]
 
-    def close_all(self) -> None:
+    def close_all(self, *, lock_timeout_s: float = 5.0) -> None:
         """Close all Index instances. Called during shutdown.
 
-        Each slot is closed while holding its per-slot lock — the same
-        lock the periodic-refresh loop takes around ``index.refresh()`` —
-        so a refresh that is still draining after the shutdown join
-        finishes before the connection is torn down. Without this,
-        close_all could close the SQLite connection mid-refresh.
+        Each slot is closed while holding its per-slot lock — the same lock
+        the periodic-refresh loop takes around ``index.refresh()`` — so a
+        refresh that is still draining finishes before the connection is torn
+        down. Without this, close_all could close the SQLite connection
+        mid-refresh.
+
+        Lock acquisition is bounded by a shared ``lock_timeout_s`` budget so
+        shutdown always completes in bounded time: a slot whose lock cannot be
+        acquired before the budget is exhausted (a refresh that outlived the
+        shutdown-thread join) is force-closed WITHOUT the lock. That interrupts
+        the in-flight refresh write, but the interrupted write is a SQLite WAL
+        transaction that is rolled back on next open — no index corruption.
+        Blocking indefinitely here would let one stuck refresh hang shutdown
+        forever, defeating ``shutdown_timeout_s``.
+
+        @param lock_timeout_s: Total budget (seconds) to spend waiting on slot
+            locks across all slots. Force-closes any slot still locked when the
+            budget runs out.
         """
         with self._lock:
-            for slot in self.slots.values():
-                with slot.lock:
-                    slot.close()
+            slots = list(self.slots.values())
+
+        deadline = time.monotonic() + max(0.0, lock_timeout_s)
+        for slot in slots:
+            remaining = deadline - time.monotonic()
+            acquired = slot.lock.acquire(timeout=remaining) if remaining > 0 else False
+            if not acquired:
+                logger.warning(
+                    "Shutdown: slot '%s' lock unavailable within budget; "
+                    "force-closing (in-flight refresh interrupted, WAL-recoverable)",
+                    slot.name,
+                )
+            try:
+                slot.close()
+            finally:
+                if acquired:
+                    slot.lock.release()
