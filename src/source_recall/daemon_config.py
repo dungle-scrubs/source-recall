@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 import stat
@@ -225,51 +226,85 @@ def load_or_create_token() -> str:
     """Load the daemon auth token, generating one on first use.
 
     The token is a URL-safe random string persisted with 0600 permissions.
-    Creation is atomic via ``O_CREAT | O_EXCL`` so concurrent first-starts
-    cannot generate divergent tokens or clobber the file: exactly one caller
-    wins the create; the rest read the winner's token. All permission and
-    read operations go through the file descriptor (``O_NOFOLLOW`` + ``fstat``/
-    ``fchmod``) so a symlink or a pathname swapped underneath us cannot redirect
-    them. Permission tightening is fail-closed — a token that cannot be confined
-    to a regular, owner-only 0600 file is rejected.
+
+    Publication is ATOMIC: the token is written in full to a private,
+    randomly-named temp file (``O_CREAT | O_EXCL | O_NOFOLLOW``, 0600) and then
+    linked into place with ``os.link``. Because the token file appears at its
+    canonical path only via that link — and only after the temp file is fully
+    written — a concurrent reader ever sees either the complete token or no
+    file at all, never a partial or empty one.
+
+    ``os.link`` also elects a single winner across concurrent first-starts: it
+    fails with ``FileExistsError`` if the canonical path already exists, so the
+    losers read the winner's token instead of diverging. ``os.rename`` would
+    give atomicity but silently overwrite, destroying that single-winner
+    guarantee, so link is used deliberately.
+
+    All permission and read operations go through the file descriptor
+    (``O_NOFOLLOW`` + ``fstat`` / ``fchmod``) so a symlink or a pathname swapped
+    underneath us cannot redirect them. Permission tightening is fail-closed —
+    a token that cannot be confined to a regular, owner-only 0600 file is
+    rejected.
 
     @returns: The auth token string.
     @raises TokenSecurityError: If the token file cannot be secured.
     """
     path = token_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    token = secrets.token_urlsafe(32)
 
-    try:
-        # O_EXCL refuses to follow an existing symlink and guarantees this
-        # caller is the sole creator; O_NOFOLLOW is belt-and-suspenders.
-        fd = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-        )
-    except FileExistsError:
+    # Fast path: an already-published token is, by construction, complete —
+    # so if the canonical file exists we simply read it (no rewrite).
+    if path.exists():
         existing = _read_existing_token_secure(path)
         if existing is not None:
             return existing
-        # File exists but is empty — a create raced ahead of its write, or the
-        # file is corrupt. Overwriting would risk clobbering a valid token, so
-        # fail closed rather than diverge.
         raise TokenSecurityError(
             f"Auth-token file {path} exists but is empty; refusing to "
             "overwrite a possibly in-progress or corrupt token."
-        ) from None
+        )
+
+    token = secrets.token_urlsafe(32)
+    data = token.encode()
+    # Random temp name so a hostile pre-created file cannot win the O_EXCL
+    # create and so concurrent writers never collide on the temp.
+    tmp = path.parent / f".{_TOKEN_FILENAME}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
 
     try:
-        # os.write may perform a short write; loop until every byte lands so
-        # a concurrent reader never sees a truncated token.
-        data = token.encode()
-        written = 0
-        while written < len(data):
-            written += os.write(fd, data[written:])
-        _enforce_owner_only_fd(fd, path)
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            # os.write may perform a short write; loop until every byte lands
+            # so the published file is never truncated.
+            written = 0
+            while written < len(data):
+                written += os.write(fd, data[written:])
+            _enforce_owner_only_fd(fd, tmp)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+        try:
+            # Atomic publication + single-winner election in one step: link
+            # fails if the canonical path already exists.
+            os.link(tmp, path)
+        except FileExistsError:
+            existing = _read_existing_token_secure(path)
+            if existing is not None:
+                return existing
+            # Canonical path exists but is empty — a create raced ahead of its
+            # write, or the file is corrupt. Fail closed rather than diverge.
+            raise TokenSecurityError(
+                f"Auth-token file {path} exists but is empty; refusing to "
+                "overwrite a possibly in-progress or corrupt token."
+            ) from None
     finally:
-        os.close(fd)
+        # The published inode survives via ``path``; drop the temp name.
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
     return token
 
 

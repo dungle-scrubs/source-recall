@@ -436,16 +436,22 @@ class IndexBuilder:
         dirty_map = self._detect_dirty_files()
         blob_map.update(dirty_map)
 
-        # Filter by size/exclusions.
-        current_files = set(self._filter_files(list(blob_map.keys())))
+        # Filter by size/exclusions.  Keep the uncertain (stat-failed) set
+        # separate: a transient stat failure must NOT be read as a deletion.
+        current_list, stat_failed = self._classify_candidates(list(blob_map.keys()))
+        current_files = set(current_list)
         stored_hashes = store.get_all_file_hashes()
         stored_paths = set(stored_hashes.keys())
 
         # Classify files into: unchanged, changed, added, deleted.
+        # Deletion requires POSITIVE evidence of absence, so a stored file
+        # whose stat merely failed transiently (in stat_failed) is excluded
+        # from the deleted set — its prior index entry survives untouched
+        # (an uncertain file is left as unknown-unchanged, not deleted).
         unchanged: list[str] = []
         changed: list[str] = []
         added: list[str] = []
-        deleted = stored_paths - current_files
+        deleted = stored_paths - current_files - stat_failed
 
         for rel_path in current_files:
             blob_sha = blob_map.get(rel_path)
@@ -682,12 +688,27 @@ class IndexBuilder:
         @returns: List of repo-relative paths.
         @raises FileDiscoveryError: On errors.
         """
+        indexable, _ = self._discover_files_classified()
+        return indexable
+
+    def _discover_files_classified(self) -> tuple[list[str], set[str]]:
+        """Discover files, separating indexable paths from uncertain ones.
+
+        Same discovery as ``_discover_files`` (git ls-files, else a directory
+        walk) but returns the ``_classify_candidates`` split so deletion
+        computation can exclude paths whose ``stat`` failed transiently. A
+        stored file must never be classified as deleted merely because a
+        fallible stat dropped it from the discovered set.
+
+        @returns: ``(indexable paths, uncertain paths)``.
+        @raises FileDiscoveryError: On errors.
+        """
         self._validate_repo_path()
 
         # Try git ls-files first (respects .gitignore).
         files = self._git_ls_files()
         if files is not None:
-            return self._filter_files(files)
+            return self._classify_candidates(files)
 
         # Fallback: walk the directory.
         result: list[str] = []
@@ -700,7 +721,28 @@ class IndexBuilder:
                 if not self._is_excluded(rel):
                     result.append(rel)
 
-        return self._filter_files(result)
+        return self._classify_candidates(result)
+
+    def _positively_absent(self, full: Path) -> bool:
+        """Report whether a file is DEFINITELY gone.
+
+        Returns True only when ``stat`` reports the path does not exist
+        (``FileNotFoundError`` — ENOENT/ENOTDIR). A transient stat error
+        (permission, I/O) returns False so the caller preserves the prior
+        index entry rather than treating uncertainty as deletion. This is the
+        positive-evidence gate that ``Path.exists()`` cannot provide, since
+        ``exists()`` also returns False on those transient errors.
+
+        @param full: Absolute path to check.
+        @returns: True only on positive evidence of absence.
+        """
+        try:
+            full.stat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return False
 
     def _git_ls_files(self) -> list[str] | None:
         """Use git ls-files to list tracked files.
@@ -721,27 +763,64 @@ class IndexBuilder:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return None
 
-    def _filter_files(self, files: list[str]) -> list[str]:
-        """Filter files by exclusion patterns and size limits.
+    def _classify_candidates(self, files: list[str]) -> tuple[list[str], set[str]]:
+        """Classify candidate paths into indexable vs. uncertain.
+
+        Every candidate lands in exactly one of three buckets:
+
+        * **indexable** — positively passes exclusion + size filters (its
+          ``stat`` succeeded, it is within the size bound and non-empty).
+          Returned in the first list.
+        * **uncertain** — its ``stat`` raised a transient (non-ENOENT) error,
+          so its true state is UNKNOWN. Returned in the second set. A caller
+          computing deletions MUST NOT treat these as absent: the invariant
+          is that an existing index entry may only be mutated on POSITIVE
+          evidence of absence or valid replacement data, and a fallible stat
+          is neither.
+        * **definite negative** — excluded by pattern, over the size limit,
+          empty, or positively gone (``FileNotFoundError``). Appears in
+          neither result, so a deletion computed as ``stored - indexable``
+          still removes a genuinely absent or now-un-indexable file.
 
         @param files: Raw list of repo-relative paths.
-        @returns: Filtered list.
+        @returns: ``(sorted indexable paths, uncertain paths)``.
         """
         result: list[str] = []
+        uncertain: set[str] = set()
         for rel_path in files:
             if self._is_excluded(rel_path):
                 continue
             full = self.repo_path / rel_path
             try:
                 size = full.stat().st_size
-                if size > self.config.max_file_size:
-                    continue
-                if size == 0:
-                    continue
+            except FileNotFoundError:
+                # Positively gone since discovery listed it — a definite
+                # negative that deletion computation should honor.
+                continue
             except OSError:
+                # Transient stat failure — state UNKNOWN. Record as uncertain
+                # so a stored file is never deleted on the strength of a stat
+                # that merely failed to answer.
+                uncertain.add(rel_path)
+                continue
+            if size > self.config.max_file_size:
+                continue
+            if size == 0:
                 continue
             result.append(rel_path)
-        return sorted(result)
+        return sorted(result), uncertain
+
+    def _filter_files(self, files: list[str]) -> list[str]:
+        """Filter files by exclusion patterns and size limits.
+
+        @param files: Raw list of repo-relative paths.
+        @returns: Filtered (indexable) list. Uncertain (stat-failed) paths are
+            dropped from the indexable list; callers that compute deletions
+            must use ``_classify_candidates`` directly so a transient stat
+            failure is not misread as a deletion.
+        """
+        indexable, _ = self._classify_candidates(files)
+        return indexable
 
     def _is_excluded(self, path: str) -> bool:
         """Check if a path matches any exclusion pattern.
@@ -987,12 +1066,23 @@ class IndexBuilder:
         # This catches content changes even when mtime is restored
         # (e.g. rsync --times, touch -t) while avoiding reading the
         # entire file for large PDFs (M-4 fix).
+        #
+        # A stat/read failure here is UNCERTAIN, not a valid result: in refresh
+        # mode the caller has already deleted the PDF's prior chunks/hash
+        # inside a savepoint, so substituting a placeholder hash and returning
+        # would commit that destructive delete with bogus replacement data.
+        # Route the OSError through the same _ChunkFailedError seam as an
+        # extraction failure so the savepoint rolls back and the prior index
+        # entry survives.  A genuine storage failure is unaffected — this only
+        # guards the file-access read of the binary head.
         try:
             mtime_ns = full.stat().st_mtime_ns
             with open(full, "rb") as f:
                 head = f.read(65536)
             content_hash = hashlib.sha256(head).hexdigest()
-        except OSError:
+        except OSError as exc:
+            if not swallow_chunk_errors:
+                raise _ChunkFailedError(rel_path) from exc
             content_hash = hashlib.sha256(b"pdf").hexdigest()
             mtime_ns = None
 
@@ -1060,7 +1150,10 @@ class IndexBuilder:
             seen: set[str] = set()  # O(1) dedup instead of O(n) list scan.
             for rel_path in git_changed:
                 full = self.repo_path / rel_path
-                if not full.exists():
+                if self._positively_absent(full):
+                    # Only a definite ENOENT counts as a deletion. A transient
+                    # stat failure leaves the file as-is (falls through to the
+                    # read below, whose OSError also preserves prior state).
                     if rel_path in stored_hashes and rel_path not in seen:
                         changes.append((rel_path, "delete"))
                         seen.add(rel_path)
@@ -1080,15 +1173,19 @@ class IndexBuilder:
                     changes.append((rel_path, "update"))
                     seen.add(rel_path)
 
-            # Also check for newly added files not in stored hashes.
-            current_files = set(self._discover_files())
+            # Also check for newly added files not in stored hashes.  Uncertain
+            # (stat-failed) paths are excluded from both add and delete: they
+            # are neither positively present-and-new nor positively absent.
+            current_list, stat_failed = self._discover_files_classified()
+            current_files = set(current_list)
             for rel_path in current_files - set(stored_hashes.keys()):
                 if rel_path not in seen:
                     changes.append((rel_path, "update"))
                     seen.add(rel_path)
 
-            # Check for deleted files.
-            for rel_path in set(stored_hashes.keys()) - current_files:
+            # Check for deleted files — POSITIVE absence only, so a file that
+            # merely failed to stat during discovery is not erased.
+            for rel_path in set(stored_hashes.keys()) - current_files - stat_failed:
                 if rel_path not in seen:
                     changes.append((rel_path, "delete"))
                     seen.add(rel_path)
@@ -1144,11 +1241,14 @@ class IndexBuilder:
         @param stored_hashes: Currently stored file records.
         @returns: List of (rel_path, action).
         """
-        current_files = set(self._discover_files())
+        current_list, stat_failed = self._discover_files_classified()
+        current_files = set(current_list)
         changes: list[tuple[str, str]] = []
 
-        # Deleted files.
-        for rel_path in set(stored_hashes.keys()) - current_files:
+        # Deleted files — POSITIVE absence only.  A file dropped from discovery
+        # by a transient stat failure (in stat_failed) is left untouched, not
+        # erased.
+        for rel_path in set(stored_hashes.keys()) - current_files - stat_failed:
             changes.append((rel_path, "delete"))
 
         # New or modified files.
