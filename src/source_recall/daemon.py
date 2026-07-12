@@ -741,6 +741,12 @@ def create_daemon_app(
             target=_background_index,
             args=(slot,),
             name=f"sr-index-{slot.name}",
+            # Daemon so an index build that outlives the shutdown join budget
+            # can never keep the process alive past lifespan shutdown. The
+            # shutdown path still joins these threads under the configured
+            # budget for a graceful finish; daemon status only bounds the
+            # worst case (a build wedged past the budget).
+            daemon=True,
         )
         slot.index_thread = t
         with state["bg_threads_lock"]:

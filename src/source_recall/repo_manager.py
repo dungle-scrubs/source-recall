@@ -113,15 +113,15 @@ class RepoSlot:
         """
         with self.lock:
             if self.cancel.is_set():
-                # Repo was removed mid-build: discard the connection.
-                try:
-                    index.close()
-                except Exception:
-                    logger.warning(
-                        "Error closing cancelled index for %s",
-                        self.name,
-                        exc_info=True,
-                    )
+                # Repo was removed mid-build: discard the connection WITHOUT
+                # blocking. Index.close() takes the querier writer lock, which
+                # can block indefinitely behind a stuck reader; a synchronous
+                # close here would hang this background index thread — and thus
+                # remove()'s bounded join and lifespan shutdown. Close on a
+                # detached daemon thread so an abandoned close can never keep
+                # the process alive (it leaves only a WAL-recoverable
+                # transaction). This mirrors close_all's bounded close path.
+                self._close_detached(index)
                 return
             self.index = index
             self.state = SlotState.READY
@@ -139,6 +139,35 @@ class RepoSlot:
             self.error = message
             self.progress_phase = "error"
             self.progress_detail = {}
+
+    def _close_detached(self, index: Index) -> None:
+        """Close ``index`` on a detached daemon thread (non-blocking).
+
+        Used to discard the Index built for a slot that was removed mid-build.
+        A synchronous close would block the background index thread on the
+        querier writer lock (which can be stuck behind a hung reader); running
+        it on a daemon thread keeps the caller — and therefore shutdown —
+        bounded. An abandoned close leaves at most a WAL-recoverable
+        transaction and cannot keep the process alive.
+
+        @param index: The Index instance to close and discard.
+        """
+
+        def _run() -> None:
+            try:
+                index.close()
+            except Exception:
+                logger.warning(
+                    "Error closing cancelled index for %s",
+                    self.name,
+                    exc_info=True,
+                )
+
+        threading.Thread(
+            target=_run,
+            name=f"sr-cancel-close-{self.name}",
+            daemon=True,
+        ).start()
 
     def close(self) -> None:
         """Close the Index if open. Safe to call multiple times."""
