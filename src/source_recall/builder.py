@@ -41,6 +41,21 @@ class _ChunkFailedError(Exception):
     """
 
 
+class _DirtyDetectionError(Exception):
+    """``git status --porcelain`` did not yield a usable change-detection signal.
+
+    Raised by ``_detect_dirty_files`` when git-status fails (non-zero exit,
+    ``git`` missing, or the 10s timeout). It is a distinct outcome from "the
+    working tree is clean": a failed signal must NEVER be read as a negative
+    (clean) result. Reading it as clean would drop previously-indexed
+    untracked/staged files out of ``blob_map`` (so they get swept into the
+    deletion set and erased) and would misclassify a modified tracked file as
+    unchanged (committing stale content as a successful pass). Callers must
+    fail closed on this — a full build aborts, and an incremental refresh
+    skips the cycle, leaving the existing index fully intact.
+    """
+
+
 class IndexBuilder:
     """Orchestrates building and refreshing a code index.
 
@@ -149,7 +164,18 @@ class IndexBuilder:
                 if git_entries is not None:
                     use_git_objects = True
                     blob_map = dict(git_entries)
-                    dirty_map = self._detect_dirty_files()
+                    # Fail closed if dirty detection cannot produce a signal:
+                    # building with an assumed-clean tree would silently omit
+                    # every untracked/staged file. Abort before atomic_swap so
+                    # any existing index is preserved intact (relevant when a
+                    # >500-change refresh triggers a full rebuild).
+                    try:
+                        dirty_map = self._detect_dirty_files()
+                    except _DirtyDetectionError as exc:
+                        raise FileDiscoveryError(
+                            "dirty_detection_failed",
+                            f"git status unavailable during build: {exc}",
+                        ) from exc
                     # Merge dirty files into blob_map (override committed SHAs).
                     blob_map.update(dirty_map)
                     # Also add brand-new untracked files.
@@ -309,12 +335,44 @@ class IndexBuilder:
                     changed_files = [(f, "update") for f in files]
                 else:
                     # Try git-object-based refresh for blob-SHA diffing.
-                    git_refresh_result = self._try_git_object_refresh(store, branch)
+                    try:
+                        git_refresh_result = self._try_git_object_refresh(store, branch)
+                    except _DirtyDetectionError:
+                        # Dirty-file detection failed (git status unavailable).
+                        # A failed change-detection signal must NOT be read as a
+                        # clean tree: doing so would delete previously-indexed
+                        # untracked/staged files and commit modified files as
+                        # unchanged. Fail closed — skip this refresh cycle,
+                        # leaving the existing index (chunks, hashes, vectors,
+                        # meta) fully intact. Detection happens before any store
+                        # mutation, so nothing is committed. A skipped refresh is
+                        # safe; the next cycle retries.
+                        logger.warning(
+                            "Refresh skipped for %s: dirty detection failed "
+                            "(git status unavailable) — index left intact",
+                            self.repo_path,
+                        )
+                        return 0
                     if git_refresh_result is not None:
                         return git_refresh_result
 
                     # Fallback: legacy change detection.
                     changed_files = self._detect_changes(store)
+
+                    # Force re-embedding of files a prior refresh committed
+                    # without vectors (meta['vec_dirty']). They are otherwise
+                    # unchanged, so add them as updates; without this a
+                    # transient embedding failure leaves their chunks
+                    # permanently vector-less.
+                    vec_dirty_prev = self._vec_dirty_paths(store)
+                    if vec_dirty_prev:
+                        already = {p for p, _ in changed_files}
+                        for path in vec_dirty_prev:
+                            if (
+                                path not in already
+                                and (self.repo_path / path).is_file()
+                            ):
+                                changed_files.append((path, "update"))
 
                 if not changed_files:
                     # Still update active_branch even if no files changed.
@@ -463,6 +521,19 @@ class IndexBuilder:
             else:
                 changed.append(rel_path)
 
+        # Force re-embedding of files whose vectors a prior refresh failed to
+        # write (recorded in meta['vec_dirty']). They are otherwise unchanged,
+        # so move them out of `unchanged` into the reindex set — without this a
+        # transient embedding failure would leave their chunks permanently
+        # vector-less (the next refresh early-returns as unchanged).
+        vec_dirty_prev = self._vec_dirty_paths(store)
+        if vec_dirty_prev:
+            forced = [p for p in unchanged if p in vec_dirty_prev]
+            if forced:
+                forced_set = set(forced)
+                unchanged = [p for p in unchanged if p not in forced_set]
+                changed.extend(forced)
+
         files_to_reindex = changed + added
         total_changed = len(files_to_reindex) + len(deleted)
 
@@ -607,6 +678,24 @@ class IndexBuilder:
         stored = store.get_file_hash(rel_path)
         if stored is not None:
             store.upsert_file_hash(stored, branch=branch)
+
+    def _vec_dirty_paths(self, store: IndexStore) -> set[str]:
+        """Return paths whose vectors a prior refresh failed to (re)embed.
+
+        When a refresh commits new chunks but the embedding step fails, the
+        affected paths are recorded in ``meta['vec_dirty']``. Those files are
+        otherwise unchanged on the next refresh, so without consuming this
+        marker they early-return as unchanged and their chunks stay
+        permanently vector-less. Consuming it forces re-embedding so a
+        transient embedding failure never permanently drops vector coverage.
+
+        @param store: Open IndexStore.
+        @returns: Set of repo-relative paths flagged vec_dirty (may be empty).
+        """
+        raw = store.get_meta("vec_dirty")
+        if not raw:
+            return set()
+        return {p for p in raw.split(",") if p}
 
     def _chunk_ids_for_file(self, store: IndexStore, rel_path: str) -> list[str]:
         """Return the ids of chunks currently stored for a file.
@@ -1415,6 +1504,11 @@ class IndexBuilder:
         working-tree content via ``git hash-object --stdin``.
 
         @returns: Dict mapping repo-relative path to synthetic blob SHA.
+        @raises _DirtyDetectionError: If ``git status`` fails to produce a
+            usable signal (non-zero exit, ``git`` missing, or timeout). An
+            empty return is reserved for a genuinely clean working tree; a
+            detection FAILURE is signalled distinctly so callers fail closed
+            instead of misreading it as "no dirty files".
         """
         # Cannot use _git_cmd here — it strips leading whitespace from
         # stdout, destroying the porcelain status columns (e.g. " M" → "M").
@@ -1426,11 +1520,13 @@ class IndexBuilder:
                 text=True,
                 timeout=10,
             )
-            if proc.returncode != 0:
-                return {}
-            output = proc.stdout
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return {}
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            raise _DirtyDetectionError(str(exc)) from exc
+        if proc.returncode != 0:
+            raise _DirtyDetectionError(
+                f"git status --porcelain exited {proc.returncode}"
+            )
+        output = proc.stdout
         if not output:
             return {}
 

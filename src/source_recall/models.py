@@ -346,7 +346,12 @@ class FileDiscoveryError(SourceRecallError):
     @param detail: Human-readable detail.
     """
 
-    REASONS = ("git_not_installed", "path_not_found", "not_a_directory")
+    REASONS = (
+        "git_not_installed",
+        "path_not_found",
+        "not_a_directory",
+        "dirty_detection_failed",
+    )
 
     def __init__(self, reason: str, detail: str = "") -> None:
         if reason not in self.REASONS:
