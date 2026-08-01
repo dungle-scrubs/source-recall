@@ -25,6 +25,12 @@ def py_app_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def laravel_app_path() -> Path:
+    """Path to the Laravel/Vue fixture app (PHP, Blade, Vue SFC)."""
+    return FIXTURES_DIR / "laravel-app"
+
+
+@pytest.fixture
 def mixed_path() -> Path:
     """Path to the mixed-language fixture."""
     return FIXTURES_DIR / "mixed"

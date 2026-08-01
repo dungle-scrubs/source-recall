@@ -131,8 +131,11 @@ def is_loaded() -> bool:
     @returns: True if launchctl reports the service.
     """
     uid = os.getuid()
-    result = subprocess.run(
-        ["launchctl", "print", f"gui/{uid}/{PLIST_LABEL}"],
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"gui/{uid}/{PLIST_LABEL}"],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return False
     return result.returncode == 0

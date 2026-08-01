@@ -44,11 +44,13 @@ class SymbolType(enum.StrEnum):
     METHOD = "method"
     CLASS = "class"
     CLASS_SHELL = "class_shell"
+    TRAIT = "trait"
     COMPONENT = "component"
     INTERFACE = "interface"
     TYPE_ALIAS = "type_alias"
     ENUM = "enum"
     MODULE = "module"
+    SECTION = "section"
     BLOCK = "block"
 
 

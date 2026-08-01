@@ -13,9 +13,12 @@ from rich.console import Console
 from rich.syntax import Syntax
 
 from source_recall.__init__ import __version__
+from source_recall.chunker import _is_blade
 from source_recall.store import get_index_base
 
 if TYPE_CHECKING:
+    from pygments.lexer import Lexer
+
     from source_recall.models import IndexStatus
 
 
@@ -419,8 +422,7 @@ def _rich_output(results: list) -> None:
             )
 
         # Code block.
-        ext = Path(r.file_path).suffix.lstrip(".")
-        lexer = _ext_to_lexer(ext)
+        lexer = _lexer_for(r.file_path)
         syntax = Syntax(
             r.content,
             lexer,
@@ -434,33 +436,51 @@ def _rich_output(results: list) -> None:
             console.rule(style="dim")
 
 
-def _ext_to_lexer(ext: str) -> str:
-    """Map file extension to Pygments lexer name.
+_LEXER_BY_EXT = {
+    "py": "python",
+    "ts": "typescript",
+    "tsx": "tsx",
+    "js": "javascript",
+    "jsx": "jsx",
+    "phtml": "html+php",
+    "vue": "html",
+    "sh": "bash",
+    "bash": "bash",
+    "go": "go",
+    "rs": "rust",
+    "rb": "ruby",
+    "java": "java",
+    "kt": "kotlin",
+    "sql": "sql",
+    "yaml": "yaml",
+    "yml": "yaml",
+    "toml": "toml",
+    "json": "json",
+    "md": "markdown",
+}
 
-    @param ext: Extension without dot.
-    @returns: Lexer name.
+
+def _lexer_for(file_path: str) -> str | Lexer:
+    """Map a file path to a Pygments lexer.
+
+    Blade needs the full basename (``Path.suffix`` of ``foo.blade.php``
+    is ``.php``), so it is matched via the chunker's ``_is_blade``
+    before the extension table.
+
+    @param file_path: Repo-relative path.
+    @returns: Lexer name, or a configured lexer instance.
     """
-    mapping = {
-        "py": "python",
-        "ts": "typescript",
-        "tsx": "tsx",
-        "js": "javascript",
-        "jsx": "jsx",
-        "sh": "bash",
-        "bash": "bash",
-        "go": "go",
-        "rs": "rust",
-        "rb": "ruby",
-        "java": "java",
-        "kt": "kotlin",
-        "sql": "sql",
-        "yaml": "yaml",
-        "yml": "yaml",
-        "toml": "toml",
-        "json": "json",
-        "md": "markdown",
-    }
-    return mapping.get(ext, "text")
+    if _is_blade(file_path):
+        return "html+php"
+    ext = Path(file_path).suffix.lstrip(".").lower()
+    if ext == "php":
+        # Chunks rarely carry an opening `<?php` tag, and the php lexer
+        # ignores everything outside one unless startinline is set — a
+        # flag Rich cannot express through a lexer name.
+        from pygments.lexers.php import PhpLexer
+
+        return PhpLexer(startinline=True)
+    return _LEXER_BY_EXT.get(ext, "text")
 
 
 # ---------------------------------------------------------------------------

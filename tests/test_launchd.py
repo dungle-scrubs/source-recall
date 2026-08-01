@@ -162,6 +162,14 @@ class TestPlistLifecycle:
             mock_run.return_value = MagicMock(returncode=3)
             assert is_loaded() is False
 
+    def test_is_loaded_false_when_launchctl_is_unavailable(self) -> None:
+        """Non-macOS hosts report the launchd service as not loaded."""
+        with patch(
+            "source_recall.launchd.subprocess.run",
+            side_effect=FileNotFoundError("launchctl"),
+        ):
+            assert is_loaded() is False
+
 
 class TestDaemonStartCLI:
     def test_start_writes_plist_and_bootstraps(self) -> None:
