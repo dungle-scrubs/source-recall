@@ -45,6 +45,41 @@ def _git_init(repo: Path, *, marker: str = "") -> None:
 
 
 class TestExclusionPatterns:
+    def test_git_submodule_directory_excluded(self, tmp_path: Path) -> None:
+        """Tracked gitlinks are not treated as readable source files."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init(repo, marker="gitlink-parent")
+
+        child = tmp_path / "child"
+        child.mkdir()
+        _git_init(child, marker="gitlink-child")
+        child_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=child,
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+        (repo / "backend").mkdir()
+        subprocess.run(
+            [
+                "git",
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"160000,{child_sha},backend",
+            ],
+            cwd=repo,
+            capture_output=True,
+            check=True,
+        )
+
+        config = resolve_config(str(repo))
+        builder = IndexBuilder(repo, config)
+
+        assert "backend" not in builder._discover_files()
+
     def test_node_modules_excluded(self, tmp_path: Path) -> None:
         """Files inside node_modules/ are excluded."""
         repo = tmp_path / "repo"

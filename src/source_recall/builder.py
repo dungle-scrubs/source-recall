@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import stat
 import subprocess
 import time
 from fnmatch import fnmatch
@@ -858,7 +859,8 @@ class IndexBuilder:
         Every candidate lands in exactly one of three buckets:
 
         * **indexable** — positively passes exclusion + size filters (its
-          ``stat`` succeeded, it is within the size bound and non-empty).
+          ``stat`` succeeded, it is a regular file, it is within the size
+          bound and non-empty).
           Returned in the first list.
         * **uncertain** — its ``stat`` raised a transient (non-ENOENT) error,
           so its true state is UNKNOWN. Returned in the second set. A caller
@@ -881,7 +883,7 @@ class IndexBuilder:
                 continue
             full = self.repo_path / rel_path
             try:
-                size = full.stat().st_size
+                file_stat = full.stat()
             except FileNotFoundError:
                 # Positively gone since discovery listed it — a definite
                 # negative that deletion computation should honor.
@@ -892,6 +894,9 @@ class IndexBuilder:
                 # that merely failed to answer.
                 uncertain.add(rel_path)
                 continue
+            if not stat.S_ISREG(file_stat.st_mode):
+                continue
+            size = file_stat.st_size
             if size > self.config.max_file_size:
                 continue
             if size == 0:
