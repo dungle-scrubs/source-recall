@@ -32,6 +32,37 @@ def indexed_app(py_app_path: Path) -> Generator[TestClient, None, None]:
 
 
 class TestWarmup:
+    def test_default_embedder_is_shared_across_repositories(
+        self, py_app_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Auto mode constructs one model for every loaded repository."""
+        import shutil
+
+        from source_recall import Index
+        from source_recall.server import create_app
+
+        repo2 = py_app_path.parent / "repo2"
+        shutil.copytree(py_app_path, repo2)
+        Index(py_app_path, embedder=None).build()
+        Index(repo2, embedder=None).build()
+
+        created: list[BagOfWordsEmbedder] = []
+
+        def create_default(_encode_batch_size: int = 32) -> BagOfWordsEmbedder:
+            instance = BagOfWordsEmbedder(dimensions=64)
+            created.append(instance)
+            return instance
+
+        monkeypatch.setattr(
+            Index, "_create_default_embedder", staticmethod(create_default)
+        )
+
+        app = create_app([py_app_path, repo2])
+        with TestClient(app):
+            app.state.warmup_thread.join(timeout=5)
+
+        assert len(created) == 1
+
     def test_startup_warms_embedder(
         self, py_app_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

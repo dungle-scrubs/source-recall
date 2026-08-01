@@ -277,14 +277,43 @@ def create_app(
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         """Load embedder and open indexes on server start."""
         from source_recall import Index
+        from source_recall.config import resolve_config
 
         t0 = time.monotonic()
         state["started_at"] = t0
 
+        resolved_embedder = embedder
+        auto_embed_enabled: dict[Path, bool] = {}
+        if embedder is _SENTINEL:
+            configs = {repo_path: resolve_config(repo_path) for repo_path in repo_paths}
+            auto_embed_enabled = {
+                repo_path: config.embed_enabled
+                for repo_path, config in configs.items()
+            }
+            enabled_configs = [
+                config for config in configs.values() if config.embed_enabled
+            ]
+            resolved_embedder = (
+                Index._create_default_embedder(
+                    min(config.embed_batch_size for config in enabled_configs)
+                )
+                if enabled_configs
+                else None
+            )
+
         for repo_path in repo_paths:
             name = repo_path.name
             logger.info("Loading index for %s (%s)...", name, repo_path)
-            idx = Index(repo_path, embedder=embedder, rerank_enabled=rerank_enabled)
+            repo_embedder = (
+                resolved_embedder
+                if embedder is not _SENTINEL or auto_embed_enabled[repo_path]
+                else None
+            )
+            idx = Index(
+                repo_path,
+                embedder=repo_embedder,
+                rerank_enabled=rerank_enabled,
+            )
             idx.status()
             state["indexes"][name] = {"index": idx, "path": repo_path}
 
