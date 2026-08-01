@@ -50,6 +50,7 @@ class SymbolType(enum.StrEnum):
     TYPE_ALIAS = "type_alias"
     ENUM = "enum"
     MODULE = "module"
+    SECTION = "section"
     BLOCK = "block"
 
 

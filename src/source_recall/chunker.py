@@ -1866,7 +1866,7 @@ def _blade_emit(
                 chunks,
                 file_path,
                 name,
-                SymbolType.MODULE if block.label else SymbolType.BLOCK,
+                SymbolType.SECTION if block.label else SymbolType.BLOCK,
                 content[block.start : block.end].strip(),
                 line_of(block.start),
                 line_of(block.end),
