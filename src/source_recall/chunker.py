@@ -528,12 +528,14 @@ def _ts_chunk_object(
         )
         return
 
-    shell_parts: list[str] = []
-    for _key, value, child in members:
-        if value is not None and value.type not in _TS_FUNCTION_VALUE_TYPES | {
-            "object"
-        }:
-            shell_parts.append(_node_text(child, content))
+    # Anything that does not become a chunk of its own goes in the shell,
+    # including value-less members (`{ Bar }` shorthand, `...mapState()`
+    # spreads) which would otherwise be dropped entirely.
+    shell_parts = [
+        _node_text(child, content)
+        for _key, value, child in members
+        if not _ts_is_own_chunk(value, child)
+    ]
 
     if shell_parts:
         _add_chunk(
@@ -549,10 +551,14 @@ def _ts_chunk_object(
         )
 
     for key, value, child in members:
+        if not _ts_is_own_chunk(value, child):
+            continue
         name = f"{prefix}.{key}" if prefix and key else (key or prefix)
-        if value is None or value.type in _TS_FUNCTION_VALUE_TYPES:
-            if value is None and child.type != "method_definition":
-                continue
+        if value is not None and value.type == "object":
+            _ts_chunk_object(
+                value, file_path, content, max_chars, chunks, name, depth + 1
+            )
+        else:
             _add_chunk(
                 chunks,
                 file_path,
@@ -564,10 +570,18 @@ def _ts_chunk_object(
                 SearchQuality.AST,
                 max_chars,
             )
-        elif value.type == "object":
-            _ts_chunk_object(
-                value, file_path, content, max_chars, chunks, name, depth + 1
-            )
+
+
+def _ts_is_own_chunk(value: Node | None, child: Node) -> bool:
+    """Whether an object member is worth a chunk instead of the shell.
+
+    @param value: The member's value node, or None.
+    @param child: The member node itself.
+    @returns: True for methods, function-valued keys and nested objects.
+    """
+    if child.type == "method_definition":
+        return True
+    return value is not None and value.type in _TS_FUNCTION_VALUE_TYPES | {"object"}
 
 
 def _ts_property_key(node: Node) -> str:

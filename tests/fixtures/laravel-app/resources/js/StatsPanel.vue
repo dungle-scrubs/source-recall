@@ -12,13 +12,14 @@
 
 <script>
 import { formatCurrency } from '../lib/format'
+import StatTile from './StatTile.vue'
 
 export default {
     name: 'stats-panel',
     props: {
         shopId: { type: Number, required: true },
     },
-    components: { },
+    components: { StatTile },
     data() {
         return {
             stats: [],

@@ -764,12 +764,13 @@ class TestVueOptionsApi:
         )
         assert shell.symbol_type == SymbolType.BLOCK
 
-    def test_empty_option_object_is_dropped(self, laravel_app_path: Path) -> None:
+    def test_empty_option_object_is_dropped(self) -> None:
         """`components: { }` carries nothing worth indexing."""
-        path = laravel_app_path / "resources/js/StatsPanel.vue"
-        chunks, _ = chunk_file("resources/js/StatsPanel.vue", path.read_text())
+        code = "export default {\n  components: { },\n  mounted() { this.load() },\n}\n"
+        chunks, _ = chunk_file("Widget.ts", code)
 
         assert not any(c.symbol_name == "components" for c in chunks)
+        assert any(c.symbol_name == "mounted" for c in chunks)
 
     def test_plain_config_object_is_not_shredded(self) -> None:
         """An object with no functions in it stays whole."""
@@ -778,6 +779,26 @@ class TestVueOptionsApi:
 
         assert len(chunks) == 1
         assert "nested" in chunks[0].content
+
+    def test_shorthand_members_are_not_dropped(self, laravel_app_path: Path) -> None:
+        """`components: { StatTile }` has no value node; keep it in the shell."""
+        path = laravel_app_path / "resources/js/StatsPanel.vue"
+        chunks, _ = chunk_file("resources/js/StatsPanel.vue", path.read_text())
+
+        assert any("StatTile" in c.content for c in chunks)
+
+    def test_spread_members_are_not_dropped(self) -> None:
+        """A `...mapState()` spread is neither a method nor a nested object."""
+        code = (
+            "export default {\n"
+            "  ...mapState(['shop']),\n"
+            "  mounted() { this.load() },\n"
+            "}\n"
+        )
+        chunks, _ = chunk_file("Widget.ts", code)
+
+        assert any("mapState(['shop'])" in c.content for c in chunks)
+        assert any(c.symbol_name == "mounted" for c in chunks)
 
 
 class TestVueTemplateSpans:
