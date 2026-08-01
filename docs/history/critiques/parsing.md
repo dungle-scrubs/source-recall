@@ -330,3 +330,32 @@ Combining PascalCase + JSX anywhere in body (including in sub-functions) catches
 | Sub-chunk ref attribution | **MEDIUM** | First-sub-chunk fallback silently breaks "what calls X"; no parent_chunk_id | Add parent_chunk_id column; union sub-chunk refs in call lookups |
 | Language coverage (Bash) | **LOW-MEDIUM** | Wrong ROI; Go/Ruby would serve more users | Replace Bash AST support with Go; keep regex-level Bash for env_var/source detection |
 | React component detection | **MEDIUM-HIGH** | Misses forwardRef, memo, function declarations, non-exported components | PascalCase + JSX-in-body heuristic; explicit wrapping-function detection |
+
+---
+
+## Addendum: Blade Strategy Selection (feat/php-blade-vue-chunking)
+
+Why Blade templates get a structural directive scanner instead of a
+tree-sitter grammar. Recorded here so the survey and measurements do not
+live as a block comment in `chunker.py`.
+
+tree-sitter-language-pack 0.13.0 ships no Blade grammar (checked against
+its full 173-language list; it has `php`, `html`, `twig` and `vue`, but
+nothing for Blade). Neither neighbouring grammar is usable as a stand-in:
+
+- `php` "succeeds" on any Blade file: everything outside `<?php` tags is a
+  single opaque `text` node, so it reports zero parse errors while yielding
+  one file-sized chunk. That is worse than a real fallback because the
+  error-density guard cannot detect it.
+- `html` chokes on Blade's control flow: directives routinely open a tag in
+  one branch and close it in another. Measured over the 82 Blade templates
+  in a production Laravel app, 22 (27%) exceeded the chunker's 10%
+  error-node threshold, several above 95%.
+
+So Blade gets a structural directive scanner: Blade's own block directives
+(`@section`/`@endsection`, `@push`, `@component`, `@if`, ...) are the
+boundaries an author already writes, and they nest properly. The scanner
+tracks that nesting, so a `@section` is chunked whole no matter how much
+control flow it contains, and descends into a section only when the section
+itself exceeds `max_chars`. Quality is REGEX, matching the Bash and
+Markdown strategies.
