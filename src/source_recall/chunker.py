@@ -5,7 +5,8 @@ from __future__ import annotations
 import bisect
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -14,9 +15,13 @@ from source_recall.models import ChunkData, RefData, RefType, SearchQuality, Sym
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from tree_sitter import Node
+
+    _LineLookup = Callable[[int], int]
+    _ChunkIdLookup = Callable[[int], str | None]
+    _RefExtractor = Callable[[list[ChunkData], str], list[RefData]]
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -39,6 +44,9 @@ _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 # Overlap lines between consecutive sub-chunks.
 _SUB_CHUNK_OVERLAP = 8
 
+# Blocks and preambles shorter than this are dropped as noise.
+_MIN_BLOCK_CHARS = 20
+
 # Resource-exhaustion guards for PDF extraction. A hostile or degenerate
 # PDF can carry an enormous page count or per-page text volume; bound both
 # so a single file cannot exhaust memory during a build.
@@ -59,30 +67,37 @@ def chunk_file(
     @param max_chars: Character threshold for sub-chunking.
     @returns: Tuple of (chunks, search_quality used).
     """
-    # Blade must be tested before the extension table: ``Path.suffix`` of
-    # ``foo.blade.php`` is ``.php``, so a plain extension lookup would hand
-    # Blade templates to the PHP grammar, which sees the whole template as
-    # one opaque ``text`` node and produces a single file-sized chunk.
-    if _is_blade(file_path):
-        return _chunk_blade(file_path, content, max_chars)
+    global _encoded_cache
+    try:
+        # Blade must be tested before the extension table: ``Path.suffix`` of
+        # ``foo.blade.php`` is ``.php``, so a plain extension lookup would hand
+        # Blade templates to the PHP grammar, which sees the whole template as
+        # one opaque ``text`` node and produces a single file-sized chunk.
+        if _is_blade(file_path):
+            return _chunk_blade(file_path, content, max_chars)
 
-    ext = _get_extension(file_path)
+        ext = _get_extension(file_path)
 
-    if ext in _TS_EXTENSIONS:
-        return _chunk_typescript(file_path, content, max_chars)
-    if ext in _PY_EXTENSIONS:
-        return _chunk_python(file_path, content, max_chars)
-    if ext in _PHP_EXTENSIONS:
-        return _chunk_php(file_path, content, max_chars)
-    if ext in _VUE_EXTENSIONS:
-        return _chunk_vue(file_path, content, max_chars)
-    if ext in _BASH_EXTENSIONS:
-        return _chunk_bash_regex(file_path, content, max_chars)
-    if ext in _MARKDOWN_EXTENSIONS:
-        return _chunk_markdown(file_path, content, max_chars)
-    if ext in _TEXT_EXTENSIONS:
-        return _chunk_prose(file_path, content, max_chars)
-    return _chunk_text_fallback(file_path, content, max_chars)
+        if ext in _TS_EXTENSIONS:
+            return _chunk_typescript(file_path, content, max_chars)
+        if ext in _PY_EXTENSIONS:
+            return _chunk_python(file_path, content, max_chars)
+        if ext in _PHP_EXTENSIONS:
+            return _chunk_php(file_path, content, max_chars)
+        if ext in _VUE_EXTENSIONS:
+            return _chunk_vue(file_path, content, max_chars)
+        if ext in _BASH_EXTENSIONS:
+            return _chunk_bash_regex(file_path, content, max_chars)
+        if ext in _MARKDOWN_EXTENSIONS:
+            return _chunk_markdown(file_path, content, max_chars)
+        if ext in _TEXT_EXTENSIONS:
+            return _chunk_prose(file_path, content, max_chars)
+        return _chunk_text_fallback(file_path, content, max_chars)
+    finally:
+        # The one-entry encode cache exists only for intra-file reuse;
+        # dropping it here keeps a long-lived daemon from retaining the
+        # last file's full UTF-8 bytes between builds.
+        _encoded_cache = None
 
 
 def chunk_file_with_refs(
@@ -99,21 +114,29 @@ def chunk_file_with_refs(
     @returns: Tuple of (chunks, search_quality, refs).
     """
     chunks, quality = chunk_file(file_path, content, max_chars=max_chars)
-    ext = _get_extension(file_path)
+    extractor = _ref_extractor_for(file_path)
+    refs = extractor(chunks, content) if extractor is not None else []
+    return chunks, quality, refs
 
-    refs: list[RefData] = []
+
+def _ref_extractor_for(file_path: str) -> _RefExtractor | None:
+    """Pick the cross-reference extractor for a file, or None.
+
+    @param file_path: Repo-relative path.
+    @returns: Extractor callable, or None for unsupported languages.
+    """
     if _is_blade(file_path):
-        refs = []
-    elif ext in _PY_EXTENSIONS:
-        refs = _extract_python_refs(chunks, content)
-    elif ext in _TS_EXTENSIONS or ext in _VUE_EXTENSIONS:
+        return None
+    ext = _get_extension(file_path)
+    if ext in _PY_EXTENSIONS:
+        return _extract_python_refs
+    if ext in _TS_EXTENSIONS or ext in _VUE_EXTENSIONS:
         # A Vue SFC's imports live in its ``<script>`` block; the line index
         # built over the SFC's chunks maps them to the right script chunk.
-        refs = _extract_ts_refs(chunks, content)
-    elif ext in _PHP_EXTENSIONS:
-        refs = _extract_php_refs(chunks, content)
-
-    return chunks, quality, refs
+        return _extract_ts_refs
+    if ext in _PHP_EXTENSIONS:
+        return _extract_php_refs
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +163,17 @@ _TS_METHOD_TYPES = frozenset(
         "public_field_definition",
     }
 )
+
+# Declarations that become one chunk apiece, keyed to their symbol type.
+_TS_DECL_SYMBOL_TYPES: dict[str, SymbolType] = {
+    "interface_declaration": SymbolType.INTERFACE,
+    "type_alias_declaration": SymbolType.TYPE_ALIAS,
+    "enum_declaration": SymbolType.ENUM,
+}
+
+# Fallback child types for name extraction, per grammar.
+_TS_NAME_TYPES = frozenset({"identifier", "type_identifier", "property_identifier"})
+_PHP_NAME_TYPES = frozenset({"name"})
 
 
 def _chunk_typescript(
@@ -191,16 +225,8 @@ def _chunk_ts_source(
                 )
             else:
                 # Bare export (e.g. `export { foo }`) — treat as block.
-                _add_chunk(
-                    chunks,
-                    file_path,
-                    "",
-                    SymbolType.BLOCK,
-                    _node_text(node, content),
-                    node.start_point[0] + 1,
-                    node.end_point[0] + 1,
-                    SearchQuality.AST,
-                    max_chars,
+                _add_node_chunk(
+                    chunks, file_path, "", SymbolType.BLOCK, node, content, max_chars
                 )
         elif node.type in _TS_TOP_LEVEL:
             _ts_process_node(
@@ -249,93 +275,38 @@ def _ts_process_node(
 
     if ntype == "class_declaration":
         _ts_chunk_class(node, file_path, content, max_chars, chunks)
-    elif ntype == "function_declaration":
-        name = _ts_get_name(node)
+        return
+    if ntype == "function_declaration":
+        name = _node_name(node, _TS_NAME_TYPES)
         sym_type = _ts_classify_function(node, name, file_path)
-        _add_chunk(
-            chunks,
-            file_path,
-            name,
-            sym_type,
-            _node_text(node, content),
-            node.start_point[0] + 1,
-            node.end_point[0] + 1,
-            SearchQuality.AST,
-            max_chars,
-        )
-    elif ntype == "lexical_declaration":
+        _add_node_chunk(chunks, file_path, name, sym_type, node, content, max_chars)
+        return
+    if ntype == "lexical_declaration":
         _ts_chunk_lexical(node, file_path, content, max_chars, chunks)
-    elif ntype == "interface_declaration":
-        name = _ts_get_name(node)
-        _add_chunk(
+        return
+    if ntype in _TS_DECL_SYMBOL_TYPES:
+        name = _node_name(node, _TS_NAME_TYPES)
+        _add_node_chunk(
             chunks,
             file_path,
             name,
-            SymbolType.INTERFACE,
-            _node_text(node, content),
-            node.start_point[0] + 1,
-            node.end_point[0] + 1,
-            SearchQuality.AST,
+            _TS_DECL_SYMBOL_TYPES[ntype],
+            node,
+            content,
             max_chars,
         )
-    elif ntype == "type_alias_declaration":
-        name = _ts_get_name(node)
-        _add_chunk(
-            chunks,
-            file_path,
-            name,
-            SymbolType.TYPE_ALIAS,
-            _node_text(node, content),
-            node.start_point[0] + 1,
-            node.end_point[0] + 1,
-            SearchQuality.AST,
-            max_chars,
-        )
-    elif ntype in {"object", "call_expression"}:
+        return
+    if ntype in {"object", "call_expression"}:
         # `export default { … }` is the Vue Options API, and the shape of
         # most JS config modules.  Without this it would fall through to
         # the generic block branch and arrive as one file-sized chunk.
         obj = node if ntype == "object" else _ts_default_export_object(node)
-        if obj is None:
-            _add_chunk(
-                chunks,
-                file_path,
-                "",
-                SymbolType.BLOCK,
-                _node_text(node, content),
-                node.start_point[0] + 1,
-                node.end_point[0] + 1,
-                SearchQuality.AST,
-                max_chars,
-            )
-        else:
+        if obj is not None:
             _ts_chunk_object(obj, file_path, content, max_chars, chunks, "", 0)
-    elif ntype == "enum_declaration":
-        name = _ts_get_name(node)
-        _add_chunk(
-            chunks,
-            file_path,
-            name,
-            SymbolType.ENUM,
-            _node_text(node, content),
-            node.start_point[0] + 1,
-            node.end_point[0] + 1,
-            SearchQuality.AST,
-            max_chars,
-        )
-    else:
-        # Generic fallback for unrecognized node types.
-        _add_chunk(
-            chunks,
-            file_path,
-            "",
-            SymbolType.BLOCK,
-            _node_text(node, content),
-            node.start_point[0] + 1,
-            node.end_point[0] + 1,
-            SearchQuality.AST,
-            max_chars,
-        )
+            return
+
+    # Generic fallback for unrecognized node types.
+    _add_node_chunk(chunks, file_path, "", SymbolType.BLOCK, node, content, max_chars)
 
 
 def _ts_chunk_class(
@@ -353,26 +324,20 @@ def _ts_chunk_class(
     @param max_chars: Sub-chunk threshold.
     @param chunks: Accumulator.
     """
-    class_name = _ts_get_name(node)
+    class_name = _node_name(node, _TS_NAME_TYPES)
 
     # Find the class body.
     body = node.child_by_field_name("body")
     if body is None:
-        _add_chunk(
-            chunks,
-            file_path,
-            class_name,
-            SymbolType.CLASS,
-            _node_text(node, content),
-            node.start_point[0] + 1,
-            node.end_point[0] + 1,
-            SearchQuality.AST,
-            max_chars,
+        _add_node_chunk(
+            chunks, file_path, class_name, SymbolType.CLASS, node, content, max_chars
         )
         return
 
     # Build shell: everything except method bodies.
-    shell_lines = _build_class_shell(node, body, content)
+    shell_lines = _build_class_shell(
+        node.start_point[0], body, content, _TS_METHOD_TYPES
+    )
     if shell_lines:
         _add_chunk(
             chunks,
@@ -389,17 +354,15 @@ def _ts_chunk_class(
     # Individual methods.
     for child in body.named_children:
         if child.type in _TS_METHOD_TYPES:
-            method_name = _ts_get_name(child)
+            method_name = _node_name(child, _TS_NAME_TYPES)
             full_name = f"{class_name}.{method_name}" if method_name else class_name
-            _add_chunk(
+            _add_node_chunk(
                 chunks,
                 file_path,
                 full_name,
                 SymbolType.METHOD,
-                _node_text(child, content),
-                child.start_point[0] + 1,
-                child.end_point[0] + 1,
-                SearchQuality.AST,
+                child,
+                content,
                 max_chars,
             )
 
@@ -423,38 +386,21 @@ def _ts_chunk_lexical(
     """
     for child in node.named_children:
         if child.type == "variable_declarator":
-            name = _ts_get_name(child)
+            name = _node_name(child, _TS_NAME_TYPES)
             sym_type = _ts_classify_lexical(child, name, file_path)
-            _add_chunk(
-                chunks,
-                file_path,
-                name,
-                sym_type,
-                _node_text(node, content),
-                node.start_point[0] + 1,
-                node.end_point[0] + 1,
-                SearchQuality.AST,
-                max_chars,
-            )
+            _add_node_chunk(chunks, file_path, name, sym_type, node, content, max_chars)
             return
 
     # Fallback.
-    _add_chunk(
-        chunks,
-        file_path,
-        "",
-        SymbolType.BLOCK,
-        _node_text(node, content),
-        node.start_point[0] + 1,
-        node.end_point[0] + 1,
-        SearchQuality.AST,
-        max_chars,
-    )
+    _add_node_chunk(chunks, file_path, "", SymbolType.BLOCK, node, content, max_chars)
 
 
 # Property values that make an object worth decomposing rather than
 # keeping whole.
 _TS_FUNCTION_VALUE_TYPES = frozenset({"function_expression", "arrow_function"})
+
+# Member values that earn a chunk of their own instead of the shell.
+_TS_OWN_CHUNK_VALUE_TYPES = _TS_FUNCTION_VALUE_TYPES | {"object"}
 
 # How deep to descend through nested object literals (`methods: { … }`).
 _TS_OBJECT_MAX_DEPTH = 3
@@ -500,41 +446,47 @@ def _ts_chunk_object(
     @param prefix: Dotted path of enclosing properties.
     @param depth: Current recursion depth.
     """
-    members = [
-        (_ts_property_key(c), _ts_property_value(c), c) for c in node.named_children
-    ]
-    decomposable = any(
-        child.type == "method_definition"
-        or (value is not None and value.type in _TS_FUNCTION_VALUE_TYPES)
-        for _key, value, child in members
-    )
-    text = _node_text(node, content)
+    members: list[tuple[Node, Node | None, bool]] = []
+    for child in node.named_children:
+        value = _ts_property_value(child)
+        members.append((child, value, _ts_is_own_chunk(value, child)))
 
     if not members:
         # `computed: {}`: an empty placeholder is not worth a chunk.
         return
 
-    if depth >= _TS_OBJECT_MAX_DEPTH or not (decomposable or len(text) > max_chars):
-        _add_chunk(
-            chunks,
-            file_path,
-            prefix,
-            SymbolType.BLOCK,
-            text,
-            node.start_point[0] + 1,
-            node.end_point[0] + 1,
-            SearchQuality.AST,
-            max_chars,
+    decomposable = any(
+        child.type == "method_definition"
+        or (value is not None and value.type in _TS_FUNCTION_VALUE_TYPES)
+        for child, value, _own in members
+    )
+
+    if depth >= _TS_OBJECT_MAX_DEPTH:
+        _add_node_chunk(
+            chunks, file_path, prefix, SymbolType.BLOCK, node, content, max_chars
         )
         return
+    if not decomposable:
+        text = _node_text(node, content)
+        if len(text) <= max_chars:
+            _add_chunk(
+                chunks,
+                file_path,
+                prefix,
+                SymbolType.BLOCK,
+                text,
+                node.start_point[0] + 1,
+                node.end_point[0] + 1,
+                SearchQuality.AST,
+                max_chars,
+            )
+            return
 
     # Anything that does not become a chunk of its own goes in the shell,
     # including value-less members (`{ Bar }` shorthand, `...mapState()`
     # spreads) which would otherwise be dropped entirely.
     shell_parts = [
-        _node_text(child, content)
-        for _key, value, child in members
-        if not _ts_is_own_chunk(value, child)
+        _node_text(child, content) for child, _value, own in members if not own
     ]
 
     if shell_parts:
@@ -550,25 +502,18 @@ def _ts_chunk_object(
             max_chars,
         )
 
-    for key, value, child in members:
-        if not _ts_is_own_chunk(value, child):
+    for child, value, own in members:
+        if not own:
             continue
+        key = _ts_property_key(child)
         name = f"{prefix}.{key}" if prefix and key else (key or prefix)
         if value is not None and value.type == "object":
             _ts_chunk_object(
                 value, file_path, content, max_chars, chunks, name, depth + 1
             )
         else:
-            _add_chunk(
-                chunks,
-                file_path,
-                name,
-                SymbolType.METHOD,
-                _node_text(child, content),
-                child.start_point[0] + 1,
-                child.end_point[0] + 1,
-                SearchQuality.AST,
-                max_chars,
+            _add_node_chunk(
+                chunks, file_path, name, SymbolType.METHOD, child, content, max_chars
             )
 
 
@@ -581,7 +526,7 @@ def _ts_is_own_chunk(value: Node | None, child: Node) -> bool:
     """
     if child.type == "method_definition":
         return True
-    return value is not None and value.type in _TS_FUNCTION_VALUE_TYPES | {"object"}
+    return value is not None and value.type in _TS_OWN_CHUNK_VALUE_TYPES
 
 
 def _ts_property_key(node: Node) -> str:
@@ -593,7 +538,7 @@ def _ts_property_key(node: Node) -> str:
     key = node.child_by_field_name("key") or node.child_by_field_name("name")
     if key is None:
         return ""
-    return (key.text or b"").decode("utf-8", errors="replace").strip("'\"")
+    return _node_str(key).strip("'\"")
 
 
 def _ts_property_value(node: Node) -> Node | None:
@@ -656,25 +601,31 @@ def _ts_classify_lexical(node: Node, name: str, file_path: str) -> SymbolType:
     return SymbolType.BLOCK
 
 
-def _ts_get_name(node: Node) -> str:
-    """Extract the name from a TS node.
+def _node_str(node: Node) -> str:
+    """Decode a node's text.
 
     @param node: tree-sitter Node.
+    @returns: Text as str (empty if the node carries none).
+    """
+    return (node.text or b"").decode("utf-8", errors="replace")
+
+
+def _node_name(node: Node, fallback_types: frozenset[str] = frozenset()) -> str:
+    """Extract a declaration's name across grammars.
+
+    Tries the ``name`` field first, then the first child whose type is in
+    ``fallback_types`` (e.g. a TS ``variable_declarator``'s identifier).
+
+    @param node: tree-sitter Node.
+    @param fallback_types: Child node types accepted as the name.
     @returns: Name string (empty if not found).
     """
-    # Try 'name' field first (works for most declarations).
     name_node = node.child_by_field_name("name")
     if name_node is not None:
-        return (name_node.text or b"").decode("utf-8", errors="replace")
-
-    # For variable_declarator, name is the first identifier child.
+        return _node_str(name_node)
     for child in node.children:
-        if child.type == "identifier":
-            return (child.text or b"").decode("utf-8", errors="replace")
-        if child.type == "type_identifier":
-            return (child.text or b"").decode("utf-8", errors="replace")
-        if child.type == "property_identifier":
-            return (child.text or b"").decode("utf-8", errors="replace")
+        if child.type in fallback_types:
+            return _node_str(child)
     return ""
 
 
@@ -731,20 +682,9 @@ def _chunk_python(
             first_def_line = node.start_point[0]
             break
 
-    if first_def_line is not None and first_def_line > 0:
-        preamble = "\n".join(content.split("\n")[:first_def_line]).strip()
-        if preamble and len(preamble) > 20:
-            _add_chunk(
-                chunks,
-                file_path,
-                "",
-                SymbolType.MODULE,
-                preamble,
-                1,
-                first_def_line,
-                SearchQuality.AST,
-                max_chars,
-            )
+    _add_preamble_chunk(
+        chunks, file_path, content, first_def_line or 0, SearchQuality.AST, max_chars
+    )
 
     for node in root.children:
         if not node.is_named:
@@ -763,6 +703,43 @@ def _chunk_python(
         return _chunk_text_fallback(file_path, content, max_chars)
 
     return chunks, SearchQuality.AST
+
+
+def _add_preamble_chunk(
+    chunks: list[ChunkData],
+    file_path: str,
+    content: str,
+    first_def_line: int,
+    quality: SearchQuality,
+    max_chars: int,
+) -> None:
+    """Emit a MODULE chunk for the lines before the first definition.
+
+    Keeping imports and module-level setup in their own chunk stops them
+    being mis-attributed to whichever symbol happens to be first.
+
+    @param chunks: Accumulator list.
+    @param file_path: Repo-relative path.
+    @param content: Full file content.
+    @param first_def_line: 0-indexed line of the first definition (0 = none).
+    @param quality: Search quality for the chunk.
+    @param max_chars: Sub-chunk threshold.
+    """
+    if first_def_line <= 0:
+        return
+    preamble = "\n".join(content.split("\n")[:first_def_line]).strip()
+    if len(preamble) > _MIN_BLOCK_CHARS:
+        _add_chunk(
+            chunks,
+            file_path,
+            "",
+            SymbolType.MODULE,
+            preamble,
+            1,
+            first_def_line,
+            quality,
+            max_chars,
+        )
 
 
 def _py_unwrap_decorated(node: Node) -> Node | None:
@@ -797,22 +774,14 @@ def _py_process_node(
     if node.type == "class_definition":
         _py_chunk_class(node, outer, file_path, content, max_chars, chunks)
     elif node.type == "function_definition":
-        name = _py_get_name(node)
-        _add_chunk(
-            chunks,
-            file_path,
-            name,
-            SymbolType.FUNCTION,
-            _node_text(outer, content),
-            outer.start_point[0] + 1,
-            outer.end_point[0] + 1,
-            SearchQuality.AST,
-            max_chars,
+        name = _node_name(node)
+        _add_node_chunk(
+            chunks, file_path, name, SymbolType.FUNCTION, outer, content, max_chars
         )
     elif node.type in {"assignment", "expression_statement"}:
         # Module-level assignments.
         text = _node_text(node, content)
-        if len(text) > 20:  # Skip trivial one-liners.
+        if len(text) > _MIN_BLOCK_CHARS:  # Skip trivial one-liners.
             _add_chunk(
                 chunks,
                 file_path,
@@ -843,20 +812,12 @@ def _py_chunk_class(
     @param max_chars: Sub-chunk threshold.
     @param chunks: Accumulator.
     """
-    class_name = _py_get_name(node)
+    class_name = _node_name(node)
 
     body = node.child_by_field_name("body")
     if body is None:
-        _add_chunk(
-            chunks,
-            file_path,
-            class_name,
-            SymbolType.CLASS,
-            _node_text(outer, content),
-            outer.start_point[0] + 1,
-            outer.end_point[0] + 1,
-            SearchQuality.AST,
-            max_chars,
+        _add_node_chunk(
+            chunks, file_path, class_name, SymbolType.CLASS, outer, content, max_chars
         )
         return
 
@@ -885,31 +846,18 @@ def _py_chunk_class(
             actual = inner
 
         if actual.type == "function_definition":
-            method_name = _py_get_name(actual)
+            method_name = _node_name(actual)
             full_name = f"{class_name}.{method_name}"
-            _add_chunk(
+            # ``child`` rather than ``actual``: include decorators.
+            _add_node_chunk(
                 chunks,
                 file_path,
                 full_name,
                 SymbolType.METHOD,
-                _node_text(child, content),  # Include decorators.
-                child.start_point[0] + 1,
-                child.end_point[0] + 1,
-                SearchQuality.AST,
+                child,
+                content,
                 max_chars,
             )
-
-
-def _py_get_name(node: Node) -> str:
-    """Extract name from a Python definition node.
-
-    @param node: tree-sitter Node.
-    @returns: Name string.
-    """
-    name_node = node.child_by_field_name("name")
-    if name_node is not None:
-        return (name_node.text or b"").decode("utf-8", errors="replace")
-    return ""
 
 
 def _build_py_class_shell(node: Node, body: Node, content: str) -> str:
@@ -1002,27 +950,23 @@ def _chunk_php(
     root = tree.root_node
     chunks: list[ChunkData] = []
 
-    # Preamble: `<?php`, declare(), namespace, and the `use` imports that
-    # precede the first definition.  Keeping them in their own chunk stops
-    # imports being mis-attributed to whichever symbol happens to be first.
-    first_def_line = _php_first_definition_line(root)
-    preamble_end = first_def_line or 0
-    if preamble_end > 0:
-        preamble = "\n".join(content.split("\n")[:preamble_end]).strip()
-        if len(preamble) > 20:
-            _add_chunk(
-                chunks,
-                file_path,
-                "",
-                SymbolType.MODULE,
-                preamble,
-                1,
-                preamble_end,
-                SearchQuality.AST,
-                max_chars,
-            )
+    pairs = list(_php_iter_with_docblocks(root))
 
-    for node, doc in _php_iter_with_docblocks(root):
+    # Preamble: `<?php`, declare(), namespace, and the `use` imports that
+    # precede the first definition (including its leading docblock).
+    preamble_end = next(
+        (
+            _php_span(node, doc)[1]
+            for node, doc in pairs
+            if node.type in _PHP_TOP_LEVEL_DEFS
+        ),
+        0,
+    )
+    _add_preamble_chunk(
+        chunks, file_path, content, preamble_end, SearchQuality.AST, max_chars
+    )
+
+    for node, doc in pairs:
         # Nodes already covered verbatim by the preamble chunk.
         if node.start_point[0] < preamble_end:
             continue
@@ -1032,28 +976,6 @@ def _chunk_php(
         return _chunk_text_fallback(file_path, content, max_chars)
 
     return chunks, SearchQuality.AST
-
-
-def _php_first_definition_line(root: Node) -> int | None:
-    """Find the 0-indexed line where the first PHP definition starts.
-
-    Includes a leading docblock so the preamble stops before it.
-
-    @param root: program node.
-    @returns: 0-indexed line, or None if the file has no definitions.
-    """
-    pending_doc: Node | None = None
-    for node in root.children:
-        if not node.is_named:
-            continue
-        if node.type == "comment":
-            pending_doc = node
-            continue
-        if node.type in _PHP_TOP_LEVEL_DEFS:
-            start = pending_doc if pending_doc is not None else node
-            return start.start_point[0]
-        pending_doc = None
-    return None
 
 
 def _php_iter_with_docblocks(parent: Node) -> Iterator[tuple[Node, Node | None]]:
@@ -1107,19 +1029,19 @@ def _php_process_node(
     @param max_chars: Sub-chunk threshold.
     @param chunks: Accumulator.
     """
-    start_byte, start_line = _php_span(node, doc)
-    text = _byte_slice(content, start_byte, node.end_byte)
-    end_line = node.end_point[0] + 1
-
     if node.type in _PHP_TYPE_DECLARATIONS:
         _php_chunk_type_declaration(node, doc, file_path, content, max_chars, chunks)
         return
+
+    start_byte, start_line = _php_span(node, doc)
+    text = _byte_slice(content, start_byte, node.end_byte)
+    end_line = node.end_point[0] + 1
 
     if node.type == "function_definition":
         _add_chunk(
             chunks,
             file_path,
-            _php_get_name(node),
+            _node_name(node, _PHP_NAME_TYPES),
             SymbolType.FUNCTION,
             text,
             start_line + 1,
@@ -1129,7 +1051,7 @@ def _php_process_node(
         )
         return
 
-    if node.type in _PHP_TEXT_TYPES or len(text.strip()) > 20:
+    if node.type in _PHP_TEXT_TYPES or len(text.strip()) > _MIN_BLOCK_CHARS:
         # Inline HTML and top-level statements in script-style / mixed
         # template files.  Trivial one-liners are dropped as noise.
         stripped = text.strip()
@@ -1164,7 +1086,7 @@ def _php_chunk_type_declaration(
     @param max_chars: Sub-chunk threshold.
     @param chunks: Accumulator.
     """
-    type_name = _php_get_name(node)
+    type_name = _node_name(node, _PHP_NAME_TYPES)
     start_byte, start_line = _php_span(node, doc)
     body = _php_body(node)
 
@@ -1182,7 +1104,7 @@ def _php_chunk_type_declaration(
         )
         return
 
-    shell = _build_php_type_shell(body, content, start_line)
+    shell = _build_class_shell(start_line, body, content, _PHP_MEMBER_TYPES)
     if shell.strip():
         # A class shell is the established CLASS_SHELL type; interfaces,
         # traits and enums keep their own type so a symbol search can tell
@@ -1208,7 +1130,7 @@ def _php_chunk_type_declaration(
         if member.type not in _PHP_MEMBER_TYPES:
             continue
         member_start_byte, member_start_line = _php_span(member, member_doc)
-        method_name = _php_get_name(member)
+        method_name = _node_name(member, _PHP_NAME_TYPES)
         full_name = f"{type_name}.{method_name}" if method_name else type_name
         _add_chunk(
             chunks,
@@ -1240,43 +1162,6 @@ def _php_body(node: Node) -> Node | None:
         if child.type.endswith("declaration_list"):
             return child
     return None
-
-
-def _build_php_type_shell(body: Node, content: str, start_line: int) -> str:
-    """Build a PHP type shell: docblock + signature + non-method members.
-
-    @param body: The member-list node.
-    @param content: Full file content.
-    @param start_line: 0-indexed line where the declaration (or its
-        docblock) starts.
-    @returns: Shell text.
-    """
-    lines = content.split("\n")
-    body_start = body.start_point[0]
-    shell_parts = lines[start_line : body_start + 1]
-
-    for child in body.named_children:
-        if child.type in _PHP_MEMBER_TYPES:
-            continue
-        shell_parts.extend(lines[child.start_point[0] : child.end_point[0] + 1])
-
-    shell_parts.append("}")
-    return "\n".join(shell_parts)
-
-
-def _php_get_name(node: Node) -> str:
-    """Extract the name from a PHP declaration node.
-
-    @param node: tree-sitter Node.
-    @returns: Name string (empty if not found).
-    """
-    name_node = node.child_by_field_name("name")
-    if name_node is not None:
-        return (name_node.text or b"").decode("utf-8", errors="replace")
-    for child in node.children:
-        if child.type == "name":
-            return (child.text or b"").decode("utf-8", errors="replace")
-    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1319,19 +1204,17 @@ def _chunk_vue(
     chunks: list[ChunkData] = []
 
     for node in tree.root_node.children:
-        if not node.is_named:
+        if not node.is_named or node.type == "comment":
             continue
         if node.type == "script_element":
             _vue_chunk_script(node, file_path, content, max_chars, chunks)
-        elif node.type == "template_element":
-            _vue_emit_element(
-                node, file_path, content, max_chars, chunks, "template", 0
-            )
-        elif node.type == "style_element":
-            _vue_emit_element(node, file_path, content, max_chars, chunks, "style", 0)
-        elif node.type != "comment":
-            # Custom blocks (<i18n>, <docs>, …) and stray top-level markup.
-            _vue_emit_element(node, file_path, content, max_chars, chunks, "", 0)
+            continue
+        # `template`/`style` name their block; custom blocks (<i18n>,
+        # <docs>, …) and stray top-level markup get no name.
+        name = (
+            node.type.removesuffix("_element") if node.type.endswith("_element") else ""
+        )
+        _vue_emit_element(node, file_path, content, max_chars, chunks, name, 0)
 
     if not chunks:
         return _chunk_text_fallback(file_path, content, max_chars)
@@ -1380,16 +1263,10 @@ def _rebase_chunks(chunks: list[ChunkData], line_offset: int) -> list[ChunkData]
     @returns: New chunks with absolute line numbers.
     """
     return [
-        ChunkData(
-            file_path=c.file_path,
-            symbol_name=c.symbol_name,
-            symbol_type=c.symbol_type,
-            content=c.content,
+        replace(
+            c,
             start_line=c.start_line + line_offset,
             end_line=c.end_line + line_offset,
-            search_quality=c.search_quality,
-            parent_chunk_id=c.parent_chunk_id,
-            sub_chunk_index=c.sub_chunk_index,
         )
         for c in chunks
     ]
@@ -1426,10 +1303,14 @@ def _vue_emit_element(
     start_byte = node.start_byte if start_byte is None else start_byte
     start_row = node.start_point[0] if start_row is None else start_row
 
-    children = [c for c in node.named_children if c.type in _VUE_ELEMENT_TYPES]
     length = node.end_byte - start_byte
+    children = (
+        [c for c in node.named_children if c.type in _VUE_ELEMENT_TYPES]
+        if length > max_chars and depth < _VUE_MAX_DEPTH
+        else []
+    )
 
-    if length <= max_chars or depth >= _VUE_MAX_DEPTH or not children:
+    if not children:
         _vue_emit_span(
             content,
             start_byte,
@@ -1523,12 +1404,10 @@ def _vue_emit_span(
     """
     if end_byte <= start_byte:
         return
-    raw = _byte_slice(content, start_byte, end_byte)
-    text = raw.strip()
-    if not text:
+    stripped = _strip_span(_byte_slice(content, start_byte, end_byte), start_row + 1)
+    if stripped is None:
         return
-    lead = raw[: len(raw) - len(raw.lstrip())]
-    start_line = start_row + 1 + lead.count("\n")
+    text, start_line = stripped
 
     if _vue_merge_into_previous(chunks, text, name, start_line, max_chars):
         return
@@ -1579,14 +1458,10 @@ def _vue_merge_into_previous(
     ):
         return False
 
-    chunks[-1] = ChunkData(
-        file_path=prev.file_path,
-        symbol_name=prev.symbol_name,
-        symbol_type=prev.symbol_type,
+    chunks[-1] = replace(
+        prev,
         content=prev.content + "\n" + text,
-        start_line=prev.start_line,
         end_line=start_line + text.count("\n"),
-        search_quality=prev.search_quality,
     )
     return True
 
@@ -1595,26 +1470,15 @@ def _vue_merge_into_previous(
 # Blade template chunking
 # ---------------------------------------------------------------------------
 #
-# tree-sitter-language-pack 0.13.0 ships no Blade grammar (checked against
-# its full 173-language list; it has `php`, `html`, `twig` and `vue`, but
-# nothing for Blade).  Neither neighbouring grammar is usable as a stand-in:
-#
-#   * `php` "succeeds" on any Blade file: everything outside `<?php` tags
-#     is a single opaque `text` node, so it reports zero parse errors while
-#     yielding one file-sized chunk.  That is worse than a real fallback
-#     because the error-density guard cannot detect it.
-#   * `html` chokes on Blade's control flow: directives routinely open a tag
-#     in one branch and close it in another.  Measured over the 82 Blade
-#     templates in a production Laravel app, 22 (27%) exceeded the chunker's
-#     10% error-node threshold, several above 95%.
-#
-# So Blade gets a structural directive scanner instead: Blade's own block
-# directives (`@section`/`@endsection`, `@push`, `@component`, `@if`, …) are
-# the boundaries an author already writes, and they nest properly.  The
-# scanner tracks that nesting, so a `@section` is chunked whole no matter how
-# much control flow it contains, and descends into a section only when the
-# section itself exceeds `max_chars`.  Quality is REGEX, matching the Bash
-# and Markdown strategies.
+# No tree-sitter Blade grammar exists, and neither neighbouring grammar is
+# usable as a stand-in: `php` parses any Blade file "successfully" into one
+# opaque `text` node (invisible to the error-density guard), and `html`
+# chokes on directives that open a tag in one branch and close it in
+# another.  So Blade is chunked structurally on its own block directives,
+# which nest properly and are the boundaries an author already writes.
+# Quality is REGEX, matching Bash and Markdown.  Full rationale and
+# measurements: docs/history/critiques/parsing.md, "Addendum: Blade
+# Strategy Selection".
 
 _BLADE_COMMENT_RE = re.compile(r"\{\{--.*?--\}\}", re.DOTALL)
 
@@ -1715,7 +1579,7 @@ def _chunk_blade(
         return [], SearchQuality.REGEX
 
     blocks = _blade_parse_blocks(content)
-    line_of = _blade_line_indexer(content)
+    line_of = _line_indexer(content)
 
     chunks: list[ChunkData] = []
     _blade_emit(
@@ -1737,13 +1601,19 @@ def _chunk_blade(
     return chunks, SearchQuality.REGEX
 
 
-def _blade_line_indexer(content: str) -> Any:
+def _line_indexer(content: str) -> _LineLookup:
     """Build an O(log n) character-offset → 1-indexed line lookup.
 
-    @param content: Full template text.
+    @param content: Full text.
     @returns: Callable mapping offset to line number.
     """
-    newlines = [i for i, ch in enumerate(content) if ch == "\n"]
+    # str.find keeps the scan at C speed; a per-character Python loop is
+    # several times slower on large files.
+    newlines: list[int] = []
+    pos = content.find("\n")
+    while pos != -1:
+        newlines.append(pos)
+        pos = content.find("\n", pos + 1)
 
     def _line_of(pos: int) -> int:
         return bisect.bisect_left(newlines, pos) + 1
@@ -1761,14 +1631,7 @@ def _blade_parse_blocks(content: str) -> list[_BladeBlock]:
     @returns: Top-level blocks, in source order.
     """
     comment_spans = [(m.start(), m.end()) for m in _BLADE_COMMENT_RE.finditer(content)]
-    comment_starts = [s for s, _ in comment_spans]
-
-    def _in_comment(pos: int) -> bool:
-        idx = bisect.bisect_right(comment_starts, pos) - 1
-        if idx < 0:
-            return False
-        start, end = comment_spans[idx]
-        return start <= pos < end
+    _in_comment = _span_membership(comment_spans)
 
     roots: list[_BladeBlock] = []
     stack: list[_BladeBlock] = []
@@ -1895,25 +1758,13 @@ def _blade_scan_args(content: str, pos: int) -> tuple[str | None, int]:
         return None, pos
 
     depth = 0
-    quote: str | None = None
-    j = i
-    while j < len(content):
-        ch = content[j]
-        if quote is not None:
-            if ch == "\\":
-                j += 2
-                continue
-            if ch == quote:
-                quote = None
-        elif ch in "'\"":
-            quote = ch
-        elif ch == "(":
+    for j, ch in _iter_code_chars(content, i):
+        if ch == "(":
             depth += 1
         elif ch == ")":
             depth -= 1
             if depth == 0:
                 return content[i + 1 : j], j + 1
-        j += 1
 
     # Unterminated argument list - treat the directive as argument-less.
     return None, pos
@@ -1926,10 +1777,30 @@ def _blade_has_top_level_comma(args: str) -> bool:
     @returns: True if the directive received more than one argument.
     """
     depth = 0
+    for _i, ch in _iter_code_chars(args):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            return True
+    return False
+
+
+def _iter_code_chars(text: str, start: int = 0) -> Iterator[tuple[int, str]]:
+    """Yield (index, char) for characters outside quoted strings.
+
+    Handles backslash escapes inside quotes; quote delimiters themselves
+    are consumed, not yielded.
+
+    @param text: Text to scan.
+    @param start: Offset to start from.
+    @returns: Iterator of (index, character) pairs.
+    """
     quote: str | None = None
-    i = 0
-    while i < len(args):
-        ch = args[i]
+    i = start
+    while i < len(text):
+        ch = text[i]
         if quote is not None:
             if ch == "\\":
                 i += 2
@@ -1938,14 +1809,9 @@ def _blade_has_top_level_comma(args: str) -> bool:
                 quote = None
         elif ch in "'\"":
             quote = ch
-        elif ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        elif ch == "," and depth == 0:
-            return True
+        else:
+            yield i, ch
         i += 1
-    return False
 
 
 def _blade_emit(
@@ -1956,7 +1822,7 @@ def _blade_emit(
     file_path: str,
     max_chars: int,
     chunks: list[ChunkData],
-    line_of: Any,
+    line_of: _LineLookup,
     *,
     inherited_name: str,
     depth: int,
@@ -1990,15 +1856,18 @@ def _blade_emit(
         )
         cursor = block.end
 
-        text = content[block.start : block.end]
         name = block.label or inherited_name
-        if len(text) <= max_chars or depth >= _BLADE_MAX_DEPTH or not block.children:
+        if (
+            block.end - block.start <= max_chars
+            or depth >= _BLADE_MAX_DEPTH
+            or not block.children
+        ):
             _add_chunk(
                 chunks,
                 file_path,
                 name,
                 SymbolType.MODULE if block.label else SymbolType.BLOCK,
-                text.strip(),
+                content[block.start : block.end].strip(),
                 line_of(block.start),
                 line_of(block.end),
                 SearchQuality.REGEX,
@@ -2034,7 +1903,7 @@ def _blade_emit_markup(
     file_path: str,
     max_chars: int,
     chunks: list[ChunkData],
-    line_of: Any,
+    line_of: _LineLookup,
     inherited_name: str,
 ) -> None:
     """Emit a chunk for a run of markup between block directives.
@@ -2050,18 +1919,18 @@ def _blade_emit_markup(
     """
     if hi <= lo:
         return
-    text = content[lo:hi].strip()
-    if not text:
+    stripped = _strip_span(content[lo:hi], line_of(lo))
+    if stripped is None:
         return
-    offset = lo + (len(content[lo:hi]) - len(content[lo:hi].lstrip()))
+    text, start_line = stripped
     _add_chunk(
         chunks,
         file_path,
         inherited_name,
         SymbolType.BLOCK,
         text,
-        line_of(offset),
-        line_of(offset) + text.count("\n"),
+        start_line,
+        start_line + text.count("\n"),
         SearchQuality.REGEX,
         max_chars,
     )
@@ -2085,12 +1954,12 @@ def _chunk_bash_regex(
     @returns: (chunks, quality).
     """
     lines = content.split("\n")
+    line_of = _line_indexer(content)
     boundaries: list[tuple[str, int]] = []  # (name, line_idx)
 
     for match in _BASH_FUNC_RE.finditer(content):
         name = match.group(1) or match.group(2)
-        line_idx = content[: match.start()].count("\n")
-        boundaries.append((name, line_idx))
+        boundaries.append((name, line_of(match.start()) - 1))
 
     if not boundaries:
         return _chunk_text_fallback(file_path, content, max_chars)
@@ -2258,15 +2127,7 @@ def _chunk_markdown(
     if open_fence is not None:
         fenced_ranges.append((open_fence[1], len(content)))
 
-    # Build sorted start positions for O(log n) bisect lookup.
-    _fence_starts = [s for s, _e in fenced_ranges]
-
-    def _in_fence(pos: int) -> bool:
-        idx = bisect.bisect_right(_fence_starts, pos) - 1
-        if idx < 0:
-            return False
-        s, e = fenced_ranges[idx]
-        return s <= pos <= e
+    _in_fence = _span_membership(fenced_ranges, inclusive_end=True)
 
     # Collect heading positions.
     sections: list[tuple[str, int]] = []  # (heading_text, char_offset)
@@ -2298,13 +2159,14 @@ def _chunk_markdown(
             )
 
     # Each section: from this heading to the next (or EOF).
+    line_of = _line_indexer(content)
     for i, (heading, start) in enumerate(sections):
         end = sections[i + 1][1] if i + 1 < len(sections) else len(content)
         body = content[start:end].strip()
         if not body:
             continue
 
-        start_line = content[:start].count("\n") + 1
+        start_line = line_of(start)
         end_line = start_line + body.count("\n")
         _add_chunk(
             chunks,
@@ -2365,13 +2227,13 @@ def _chunk_prose(
     boundaries = [m.start() for m in _SENTENCE_END_RE.finditer(content)]
     boundaries.append(len(content))
 
+    line_of = _line_indexer(content)
     prev = 0
     for boundary in boundaries:
         raw = content[prev:boundary]
         stripped = raw.strip()
         if stripped:
-            start_line = content[:prev].count("\n") + 1
-            sentence_infos.append((stripped, start_line))
+            sentence_infos.append((stripped, line_of(prev)))
         prev = boundary
 
     chunks: list[ChunkData] = []
@@ -2442,13 +2304,14 @@ def _chunk_text_fallback(
     block_ends = [m.start() for m in matches] + [len(content)]
 
     chunks: list[ChunkData] = []
+    line_of = _line_indexer(content)
 
     for start_pos, end_pos in zip(block_starts, block_ends, strict=True):
         text = content[start_pos:end_pos].strip()
         if not text:
             continue
 
-        start_line = content[:start_pos].count("\n") + 1
+        start_line = line_of(start_pos)
         line_count = text.count("\n") + 1
         _add_chunk(
             chunks,
@@ -2549,6 +2412,40 @@ def _add_chunk(
                 sub_chunk_index=i,
             )
         )
+
+
+def _add_node_chunk(
+    chunks: list[ChunkData],
+    file_path: str,
+    symbol_name: str,
+    symbol_type: SymbolType,
+    node: Node,
+    content: str,
+    max_chars: int,
+    quality: SearchQuality = SearchQuality.AST,
+) -> None:
+    """Add a chunk whose text and line span come straight from a node.
+
+    @param chunks: Accumulator list.
+    @param file_path: Repo-relative path.
+    @param symbol_name: Symbol name.
+    @param symbol_type: Symbol type.
+    @param node: tree-sitter Node supplying text and line span.
+    @param content: Full file content.
+    @param max_chars: Character threshold.
+    @param quality: Search quality.
+    """
+    _add_chunk(
+        chunks,
+        file_path,
+        symbol_name,
+        symbol_type,
+        _node_text(node, content),
+        node.start_point[0] + 1,
+        node.end_point[0] + 1,
+        quality,
+        max_chars,
+    )
 
 
 def _split_into_sub_chunks(
@@ -2717,10 +2614,16 @@ def _parse_with_fallback(
     @returns: (tree, quality). Tree may be None if fallback.
     """
     parser = _get_cached_parser(language)
-    tree = parser.parse(content.encode("utf-8"))
+    tree = parser.parse(_encoded(content))
+
+    # `has_error` is a C-level flag; the full node walk below costs more
+    # than the parse itself, so only pay for it when errors exist.
+    root = tree.root_node
+    if not root.has_error:
+        return tree, SearchQuality.AST
 
     # Check error node density.
-    total, errors = _count_nodes(tree.root_node)
+    total, errors = _count_nodes(root)
     if total > 0 and errors / total > 0.10:
         return tree, SearchQuality.TEXT_FALLBACK
 
@@ -2808,23 +2711,65 @@ def _node_text(node: Node, content: str) -> str:
     return _byte_slice(content, node.start_byte, node.end_byte)
 
 
-def _build_class_shell(node: Node, body: Node, content: str) -> str:
-    """Build a TS class shell (signature + property declarations).
+def _strip_span(raw: str, start_line: int) -> tuple[str, int] | None:
+    """Strip a source span, adjusting its start line past leading blanks.
 
-    @param node: class_declaration node.
-    @param body: class_body node.
+    @param raw: The span text.
+    @param start_line: 1-indexed line of ``raw``'s first character.
+    @returns: (stripped text, adjusted start line), or None if blank.
+    """
+    text = raw.strip()
+    if not text:
+        return None
+    lead = raw[: len(raw) - len(raw.lstrip())]
+    return text, start_line + lead.count("\n")
+
+
+def _span_membership(
+    spans: list[tuple[int, int]], *, inclusive_end: bool = False
+) -> Callable[[int], bool]:
+    """Build an O(log n) test for membership in sorted, disjoint spans.
+
+    @param spans: (start, end) pairs, sorted by start.
+    @param inclusive_end: Whether ``end`` itself counts as inside.
+    @returns: Callable testing whether an offset falls in any span.
+    """
+    starts = [s for s, _ in spans]
+
+    def _contains(pos: int) -> bool:
+        idx = bisect.bisect_right(starts, pos) - 1
+        if idx < 0:
+            return False
+        start, end = spans[idx]
+        return start <= pos <= end if inclusive_end else start <= pos < end
+
+    return _contains
+
+
+def _build_class_shell(
+    start_line: int, body: Node, content: str, member_types: frozenset[str]
+) -> str:
+    """Build a type shell: signature (and docblock) + non-method members.
+
+    Shared by the TS and PHP chunkers; ``member_types`` is the grammar's
+    set of member node types that become chunks of their own and are
+    therefore excluded from the shell.
+
+    @param start_line: 0-indexed line where the declaration (or its
+        docblock) starts.
+    @param body: The member-list / class-body node.
     @param content: Full file content.
+    @param member_types: Node types excluded from the shell.
+    @returns: Shell text.
     """
     lines = content.split("\n")
-    sig_start = node.start_point[0]
     body_start = body.start_point[0]
 
-    # Class signature.
-    shell_parts = lines[sig_start : body_start + 1]  # Include opening brace.
+    # Signature, including the opening brace.
+    shell_parts = lines[start_line : body_start + 1]
 
-    # Property declarations (not methods).
     for child in body.named_children:
-        if child.type not in _TS_METHOD_TYPES:
+        if child.type not in member_types:
             shell_parts.extend(lines[child.start_point[0] : child.end_point[0] + 1])
 
     shell_parts.append("}")
@@ -2885,10 +2830,8 @@ def _has_react_wrapper(node: Node) -> bool:
         if descendant.type != "call_expression":
             continue
         func = descendant.child_by_field_name("function")
-        if func is not None:
-            text = (func.text or b"").decode("utf-8", errors="replace")
-            if _REACT_WRAPPER_RE.search(text):
-                return True
+        if func is not None and _REACT_WRAPPER_RE.search(_node_str(func)):
+            return True
     return False
 
 
@@ -2924,11 +2867,14 @@ def _is_pascal_case(name: str) -> bool:
     return any(c.islower() for c in name)
 
 
+@lru_cache(maxsize=8192)
 def _get_extension(file_path: str) -> str:
     """Get the lowercase file extension.
 
     Uses ``Path.suffix`` so only the basename's extension is considered,
-    not dots in parent directory names (M-4 fix).
+    not dots in parent directory names (M-4 fix).  Cached: the TS symbol
+    classifiers call this per node, and ``Path`` construction is the
+    dominant cost.
 
     @param file_path: File path.
     @returns: Extension including dot (e.g. '.py'), or '' if none.
@@ -2936,6 +2882,7 @@ def _get_extension(file_path: str) -> str:
     return Path(file_path).suffix.lower()
 
 
+@lru_cache(maxsize=8192)
 def _is_blade(file_path: str) -> bool:
     """Check whether a path is a Blade template.
 
@@ -2951,10 +2898,8 @@ def _is_blade(file_path: str) -> bool:
 
 def _build_line_index(
     chunks: list[ChunkData],
-) -> Any:
+) -> _ChunkIdLookup:
     """Build a bisect-based lookup from line number to chunk_id.
-
-    Returns a callable: (line: int) -> str | None.
 
     @param chunks: Chunks sorted by start_line (as produced by chunkers).
     @returns: Callable that maps line → chunk_id or None.
@@ -3004,15 +2949,15 @@ def _extract_python_refs(chunks: list[ChunkData], content: str) -> list[RefData]
     """
     refs: list[RefData] = []
 
-    # Build sorted index for O(log n) line → chunk_id lookup.
+    # Build sorted indexes for O(log n) offset → line → chunk_id lookups.
     _chunk_for_line = _build_line_index(chunks)
+    line_of = _line_indexer(content)
 
     # from X import Y, Z
     for m in _PY_IMPORT_FROM_RE.finditer(content):
         module = m.group(1)
         names = [n.strip().split(" as ")[0].strip() for n in m.group(2).split(",")]
-        line = content[: m.start()].count("\n") + 1
-        cid = _chunk_for_line(line)
+        cid = _chunk_for_line(line_of(m.start()))
         if cid:
             for name in names:
                 if name and name != "*":
@@ -3020,15 +2965,13 @@ def _extract_python_refs(chunks: list[ChunkData], content: str) -> list[RefData]
 
     # import X
     for m in _PY_IMPORT_RE.finditer(content):
-        line = content[: m.start()].count("\n") + 1
-        cid = _chunk_for_line(line)
+        cid = _chunk_for_line(line_of(m.start()))
         if cid:
             refs.append(RefData(cid, m.group(1), RefType.IMPORT))
 
     # class Foo(Bar, Baz):
     for m in _PY_CLASS_RE.finditer(content):
-        line = content[: m.start()].count("\n") + 1
-        cid = _chunk_for_line(line)
+        cid = _chunk_for_line(line_of(m.start()))
         if cid:
             bases = [b.strip() for b in m.group(1).split(",")]
             for base in bases:
@@ -3039,8 +2982,7 @@ def _extract_python_refs(chunks: list[ChunkData], content: str) -> list[RefData]
 
     # @decorator
     for m in _PY_DECORATOR_RE.finditer(content):
-        line = content[: m.start()].count("\n") + 1
-        cid = _chunk_for_line(line)
+        cid = _chunk_for_line(line_of(m.start()))
         if cid:
             refs.append(RefData(cid, m.group(1), RefType.DECORATOR))
 
@@ -3070,17 +3012,16 @@ def _extract_php_refs(chunks: list[ChunkData], content: str) -> list[RefData]:
     """
     refs: list[RefData] = []
     _chunk_for_line = _build_line_index(chunks)
+    line_of = _line_indexer(content)
 
     for m in _PHP_USE_RE.finditer(content):
-        line = content[: m.start()].count("\n") + 1
-        cid = _chunk_for_line(line)
+        cid = _chunk_for_line(line_of(m.start()))
         if cid:
             refs.append(RefData(cid, m.group(1).lstrip("\\"), RefType.IMPORT))
 
     for pattern in (_PHP_EXTENDS_RE, _PHP_IMPLEMENTS_RE):
         for m in pattern.finditer(content):
-            line = content[: m.start()].count("\n") + 1
-            cid = _chunk_for_line(line)
+            cid = _chunk_for_line(line_of(m.start()))
             if not cid:
                 continue
             for base in m.group(1).split(","):
@@ -3110,12 +3051,12 @@ def _extract_ts_refs(chunks: list[ChunkData], content: str) -> list[RefData]:
     refs: list[RefData] = []
 
     _chunk_for_line = _build_line_index(chunks)
+    line_of = _line_indexer(content)
 
     # import { X, Y } from 'module'
     for m in _TS_IMPORT_RE.finditer(content):
         names = [n.strip().split(" as ")[0].strip() for n in m.group(1).split(",")]
-        line = content[: m.start()].count("\n") + 1
-        cid = _chunk_for_line(line)
+        cid = _chunk_for_line(line_of(m.start()))
         if cid:
             for name in names:
                 if name:
@@ -3123,8 +3064,7 @@ def _extract_ts_refs(chunks: list[ChunkData], content: str) -> list[RefData]:
 
     # import X from 'module'
     for m in _TS_IMPORT_DEFAULT_RE.finditer(content):
-        line = content[: m.start()].count("\n") + 1
-        cid = _chunk_for_line(line)
+        cid = _chunk_for_line(line_of(m.start()))
         if cid:
             refs.append(RefData(cid, m.group(1), RefType.IMPORT))
 
