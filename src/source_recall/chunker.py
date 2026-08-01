@@ -291,6 +291,25 @@ def _ts_process_node(
             SearchQuality.AST,
             max_chars,
         )
+    elif ntype in {"object", "call_expression"}:
+        # `export default { … }` is the Vue Options API, and the shape of
+        # most JS config modules.  Without this it would fall through to
+        # the generic block branch and arrive as one file-sized chunk.
+        obj = node if ntype == "object" else _ts_default_export_object(node)
+        if obj is None:
+            _add_chunk(
+                chunks,
+                file_path,
+                "",
+                SymbolType.BLOCK,
+                _node_text(node, content),
+                node.start_point[0] + 1,
+                node.end_point[0] + 1,
+                SearchQuality.AST,
+                max_chars,
+            )
+        else:
+            _ts_chunk_object(obj, file_path, content, max_chars, chunks, "", 0)
     elif ntype == "enum_declaration":
         name = _ts_get_name(node)
         _add_chunk(
@@ -431,6 +450,148 @@ def _ts_chunk_lexical(
         SearchQuality.AST,
         max_chars,
     )
+
+
+# Property values that make an object worth decomposing rather than
+# keeping whole.
+_TS_FUNCTION_VALUE_TYPES = frozenset({"function_expression", "arrow_function"})
+
+# How deep to descend through nested object literals (`methods: { … }`).
+_TS_OBJECT_MAX_DEPTH = 3
+
+
+def _ts_default_export_object(node: Node) -> Node | None:
+    """Find the object literal inside a wrapped default export.
+
+    Covers `defineComponent({ … })` and friends, where the component
+    definition is an argument rather than the export itself.
+
+    @param node: call_expression node.
+    @returns: The object-literal argument, or None.
+    """
+    args = node.child_by_field_name("arguments")
+    if args is None:
+        return None
+    return next((c for c in args.named_children if c.type == "object"), None)
+
+
+def _ts_chunk_object(
+    node: Node,
+    file_path: str,
+    content: str,
+    max_chars: int,
+    chunks: list[ChunkData],
+    prefix: str,
+    depth: int,
+) -> None:
+    """Chunk an object literal into a shell plus its function members.
+
+    The class treatment, applied to objects: methods get their own named
+    chunk so they are individually retrievable, and everything else
+    collapses into one shell that carries the object's shape.  Objects
+    with no functions in them are left whole unless they are oversized,
+    so ordinary config literals are not shredded.
+
+    @param node: object node.
+    @param file_path: Repo-relative path.
+    @param content: Full file content.
+    @param max_chars: Sub-chunk threshold.
+    @param chunks: Accumulator.
+    @param prefix: Dotted path of enclosing properties.
+    @param depth: Current recursion depth.
+    """
+    members = [
+        (_ts_property_key(c), _ts_property_value(c), c) for c in node.named_children
+    ]
+    decomposable = any(
+        child.type == "method_definition"
+        or (value is not None and value.type in _TS_FUNCTION_VALUE_TYPES)
+        for _key, value, child in members
+    )
+    text = _node_text(node, content)
+
+    if not members:
+        # `computed: {}`: an empty placeholder is not worth a chunk.
+        return
+
+    if depth >= _TS_OBJECT_MAX_DEPTH or not (decomposable or len(text) > max_chars):
+        _add_chunk(
+            chunks,
+            file_path,
+            prefix,
+            SymbolType.BLOCK,
+            text,
+            node.start_point[0] + 1,
+            node.end_point[0] + 1,
+            SearchQuality.AST,
+            max_chars,
+        )
+        return
+
+    shell_parts: list[str] = []
+    for _key, value, child in members:
+        if value is not None and value.type not in _TS_FUNCTION_VALUE_TYPES | {
+            "object"
+        }:
+            shell_parts.append(_node_text(child, content))
+
+    if shell_parts:
+        _add_chunk(
+            chunks,
+            file_path,
+            prefix,
+            SymbolType.BLOCK,
+            ",\n".join(shell_parts),
+            node.start_point[0] + 1,
+            node.end_point[0] + 1,
+            SearchQuality.AST,
+            max_chars,
+        )
+
+    for key, value, child in members:
+        name = f"{prefix}.{key}" if prefix and key else (key or prefix)
+        if value is None or value.type in _TS_FUNCTION_VALUE_TYPES:
+            if value is None and child.type != "method_definition":
+                continue
+            _add_chunk(
+                chunks,
+                file_path,
+                name,
+                SymbolType.METHOD,
+                _node_text(child, content),
+                child.start_point[0] + 1,
+                child.end_point[0] + 1,
+                SearchQuality.AST,
+                max_chars,
+            )
+        elif value.type == "object":
+            _ts_chunk_object(
+                value, file_path, content, max_chars, chunks, name, depth + 1
+            )
+
+
+def _ts_property_key(node: Node) -> str:
+    """Extract the key of an object property.
+
+    @param node: pair / method_definition / shorthand node.
+    @returns: Key text, or "".
+    """
+    key = node.child_by_field_name("key") or node.child_by_field_name("name")
+    if key is None:
+        return ""
+    return (key.text or b"").decode("utf-8", errors="replace").strip("'\"")
+
+
+def _ts_property_value(node: Node) -> Node | None:
+    """Extract the value of an object property.
+
+    ``method_definition`` has no value field: the node *is* the function,
+    which callers detect by the returned None plus the node type.
+
+    @param node: pair / method_definition / shorthand node.
+    @returns: Value node, or None.
+    """
+    return node.child_by_field_name("value")
 
 
 def _ts_classify_function(node: Node, name: str, file_path: str) -> SymbolType:
@@ -1122,6 +1283,10 @@ _VUE_ELEMENT_TYPES = frozenset({"element", "template_element"})
 # remainder to the shared line-window sub-chunker.
 _VUE_MAX_DEPTH = 3
 
+# Markup runs shorter than this are folded into the following element
+# instead of becoming their own chunk.  A bare `</div>` retrieves nothing.
+_VUE_MIN_SPAN = 200
+
 
 def _chunk_vue(
     file_path: str, content: str, max_chars: int
@@ -1224,6 +1389,8 @@ def _vue_emit_element(
     chunks: list[ChunkData],
     name: str,
     depth: int,
+    start_byte: int | None = None,
+    start_row: int | None = None,
 ) -> None:
     """Emit a chunk for a markup element, descending if it is oversized.
 
@@ -1237,46 +1404,81 @@ def _vue_emit_element(
     @param chunks: Accumulator.
     @param name: Symbol name carried down from the enclosing block.
     @param depth: Current recursion depth.
+    @param start_byte: Extend the chunk back to this offset, folding a
+        short preceding run of markup into it rather than emitting that
+        run on its own.  Defaults to the node's own start.
+    @param start_row: 0-indexed row containing ``start_byte``.
     """
-    text = _node_text(node, content)
-    children = [c for c in node.named_children if c.type in _VUE_ELEMENT_TYPES]
+    start_byte = node.start_byte if start_byte is None else start_byte
+    start_row = node.start_point[0] if start_row is None else start_row
 
-    if len(text) <= max_chars or depth >= _VUE_MAX_DEPTH or not children:
-        _add_chunk(
-            chunks,
+    children = [c for c in node.named_children if c.type in _VUE_ELEMENT_TYPES]
+    length = node.end_byte - start_byte
+
+    if length <= max_chars or depth >= _VUE_MAX_DEPTH or not children:
+        _vue_emit_span(
+            content,
+            start_byte,
+            node.end_byte,
+            start_row,
             file_path,
-            name,
-            SymbolType.BLOCK,
-            text.strip(),
-            node.start_point[0] + 1,
-            node.end_point[0] + 1,
-            SearchQuality.AST,
             max_chars,
+            chunks,
+            name,
         )
         return
 
-    cursor_byte = node.start_byte
-    cursor_row = node.start_point[0]
+    # Pack consecutive siblings into one chunk until they would overflow,
+    # then start a fresh pack at the sibling that did not fit.  Packing is
+    # what keeps the markup between elements (an opening tag, a stray
+    # `</div>`) attached to something substantial instead of becoming its
+    # own useless chunk, and it stops a run of small siblings from being
+    # emitted one chunk apiece.
+    pack_byte = start_byte
+    pack_row = start_row
     for child in children:
-        _vue_emit_span(
-            content,
-            cursor_byte,
-            child.start_byte,
-            cursor_row,
+        if child.end_byte - pack_byte <= max_chars:
+            continue
+
+        if child.start_byte - pack_byte >= _VUE_MIN_SPAN:
+            _vue_emit_span(
+                content,
+                pack_byte,
+                child.start_byte,
+                pack_row,
+                file_path,
+                max_chars,
+                chunks,
+                name,
+            )
+            pack_byte = child.start_byte
+            pack_row = child.start_point[0]
+
+        if child.end_byte - pack_byte <= max_chars:
+            # The child now opens a fresh pack; keep accumulating.
+            continue
+
+        # The child does not fit on its own: descend into it, folding any
+        # short preceding run into the chunks it produces.
+        _vue_emit_element(
+            child,
             file_path,
+            content,
             max_chars,
             chunks,
             name,
+            depth + 1,
+            start_byte=pack_byte,
+            start_row=pack_row,
         )
-        _vue_emit_element(child, file_path, content, max_chars, chunks, name, depth + 1)
-        cursor_byte = child.end_byte
-        cursor_row = child.end_point[0]
+        pack_byte = child.end_byte
+        pack_row = child.end_point[0]
 
     _vue_emit_span(
         content,
-        cursor_byte,
+        pack_byte,
         node.end_byte,
-        cursor_row,
+        pack_row,
         file_path,
         max_chars,
         chunks,
@@ -1294,7 +1496,7 @@ def _vue_emit_span(
     chunks: list[ChunkData],
     name: str,
 ) -> None:
-    """Emit a chunk for the markup between two child elements.
+    """Emit a chunk for one span of an SFC block.
 
     @param content: Full SFC text.
     @param start_byte: Span start.
@@ -1313,6 +1515,10 @@ def _vue_emit_span(
         return
     lead = raw[: len(raw) - len(raw.lstrip())]
     start_line = start_row + 1 + lead.count("\n")
+
+    if _vue_merge_into_previous(chunks, text, name, start_line, max_chars):
+        return
+
     _add_chunk(
         chunks,
         file_path,
@@ -1324,6 +1530,51 @@ def _vue_emit_span(
         SearchQuality.AST,
         max_chars,
     )
+
+
+def _vue_merge_into_previous(
+    chunks: list[ChunkData],
+    text: str,
+    name: str,
+    start_line: int,
+    max_chars: int,
+) -> bool:
+    """Fold a trailing scrap of markup back into the chunk it closes.
+
+    Descent leaves behind runs like a lone `</div>`.  They are real source
+    and cannot be dropped, but they retrieve nothing on their own, so they
+    are appended to the preceding chunk when that chunk is theirs to
+    extend.
+
+    @param chunks: Accumulator (mutated).
+    @param text: The stripped markup run.
+    @param name: Symbol name of the enclosing block.
+    @param start_line: 1-indexed line the run starts on.
+    @param max_chars: Sub-chunk threshold.
+    @returns: True if the run was merged.
+    """
+    if len(text) >= _VUE_MIN_SPAN or not chunks:
+        return False
+    prev = chunks[-1]
+    if (
+        prev.symbol_name != name
+        or prev.parent_chunk_id is not None
+        or prev.symbol_type != SymbolType.BLOCK
+        or prev.end_line > start_line
+        or len(prev.content) + len(text) + 1 > max_chars
+    ):
+        return False
+
+    chunks[-1] = ChunkData(
+        file_path=prev.file_path,
+        symbol_name=prev.symbol_name,
+        symbol_type=prev.symbol_type,
+        content=prev.content + "\n" + text,
+        start_line=prev.start_line,
+        end_line=start_line + text.count("\n"),
+        search_quality=prev.search_quality,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------

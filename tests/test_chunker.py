@@ -718,3 +718,82 @@ class TestNodeTextByteOffsets:
         assert fn.content.startswith("function première()")
         assert "return 'naïve'" in fn.content
         assert fn.content.rstrip().endswith("}")
+
+
+class TestVueOptionsApi:
+    """Vue 2 / Options API components, which are still the common shape.
+
+    `export default { … }` used to unwrap to an unrecognised node type and
+    arrive as one file-sized block, so every method in the component was
+    only reachable through a line-window sub-chunk.
+    """
+
+    def test_methods_become_individual_chunks(self, laravel_app_path: Path) -> None:
+        """Each entry under `methods:` is its own retrievable chunk."""
+        path = laravel_app_path / "resources/js/StatsPanel.vue"
+        chunks, quality = chunk_file("resources/js/StatsPanel.vue", path.read_text())
+
+        assert quality == SearchQuality.AST
+        by_name = {c.symbol_name: c for c in chunks}
+        assert by_name["methods.fetchStats"].symbol_type == SymbolType.METHOD
+        assert by_name["methods.formatValue"].symbol_type == SymbolType.METHOD
+        assert by_name["computed.title"].symbol_type == SymbolType.METHOD
+        # Lifecycle hooks sit directly on the object.
+        assert by_name["data"].symbol_type == SymbolType.METHOD
+        assert by_name["mounted"].symbol_type == SymbolType.METHOD
+
+    def test_method_bodies_stay_whole(self, laravel_app_path: Path) -> None:
+        """An Options API method is never cut across chunks."""
+        path = laravel_app_path / "resources/js/StatsPanel.vue"
+        chunks, _ = chunk_file("resources/js/StatsPanel.vue", path.read_text())
+
+        fetch = next(c for c in chunks if c.symbol_name == "methods.fetchStats")
+        assert fetch.parent_chunk_id is None
+        assert _braces_balanced(fetch.content)
+        assert "finally" in fetch.content
+
+    def test_non_function_options_form_a_shell(self, laravel_app_path: Path) -> None:
+        """`name` and `props` travel together as the component's shape."""
+        path = laravel_app_path / "resources/js/StatsPanel.vue"
+        chunks, _ = chunk_file("resources/js/StatsPanel.vue", path.read_text())
+
+        shell = next(
+            c
+            for c in chunks
+            if "name: 'stats-panel'" in c.content and not c.symbol_name
+        )
+        assert shell.symbol_type == SymbolType.BLOCK
+
+    def test_empty_option_object_is_dropped(self, laravel_app_path: Path) -> None:
+        """`components: { }` carries nothing worth indexing."""
+        path = laravel_app_path / "resources/js/StatsPanel.vue"
+        chunks, _ = chunk_file("resources/js/StatsPanel.vue", path.read_text())
+
+        assert not any(c.symbol_name == "components" for c in chunks)
+
+    def test_plain_config_object_is_not_shredded(self) -> None:
+        """An object with no functions in it stays whole."""
+        code = "export default {\n  a: 1,\n  nested: { b: 2, c: 3 },\n}\n"
+        chunks, _ = chunk_file("config.ts", code)
+
+        assert len(chunks) == 1
+        assert "nested" in chunks[0].content
+
+
+class TestVueTemplateSpans:
+    def test_trailing_markup_is_folded_into_its_chunk(self) -> None:
+        """Descent must not leave a bare closing tag as its own chunk."""
+        row = '      <li class="row"><span>value</span></li>\n'
+        content = (
+            "<template>\n  <ul>\n"
+            + row * 60
+            + "  </ul>\n  <footer>done</footer>\n</template>\n"
+        )
+        chunks, _ = chunk_file("Big.vue", content, max_chars=800)
+
+        assert len(chunks) > 1
+        assert all(len(c.content) >= 40 for c in chunks)
+        # Nothing was dropped on the way down.
+        assert sum(c.content.count("<li ") for c in chunks) == 60
+        assert any("</ul>" in c.content for c in chunks)
+        assert any("<footer>done</footer>" in c.content for c in chunks)
