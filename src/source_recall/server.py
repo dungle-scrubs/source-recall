@@ -287,8 +287,7 @@ def create_app(
         if embedder is _SENTINEL:
             configs = {repo_path: resolve_config(repo_path) for repo_path in repo_paths}
             auto_embed_enabled = {
-                repo_path: config.embed_enabled
-                for repo_path, config in configs.items()
+                repo_path: config.embed_enabled for repo_path, config in configs.items()
             }
             enabled_configs = [
                 config for config in configs.values() if config.embed_enabled
