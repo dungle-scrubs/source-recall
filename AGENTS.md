@@ -76,6 +76,11 @@ change the format without migrating existing indexes.
    from `tree_sitter_language_pack`
 5. If error-node density exceeds 10%, the file falls
    back to text chunking automatically
+6. Compound extensions (`.blade.php`) cannot go in the
+   extension table: `Path.suffix` only yields `.php`.
+   They are matched by `_is_blade`-style basename checks
+   that run *before* the extension dispatch, or the more
+   specific type silently loses to the shorter suffix.
 
 ## `docs/history/critiques/` is design rationale, not code
 

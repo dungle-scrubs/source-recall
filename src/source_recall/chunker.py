@@ -1,10 +1,11 @@
-"""Tree-sitter chunking for TS/Python, regex for Bash, text fallback."""
+"""Tree-sitter chunking for TS/Python/PHP/Vue, regex for Bash/Blade, text fallback."""
 
 from __future__ import annotations
 
 import bisect
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +25,10 @@ if TYPE_CHECKING:
 # File extensions mapped to their language key.
 _TS_EXTENSIONS = frozenset({".ts", ".tsx", ".js", ".jsx"})
 _PY_EXTENSIONS = frozenset({".py"})
+_PHP_EXTENSIONS = frozenset({".php", ".phtml"})
+_VUE_EXTENSIONS = frozenset({".vue"})
+# Compound extension - see ``_is_blade``.
+_BLADE_SUFFIX = ".blade.php"
 _BASH_EXTENSIONS = frozenset({".sh", ".bash"})
 _MARKDOWN_EXTENSIONS = frozenset({".md", ".mdx", ".markdown"})
 _TEXT_EXTENSIONS = frozenset({".txt", ".text", ".rst", ".log"})
@@ -54,12 +59,23 @@ def chunk_file(
     @param max_chars: Character threshold for sub-chunking.
     @returns: Tuple of (chunks, search_quality used).
     """
+    # Blade must be tested before the extension table: ``Path.suffix`` of
+    # ``foo.blade.php`` is ``.php``, so a plain extension lookup would hand
+    # Blade templates to the PHP grammar, which sees the whole template as
+    # one opaque ``text`` node and produces a single file-sized chunk.
+    if _is_blade(file_path):
+        return _chunk_blade(file_path, content, max_chars)
+
     ext = _get_extension(file_path)
 
     if ext in _TS_EXTENSIONS:
         return _chunk_typescript(file_path, content, max_chars)
     if ext in _PY_EXTENSIONS:
         return _chunk_python(file_path, content, max_chars)
+    if ext in _PHP_EXTENSIONS:
+        return _chunk_php(file_path, content, max_chars)
+    if ext in _VUE_EXTENSIONS:
+        return _chunk_vue(file_path, content, max_chars)
     if ext in _BASH_EXTENSIONS:
         return _chunk_bash_regex(file_path, content, max_chars)
     if ext in _MARKDOWN_EXTENSIONS:
@@ -86,10 +102,16 @@ def chunk_file_with_refs(
     ext = _get_extension(file_path)
 
     refs: list[RefData] = []
-    if ext in _PY_EXTENSIONS:
+    if _is_blade(file_path):
+        refs = []
+    elif ext in _PY_EXTENSIONS:
         refs = _extract_python_refs(chunks, content)
-    elif ext in _TS_EXTENSIONS:
+    elif ext in _TS_EXTENSIONS or ext in _VUE_EXTENSIONS:
+        # A Vue SFC's imports live in its ``<script>`` block; the line index
+        # built over the SFC's chunks maps them to the right script chunk.
         refs = _extract_ts_refs(chunks, content)
+    elif ext in _PHP_EXTENSIONS:
+        refs = _extract_php_refs(chunks, content)
 
     return chunks, quality, refs
 
@@ -132,7 +154,23 @@ def _chunk_typescript(
     """
     ext = _get_extension(file_path)
     lang = "tsx" if ext in {".tsx", ".jsx"} else "typescript"
+    return _chunk_ts_source(file_path, content, max_chars, lang)
 
+
+def _chunk_ts_source(
+    file_path: str, content: str, max_chars: int, lang: str
+) -> tuple[list[ChunkData], SearchQuality]:
+    """Chunk a TypeScript/JavaScript source string with an explicit grammar.
+
+    Split out from ``_chunk_typescript`` so a Vue SFC's ``<script>`` body,
+    which has no extension of its own, can go through the same strategy.
+
+    @param file_path: Repo-relative path (used for symbol classification).
+    @param content: Source text to chunk.
+    @param max_chars: Sub-chunk threshold.
+    @param lang: tree-sitter language key.
+    @returns: (chunks, quality).
+    """
     tree, quality = _parse_with_fallback(file_path, content, lang)
     if quality == SearchQuality.TEXT_FALLBACK:
         return _chunk_text_fallback(file_path, content, max_chars)
@@ -736,6 +774,1032 @@ def _build_py_class_shell(node: Node, body: Node, content: str) -> str:
             shell_parts.extend(lines[child.start_point[0] : child.end_point[0] + 1])
 
     return "\n".join(shell_parts)
+
+
+# ---------------------------------------------------------------------------
+# PHP chunking
+# ---------------------------------------------------------------------------
+
+# Type declarations that get the shell + members treatment.
+_PHP_TYPE_DECLARATIONS: dict[str, SymbolType] = {
+    "class_declaration": SymbolType.CLASS,
+    "interface_declaration": SymbolType.INTERFACE,
+    "trait_declaration": SymbolType.TRAIT,
+    "enum_declaration": SymbolType.ENUM,
+}
+
+# Members of a declaration_list that become their own chunk.  Everything
+# else (properties, constants, `use` of traits, enum cases) stays in the
+# shell so the class-level context travels with the signature.
+_PHP_MEMBER_TYPES = frozenset({"method_declaration"})
+
+# Top-level nodes that end the file preamble.
+_PHP_TOP_LEVEL_DEFS = frozenset(_PHP_TYPE_DECLARATIONS) | {"function_definition"}
+
+# Inline HTML the PHP grammar hands back verbatim in mixed template files.
+_PHP_TEXT_TYPES = frozenset({"text", "text_interpolation"})
+
+
+def _chunk_php(
+    file_path: str, content: str, max_chars: int
+) -> tuple[list[ChunkData], SearchQuality]:
+    """Chunk PHP via tree-sitter.
+
+    Mirrors the Python strategy: a preamble chunk for the namespace and
+    ``use`` imports, one chunk per top-level function, and one shell plus
+    one chunk per method for each class/interface/trait/enum.  Method
+    bodies are always emitted whole - a method is only ever split by the
+    shared ``_add_chunk`` sub-chunker, never at an arbitrary boundary.
+
+    Files that mix HTML and PHP parse fine: the grammar exposes the
+    inline markup as ``text`` / ``text_interpolation`` nodes, which become
+    their own block chunks alongside the real declarations.
+
+    @param file_path: Repo-relative path.
+    @param content: File content.
+    @param max_chars: Sub-chunk threshold.
+    @returns: (chunks, quality).
+    """
+    tree, quality = _parse_with_fallback(file_path, content, "php")
+    if quality == SearchQuality.TEXT_FALLBACK:
+        return _chunk_text_fallback(file_path, content, max_chars)
+
+    root = tree.root_node
+    chunks: list[ChunkData] = []
+
+    # Preamble: `<?php`, declare(), namespace, and the `use` imports that
+    # precede the first definition.  Keeping them in their own chunk stops
+    # imports being mis-attributed to whichever symbol happens to be first.
+    first_def_line = _php_first_definition_line(root)
+    preamble_end = first_def_line or 0
+    if preamble_end > 0:
+        preamble = "\n".join(content.split("\n")[:preamble_end]).strip()
+        if len(preamble) > 20:
+            _add_chunk(
+                chunks,
+                file_path,
+                "",
+                SymbolType.MODULE,
+                preamble,
+                1,
+                preamble_end,
+                SearchQuality.AST,
+                max_chars,
+            )
+
+    for node, doc in _php_iter_with_docblocks(root):
+        # Nodes already covered verbatim by the preamble chunk.
+        if node.start_point[0] < preamble_end:
+            continue
+        _php_process_node(node, doc, file_path, content, max_chars, chunks)
+
+    if not chunks:
+        return _chunk_text_fallback(file_path, content, max_chars)
+
+    return chunks, SearchQuality.AST
+
+
+def _php_first_definition_line(root: Node) -> int | None:
+    """Find the 0-indexed line where the first PHP definition starts.
+
+    Includes a leading docblock so the preamble stops before it.
+
+    @param root: program node.
+    @returns: 0-indexed line, or None if the file has no definitions.
+    """
+    pending_doc: Node | None = None
+    for node in root.children:
+        if not node.is_named:
+            continue
+        if node.type == "comment":
+            pending_doc = node
+            continue
+        if node.type in _PHP_TOP_LEVEL_DEFS:
+            start = pending_doc if pending_doc is not None else node
+            return start.start_point[0]
+        pending_doc = None
+    return None
+
+
+def _php_iter_with_docblocks(parent: Node) -> Iterator[tuple[Node, Node | None]]:
+    """Yield each named child of ``parent`` with its preceding comment.
+
+    PHP attaches documentation as a sibling ``comment`` node rather than
+    nesting it (unlike a Python docstring or a decorated definition), so
+    the docblock has to be re-associated here or it would land in the
+    wrong chunk.
+
+    @param parent: Node whose children to walk.
+    @returns: Iterator of (node, docblock-or-None) pairs.
+    """
+    pending_doc: Node | None = None
+    for node in parent.children:
+        if not node.is_named:
+            continue
+        if node.type == "comment":
+            pending_doc = node
+            continue
+        yield node, pending_doc
+        pending_doc = None
+
+
+def _php_span(node: Node, doc: Node | None) -> tuple[int, int]:
+    """Return the (start_byte, 0-indexed start line) covering an optional doc.
+
+    @param node: The declaration node.
+    @param doc: Preceding docblock comment, if any.
+    @returns: (start_byte, start_line).
+    """
+    if doc is None:
+        return node.start_byte, node.start_point[0]
+    return doc.start_byte, doc.start_point[0]
+
+
+def _php_process_node(
+    node: Node,
+    doc: Node | None,
+    file_path: str,
+    content: str,
+    max_chars: int,
+    chunks: list[ChunkData],
+) -> None:
+    """Process a single top-level PHP node into chunks.
+
+    @param node: The top-level node.
+    @param doc: Preceding docblock comment, if any.
+    @param file_path: Repo-relative path.
+    @param content: Full file content.
+    @param max_chars: Sub-chunk threshold.
+    @param chunks: Accumulator.
+    """
+    start_byte, start_line = _php_span(node, doc)
+    text = _byte_slice(content, start_byte, node.end_byte)
+    end_line = node.end_point[0] + 1
+
+    if node.type in _PHP_TYPE_DECLARATIONS:
+        _php_chunk_type_declaration(node, doc, file_path, content, max_chars, chunks)
+        return
+
+    if node.type == "function_definition":
+        _add_chunk(
+            chunks,
+            file_path,
+            _php_get_name(node),
+            SymbolType.FUNCTION,
+            text,
+            start_line + 1,
+            end_line,
+            SearchQuality.AST,
+            max_chars,
+        )
+        return
+
+    if node.type in _PHP_TEXT_TYPES or len(text.strip()) > 20:
+        # Inline HTML and top-level statements in script-style / mixed
+        # template files.  Trivial one-liners are dropped as noise.
+        stripped = text.strip()
+        if stripped:
+            _add_chunk(
+                chunks,
+                file_path,
+                "",
+                SymbolType.BLOCK,
+                stripped,
+                start_line + 1,
+                end_line,
+                SearchQuality.AST,
+                max_chars,
+            )
+
+
+def _php_chunk_type_declaration(
+    node: Node,
+    doc: Node | None,
+    file_path: str,
+    content: str,
+    max_chars: int,
+    chunks: list[ChunkData],
+) -> None:
+    """Chunk a class/interface/trait/enum into a shell plus its methods.
+
+    @param node: The declaration node.
+    @param doc: Preceding docblock comment, if any.
+    @param file_path: Repo-relative path.
+    @param content: Full file content.
+    @param max_chars: Sub-chunk threshold.
+    @param chunks: Accumulator.
+    """
+    type_name = _php_get_name(node)
+    start_byte, start_line = _php_span(node, doc)
+    body = _php_body(node)
+
+    if body is None:
+        _add_chunk(
+            chunks,
+            file_path,
+            type_name,
+            _PHP_TYPE_DECLARATIONS[node.type],
+            _byte_slice(content, start_byte, node.end_byte),
+            start_line + 1,
+            node.end_point[0] + 1,
+            SearchQuality.AST,
+            max_chars,
+        )
+        return
+
+    shell = _build_php_type_shell(body, content, start_line)
+    if shell.strip():
+        # A class shell is the established CLASS_SHELL type; interfaces,
+        # traits and enums keep their own type so a symbol search can tell
+        # them apart from the classes that use them.
+        shell_type = (
+            SymbolType.CLASS_SHELL
+            if node.type == "class_declaration"
+            else _PHP_TYPE_DECLARATIONS[node.type]
+        )
+        _add_chunk(
+            chunks,
+            file_path,
+            type_name,
+            shell_type,
+            shell,
+            start_line + 1,
+            node.end_point[0] + 1,
+            SearchQuality.AST,
+            max_chars,
+        )
+
+    for member, member_doc in _php_iter_with_docblocks(body):
+        if member.type not in _PHP_MEMBER_TYPES:
+            continue
+        member_start_byte, member_start_line = _php_span(member, member_doc)
+        method_name = _php_get_name(member)
+        full_name = f"{type_name}.{method_name}" if method_name else type_name
+        _add_chunk(
+            chunks,
+            file_path,
+            full_name,
+            SymbolType.METHOD,
+            _byte_slice(content, member_start_byte, member.end_byte),
+            member_start_line + 1,
+            member.end_point[0] + 1,
+            SearchQuality.AST,
+            max_chars,
+        )
+
+
+def _php_body(node: Node) -> Node | None:
+    """Find the member list of a PHP type declaration.
+
+    Classes, interfaces and traits expose a ``declaration_list``; enums
+    expose an ``enum_declaration_list``.  Neither is reachable through a
+    consistent field name across the grammar's rules.
+
+    @param node: The declaration node.
+    @returns: The member-list node, or None.
+    """
+    body = node.child_by_field_name("body")
+    if body is not None:
+        return body
+    for child in node.children:
+        if child.type.endswith("declaration_list"):
+            return child
+    return None
+
+
+def _build_php_type_shell(body: Node, content: str, start_line: int) -> str:
+    """Build a PHP type shell: docblock + signature + non-method members.
+
+    @param body: The member-list node.
+    @param content: Full file content.
+    @param start_line: 0-indexed line where the declaration (or its
+        docblock) starts.
+    @returns: Shell text.
+    """
+    lines = content.split("\n")
+    body_start = body.start_point[0]
+    shell_parts = lines[start_line : body_start + 1]
+
+    for child in body.named_children:
+        if child.type in _PHP_MEMBER_TYPES:
+            continue
+        shell_parts.extend(lines[child.start_point[0] : child.end_point[0] + 1])
+
+    shell_parts.append("}")
+    return "\n".join(shell_parts)
+
+
+def _php_get_name(node: Node) -> str:
+    """Extract the name from a PHP declaration node.
+
+    @param node: tree-sitter Node.
+    @returns: Name string (empty if not found).
+    """
+    name_node = node.child_by_field_name("name")
+    if name_node is not None:
+        return (name_node.text or b"").decode("utf-8", errors="replace")
+    for child in node.children:
+        if child.type == "name":
+            return (child.text or b"").decode("utf-8", errors="replace")
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Vue single-file-component chunking
+# ---------------------------------------------------------------------------
+#
+# tree-sitter-language-pack 0.13.0 does ship a `vue` grammar, and it gives
+# exactly the top-level split an SFC needs: `template_element`,
+# `script_element` and `style_element`, with the script body exposed as an
+# unparsed `raw_text` node.  That last part is what makes the delegation
+# work: the script text is handed to the existing TypeScript strategy, so
+# `<script setup>` produces the same function/interface/class chunks a `.ts`
+# file would, and only the line numbers need rebasing onto the SFC.
+
+_VUE_ELEMENT_TYPES = frozenset({"element", "template_element"})
+
+# How deep to descend into an oversized template before handing the
+# remainder to the shared line-window sub-chunker.
+_VUE_MAX_DEPTH = 3
+
+
+def _chunk_vue(
+    file_path: str, content: str, max_chars: int
+) -> tuple[list[ChunkData], SearchQuality]:
+    """Chunk a Vue SFC by top-level block.
+
+    @param file_path: Repo-relative path.
+    @param content: SFC text.
+    @param max_chars: Sub-chunk threshold.
+    @returns: (chunks, quality).
+    """
+    tree, quality = _parse_with_fallback(file_path, content, "vue")
+    if quality == SearchQuality.TEXT_FALLBACK:
+        return _chunk_text_fallback(file_path, content, max_chars)
+
+    chunks: list[ChunkData] = []
+
+    for node in tree.root_node.children:
+        if not node.is_named:
+            continue
+        if node.type == "script_element":
+            _vue_chunk_script(node, file_path, content, max_chars, chunks)
+        elif node.type == "template_element":
+            _vue_emit_element(
+                node, file_path, content, max_chars, chunks, "template", 0
+            )
+        elif node.type == "style_element":
+            _vue_emit_element(node, file_path, content, max_chars, chunks, "style", 0)
+        elif node.type != "comment":
+            # Custom blocks (<i18n>, <docs>, …) and stray top-level markup.
+            _vue_emit_element(node, file_path, content, max_chars, chunks, "", 0)
+
+    if not chunks:
+        return _chunk_text_fallback(file_path, content, max_chars)
+
+    return chunks, SearchQuality.AST
+
+
+def _vue_chunk_script(
+    node: Node,
+    file_path: str,
+    content: str,
+    max_chars: int,
+    chunks: list[ChunkData],
+) -> None:
+    """Chunk a ``<script>`` block with the TypeScript strategy.
+
+    @param node: script_element node.
+    @param file_path: Repo-relative path.
+    @param content: Full SFC text.
+    @param max_chars: Sub-chunk threshold.
+    @param chunks: Accumulator.
+    """
+    raw = next((c for c in node.children if c.type == "raw_text"), None)
+
+    if raw is not None:
+        source = _node_text(raw, content)
+        # `raw_text` starts just past the `>` of the opening tag, so its
+        # 0-indexed row is the offset that rebases script-local line 1 onto
+        # the SFC.
+        sub_chunks, sub_quality = _chunk_ts_source(
+            file_path, source, max_chars, "typescript"
+        )
+        if sub_quality == SearchQuality.AST and sub_chunks:
+            chunks.extend(_rebase_chunks(sub_chunks, raw.start_point[0]))
+            return
+
+    # Empty, or too malformed for the TS grammar: keep the block whole.
+    _vue_emit_element(node, file_path, content, max_chars, chunks, "script", 0)
+
+
+def _rebase_chunks(chunks: list[ChunkData], line_offset: int) -> list[ChunkData]:
+    """Shift chunk line numbers onto the enclosing file.
+
+    @param chunks: Chunks whose lines are relative to an embedded block.
+    @param line_offset: Lines preceding the embedded block.
+    @returns: New chunks with absolute line numbers.
+    """
+    return [
+        ChunkData(
+            file_path=c.file_path,
+            symbol_name=c.symbol_name,
+            symbol_type=c.symbol_type,
+            content=c.content,
+            start_line=c.start_line + line_offset,
+            end_line=c.end_line + line_offset,
+            search_quality=c.search_quality,
+            parent_chunk_id=c.parent_chunk_id,
+            sub_chunk_index=c.sub_chunk_index,
+        )
+        for c in chunks
+    ]
+
+
+def _vue_emit_element(
+    node: Node,
+    file_path: str,
+    content: str,
+    max_chars: int,
+    chunks: list[ChunkData],
+    name: str,
+    depth: int,
+) -> None:
+    """Emit a chunk for a markup element, descending if it is oversized.
+
+    Descent splits at child-element boundaries, so a chunk never begins or
+    ends in the middle of a tag.
+
+    @param node: Element-ish node.
+    @param file_path: Repo-relative path.
+    @param content: Full SFC text.
+    @param max_chars: Sub-chunk threshold.
+    @param chunks: Accumulator.
+    @param name: Symbol name carried down from the enclosing block.
+    @param depth: Current recursion depth.
+    """
+    text = _node_text(node, content)
+    children = [c for c in node.named_children if c.type in _VUE_ELEMENT_TYPES]
+
+    if len(text) <= max_chars or depth >= _VUE_MAX_DEPTH or not children:
+        _add_chunk(
+            chunks,
+            file_path,
+            name,
+            SymbolType.BLOCK,
+            text.strip(),
+            node.start_point[0] + 1,
+            node.end_point[0] + 1,
+            SearchQuality.AST,
+            max_chars,
+        )
+        return
+
+    cursor_byte = node.start_byte
+    cursor_row = node.start_point[0]
+    for child in children:
+        _vue_emit_span(
+            content,
+            cursor_byte,
+            child.start_byte,
+            cursor_row,
+            file_path,
+            max_chars,
+            chunks,
+            name,
+        )
+        _vue_emit_element(child, file_path, content, max_chars, chunks, name, depth + 1)
+        cursor_byte = child.end_byte
+        cursor_row = child.end_point[0]
+
+    _vue_emit_span(
+        content,
+        cursor_byte,
+        node.end_byte,
+        cursor_row,
+        file_path,
+        max_chars,
+        chunks,
+        name,
+    )
+
+
+def _vue_emit_span(
+    content: str,
+    start_byte: int,
+    end_byte: int,
+    start_row: int,
+    file_path: str,
+    max_chars: int,
+    chunks: list[ChunkData],
+    name: str,
+) -> None:
+    """Emit a chunk for the markup between two child elements.
+
+    @param content: Full SFC text.
+    @param start_byte: Span start.
+    @param end_byte: Span end.
+    @param start_row: 0-indexed row containing ``start_byte``.
+    @param file_path: Repo-relative path.
+    @param max_chars: Sub-chunk threshold.
+    @param chunks: Accumulator.
+    @param name: Symbol name from the enclosing block.
+    """
+    if end_byte <= start_byte:
+        return
+    raw = _byte_slice(content, start_byte, end_byte)
+    text = raw.strip()
+    if not text:
+        return
+    lead = raw[: len(raw) - len(raw.lstrip())]
+    start_line = start_row + 1 + lead.count("\n")
+    _add_chunk(
+        chunks,
+        file_path,
+        name,
+        SymbolType.BLOCK,
+        text,
+        start_line,
+        start_line + text.count("\n"),
+        SearchQuality.AST,
+        max_chars,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Blade template chunking
+# ---------------------------------------------------------------------------
+#
+# tree-sitter-language-pack 0.13.0 ships no Blade grammar (checked against
+# its full 173-language list; it has `php`, `html`, `twig` and `vue`, but
+# nothing for Blade).  Neither neighbouring grammar is usable as a stand-in:
+#
+#   * `php` "succeeds" on any Blade file: everything outside `<?php` tags
+#     is a single opaque `text` node, so it reports zero parse errors while
+#     yielding one file-sized chunk.  That is worse than a real fallback
+#     because the error-density guard cannot detect it.
+#   * `html` chokes on Blade's control flow: directives routinely open a tag
+#     in one branch and close it in another.  Measured over the 82 Blade
+#     templates in a production Laravel app, 22 (27%) exceeded the chunker's
+#     10% error-node threshold, several above 95%.
+#
+# So Blade gets a structural directive scanner instead: Blade's own block
+# directives (`@section`/`@endsection`, `@push`, `@component`, `@if`, …) are
+# the boundaries an author already writes, and they nest properly.  The
+# scanner tracks that nesting, so a `@section` is chunked whole no matter how
+# much control flow it contains, and descends into a section only when the
+# section itself exceeds `max_chars`.  Quality is REGEX, matching the Bash
+# and Markdown strategies.
+
+_BLADE_COMMENT_RE = re.compile(r"\{\{--.*?--\}\}", re.DOTALL)
+
+# `(?<!@)` skips Blade's `@@` escape for a literal at-sign.
+_BLADE_DIRECTIVE_RE = re.compile(r"(?<!@)@(\w+)")
+
+# Opener directive (lowercased) -> the directives that close it.
+_BLADE_BLOCK_CLOSERS: dict[str, frozenset[str]] = {
+    "auth": frozenset({"endauth"}),
+    "can": frozenset({"endcan"}),
+    "canany": frozenset({"endcanany"}),
+    "cannot": frozenset({"endcannot"}),
+    "component": frozenset({"endcomponent"}),
+    "empty": frozenset({"endempty"}),
+    "env": frozenset({"endenv"}),
+    "error": frozenset({"enderror"}),
+    "for": frozenset({"endfor"}),
+    "foreach": frozenset({"endforeach"}),
+    "forelse": frozenset({"endforelse"}),
+    "fragment": frozenset({"endfragment"}),
+    "guest": frozenset({"endguest"}),
+    "hassection": frozenset({"endif"}),
+    "if": frozenset({"endif"}),
+    "isset": frozenset({"endisset"}),
+    "once": frozenset({"endonce"}),
+    "php": frozenset({"endphp"}),
+    "prepend": frozenset({"endprepend"}),
+    "prependonce": frozenset({"endprependonce"}),
+    "production": frozenset({"endproduction"}),
+    "push": frozenset({"endpush"}),
+    "pushonce": frozenset({"endpushonce"}),
+    "section": frozenset({"endsection", "show", "stop", "append", "overwrite"}),
+    "sectionmissing": frozenset({"endif"}),
+    "session": frozenset({"endsession"}),
+    "slot": frozenset({"endslot"}),
+    "switch": frozenset({"endswitch"}),
+    "unless": frozenset({"endunless"}),
+    "verbatim": frozenset({"endverbatim"}),
+    "while": frozenset({"endwhile"}),
+}
+
+# Directives whose first argument names the block, and which therefore make
+# a good symbol_name for retrieval (`@section('content')` -> section:content).
+_BLADE_NAMED_BLOCKS = frozenset(
+    {
+        "component",
+        "fragment",
+        "prepend",
+        "prependonce",
+        "push",
+        "pushonce",
+        "section",
+        "slot",
+    }
+)
+
+# Directives that take a *second* argument instead of a body, e.g.
+# `@section('title', 'Reviews')` or `@php($x = 1)`.  A top-level comma in
+# the argument list (or, for @php, any argument at all) means inline.
+_BLADE_INLINE_WHEN_TWO_ARGS = frozenset({"section", "slot"})
+
+# How deep to descend into an oversized block before handing the remainder
+# to the shared line-window sub-chunker.
+_BLADE_MAX_DEPTH = 3
+
+
+@dataclass(slots=True)
+class _BladeBlock:
+    """One Blade block directive and everything it encloses.
+
+    @param name: Lowercased directive name (``section``, ``if``, …).
+    @param label: Retrieval symbol name, or "" for unnamed control flow.
+    @param start: Character offset of the opening ``@``.
+    @param body_start: Character offset just past the opening directive.
+    @param end: Character offset just past the closing directive.
+    @param children: Nested blocks, in source order.
+    """
+
+    name: str
+    label: str
+    start: int
+    body_start: int
+    end: int
+    children: list[_BladeBlock]
+
+
+def _chunk_blade(
+    file_path: str, content: str, max_chars: int
+) -> tuple[list[ChunkData], SearchQuality]:
+    """Chunk a Blade template on its block-directive boundaries.
+
+    @param file_path: Repo-relative path.
+    @param content: Template text.
+    @param max_chars: Sub-chunk threshold.
+    @returns: (chunks, quality).
+    """
+    if not content.strip():
+        return [], SearchQuality.REGEX
+
+    blocks = _blade_parse_blocks(content)
+    line_of = _blade_line_indexer(content)
+
+    chunks: list[ChunkData] = []
+    _blade_emit(
+        blocks,
+        content,
+        0,
+        len(content),
+        file_path,
+        max_chars,
+        chunks,
+        line_of,
+        inherited_name="",
+        depth=0,
+    )
+
+    if not chunks:
+        return _chunk_text_fallback(file_path, content, max_chars)
+
+    return chunks, SearchQuality.REGEX
+
+
+def _blade_line_indexer(content: str) -> Any:
+    """Build an O(log n) character-offset → 1-indexed line lookup.
+
+    @param content: Full template text.
+    @returns: Callable mapping offset to line number.
+    """
+    newlines = [i for i, ch in enumerate(content) if ch == "\n"]
+
+    def _line_of(pos: int) -> int:
+        return bisect.bisect_left(newlines, pos) + 1
+
+    return _line_of
+
+
+def _blade_parse_blocks(content: str) -> list[_BladeBlock]:
+    """Parse a template into a tree of nested block directives.
+
+    Unbalanced templates are tolerated: a closer with no matching opener is
+    ignored, and blocks still open at EOF are closed there.
+
+    @param content: Template text.
+    @returns: Top-level blocks, in source order.
+    """
+    comment_spans = [(m.start(), m.end()) for m in _BLADE_COMMENT_RE.finditer(content)]
+    comment_starts = [s for s, _ in comment_spans]
+
+    def _in_comment(pos: int) -> bool:
+        idx = bisect.bisect_right(comment_starts, pos) - 1
+        if idx < 0:
+            return False
+        start, end = comment_spans[idx]
+        return start <= pos < end
+
+    roots: list[_BladeBlock] = []
+    stack: list[_BladeBlock] = []
+    pos = 0
+
+    while True:
+        match = _BLADE_DIRECTIVE_RE.search(content, pos)
+        if match is None:
+            break
+        pos = match.end()
+
+        if _in_comment(match.start()):
+            continue
+
+        raw_name = match.group(1)
+        name = raw_name.lower()
+        args, after = _blade_scan_args(content, match.end())
+
+        # `@verbatim` suppresses Blade parsing entirely; its body may hold
+        # literal directives that must not disturb the nesting.
+        if name == "verbatim":
+            close = content.find("@endverbatim", after)
+            end = len(content) if close < 0 else close + len("@endverbatim")
+            block = _BladeBlock("verbatim", "", match.start(), after, end, [])
+            (stack[-1].children if stack else roots).append(block)
+            pos = end
+            continue
+
+        closed = _blade_close(stack, name, after)
+        if closed:
+            continue
+
+        if not _blade_opens_block(name, args):
+            pos = after
+            continue
+
+        block = _BladeBlock(
+            name,
+            _blade_label(name, args),
+            match.start(),
+            after,
+            len(content),
+            [],
+        )
+        (stack[-1].children if stack else roots).append(block)
+        stack.append(block)
+        pos = after
+
+    return roots
+
+
+def _blade_close(stack: list[_BladeBlock], name: str, end: int) -> bool:
+    """Close the innermost open block that ``name`` terminates.
+
+    Blocks nested inside it are closed at the same offset, which recovers
+    the outer structure of a template with a stray unclosed directive.
+
+    @param stack: Open-block stack (mutated).
+    @param name: Lowercased directive name.
+    @param end: Character offset just past the closing directive.
+    @returns: True if ``name`` closed a block.
+    """
+    for depth in range(len(stack) - 1, -1, -1):
+        if name in _BLADE_BLOCK_CLOSERS.get(stack[depth].name, frozenset()):
+            for block in stack[depth:]:
+                block.end = end
+            del stack[depth:]
+            return True
+    return False
+
+
+def _blade_opens_block(name: str, args: str | None) -> bool:
+    """Decide whether a directive opens a body-bearing block.
+
+    @param name: Lowercased directive name.
+    @param args: Argument text, or None when the directive took no parens.
+    @returns: True if the directive opens a block.
+    """
+    if name not in _BLADE_BLOCK_CLOSERS:
+        return False
+    if name == "php":
+        # `@php($x = 1)` is a one-liner; only the bare form takes a body.
+        return args is None
+    if name == "empty":
+        # Bare `@empty` is the `@forelse` separator, not `@empty($x)`.
+        return args is not None
+    if name in _BLADE_INLINE_WHEN_TWO_ARGS and args is not None:
+        return not _blade_has_top_level_comma(args)
+    return True
+
+
+_BLADE_FIRST_ARG_RE = re.compile(r"^\s*['\"]([^'\"]*)['\"]")
+
+
+def _blade_label(name: str, args: str | None) -> str:
+    """Build the retrieval symbol name for a block directive.
+
+    Control-flow blocks deliberately get no name: an index full of chunks
+    called "if" would pollute symbol lookup.
+
+    @param name: Lowercased directive name.
+    @param args: Argument text, or None.
+    @returns: Symbol name, or "" for unnamed blocks.
+    """
+    if name not in _BLADE_NAMED_BLOCKS or not args:
+        return ""
+    match = _BLADE_FIRST_ARG_RE.match(args)
+    if match is None:
+        return ""
+    return f"{name}:{match.group(1)}"
+
+
+def _blade_scan_args(content: str, pos: int) -> tuple[str | None, int]:
+    """Read a directive's parenthesised argument list, if present.
+
+    @param content: Template text.
+    @param pos: Offset just past the directive name.
+    @returns: (argument text or None, offset just past the directive).
+    """
+    i = pos
+    while i < len(content) and content[i] in " \t":
+        i += 1
+    if i >= len(content) or content[i] != "(":
+        return None, pos
+
+    depth = 0
+    quote: str | None = None
+    j = i
+    while j < len(content):
+        ch = content[j]
+        if quote is not None:
+            if ch == "\\":
+                j += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return content[i + 1 : j], j + 1
+        j += 1
+
+    # Unterminated argument list - treat the directive as argument-less.
+    return None, pos
+
+
+def _blade_has_top_level_comma(args: str) -> bool:
+    """Check for a comma outside any nested quotes/brackets.
+
+    @param args: Argument text.
+    @returns: True if the directive received more than one argument.
+    """
+    depth = 0
+    quote: str | None = None
+    i = 0
+    while i < len(args):
+        ch = args[i]
+        if quote is not None:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            return True
+        i += 1
+    return False
+
+
+def _blade_emit(
+    blocks: list[_BladeBlock],
+    content: str,
+    lo: int,
+    hi: int,
+    file_path: str,
+    max_chars: int,
+    chunks: list[ChunkData],
+    line_of: Any,
+    *,
+    inherited_name: str,
+    depth: int,
+) -> None:
+    """Emit chunks for the span ``[lo, hi)``, splitting at ``blocks``.
+
+    @param blocks: Blocks contained directly in this span.
+    @param content: Template text.
+    @param lo: Span start offset.
+    @param hi: Span end offset.
+    @param file_path: Repo-relative path.
+    @param max_chars: Sub-chunk threshold.
+    @param chunks: Accumulator.
+    @param line_of: Offset → line lookup.
+    @param inherited_name: Symbol name carried down from an enclosing
+        named block, so markup inside `@section('content')` is still
+        attributed to that section.
+    @param depth: Current recursion depth.
+    """
+    cursor = lo
+    for block in blocks:
+        _blade_emit_markup(
+            content,
+            cursor,
+            block.start,
+            file_path,
+            max_chars,
+            chunks,
+            line_of,
+            inherited_name,
+        )
+        cursor = block.end
+
+        text = content[block.start : block.end]
+        name = block.label or inherited_name
+        if len(text) <= max_chars or depth >= _BLADE_MAX_DEPTH or not block.children:
+            _add_chunk(
+                chunks,
+                file_path,
+                name,
+                SymbolType.MODULE if block.label else SymbolType.BLOCK,
+                text.strip(),
+                line_of(block.start),
+                line_of(block.end),
+                SearchQuality.REGEX,
+                max_chars,
+            )
+            continue
+
+        # Oversized block with structure inside it: descend.  The opening
+        # and closing directives fall into the surrounding markup runs, so
+        # no source text is dropped.
+        _blade_emit(
+            block.children,
+            content,
+            block.start,
+            block.end,
+            file_path,
+            max_chars,
+            chunks,
+            line_of,
+            inherited_name=name,
+            depth=depth + 1,
+        )
+
+    _blade_emit_markup(
+        content, cursor, hi, file_path, max_chars, chunks, line_of, inherited_name
+    )
+
+
+def _blade_emit_markup(
+    content: str,
+    lo: int,
+    hi: int,
+    file_path: str,
+    max_chars: int,
+    chunks: list[ChunkData],
+    line_of: Any,
+    inherited_name: str,
+) -> None:
+    """Emit a chunk for a run of markup between block directives.
+
+    @param content: Template text.
+    @param lo: Span start offset.
+    @param hi: Span end offset.
+    @param file_path: Repo-relative path.
+    @param max_chars: Sub-chunk threshold.
+    @param chunks: Accumulator.
+    @param line_of: Offset → line lookup.
+    @param inherited_name: Symbol name from the enclosing named block.
+    """
+    if hi <= lo:
+        return
+    text = content[lo:hi].strip()
+    if not text:
+        return
+    offset = lo + (len(content[lo:hi]) - len(content[lo:hi].lstrip()))
+    _add_chunk(
+        chunks,
+        file_path,
+        inherited_name,
+        SymbolType.BLOCK,
+        text,
+        line_of(offset),
+        line_of(offset) + text.count("\n"),
+        SearchQuality.REGEX,
+        max_chars,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1607,6 +2671,19 @@ def _get_extension(file_path: str) -> str:
     return Path(file_path).suffix.lower()
 
 
+def _is_blade(file_path: str) -> bool:
+    """Check whether a path is a Blade template.
+
+    ``Path.suffix`` cannot express a compound extension, so Blade has to
+    be matched on the full basename.  Without this, ``.blade.php`` would
+    collide with plain ``.php`` and be routed to the PHP grammar.
+
+    @param file_path: File path.
+    @returns: True if the file is a ``.blade.php`` template.
+    """
+    return Path(file_path).name.lower().endswith(_BLADE_SUFFIX)
+
+
 def _build_line_index(
     chunks: list[ChunkData],
 ) -> Any:
@@ -1701,6 +2778,50 @@ def _extract_python_refs(chunks: list[ChunkData], content: str) -> list[RefData]
         cid = _chunk_for_line(line)
         if cid:
             refs.append(RefData(cid, m.group(1), RefType.DECORATOR))
+
+    return refs
+
+
+# PHP patterns
+_PHP_USE_RE = re.compile(
+    r"^\s*use\s+(?:function\s+|const\s+)?([\w\\]+)(?:\s+as\s+\w+)?\s*;", re.MULTILINE
+)
+_PHP_EXTENDS_RE = re.compile(
+    r"\b(?:class|interface)\s+\w+\s+extends\s+([\w\\,\s]+?)\s*(?:\{|implements\b)"
+)
+_PHP_IMPLEMENTS_RE = re.compile(r"\bimplements\s+([\w\\,\s]+?)\s*\{")
+
+
+def _extract_php_refs(chunks: list[ChunkData], content: str) -> list[RefData]:
+    """Extract cross-references from PHP source.
+
+    ``use`` statements are the import graph a Laravel codebase actually
+    navigates by; ``extends`` / ``implements`` give the inheritance edges
+    that connect a controller or model to its framework base class.
+
+    @param chunks: Chunks produced from this file.
+    @param content: Full file content.
+    @returns: List of RefData.
+    """
+    refs: list[RefData] = []
+    _chunk_for_line = _build_line_index(chunks)
+
+    for m in _PHP_USE_RE.finditer(content):
+        line = content[: m.start()].count("\n") + 1
+        cid = _chunk_for_line(line)
+        if cid:
+            refs.append(RefData(cid, m.group(1).lstrip("\\"), RefType.IMPORT))
+
+    for pattern in (_PHP_EXTENDS_RE, _PHP_IMPLEMENTS_RE):
+        for m in pattern.finditer(content):
+            line = content[: m.start()].count("\n") + 1
+            cid = _chunk_for_line(line)
+            if not cid:
+                continue
+            for base in m.group(1).split(","):
+                name = base.strip().lstrip("\\")
+                if name:
+                    refs.append(RefData(cid, name, RefType.INHERITS))
 
     return refs
 

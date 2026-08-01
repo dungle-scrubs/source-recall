@@ -161,6 +161,9 @@ Default excludes: `node_modules/`, `dist/`, `build/`, `.git/`,
 |------|----------|------------|
 | Python | tree-sitter AST | `.py` |
 | TypeScript/JavaScript | tree-sitter AST | `.ts`, `.tsx`, `.js`, `.jsx` |
+| PHP | tree-sitter AST | `.php`, `.phtml` |
+| Vue SFC | tree-sitter AST per block; `<script>` via the TS strategy | `.vue` |
+| Blade | Block-directive boundaries (`@section`, `@push`, …) | `.blade.php` |
 | Bash | Regex (function boundaries) | `.sh`, `.bash` |
 | Markdown | Heading-based sections | `.md`, `.mdx`, `.markdown` |
 | PDF | Page-level text extraction (pymupdf) | `.pdf` |

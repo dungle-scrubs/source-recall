@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from source_recall.chunker import _split_into_sub_chunks, chunk_file
-from source_recall.models import SearchQuality, SymbolType
+from source_recall.chunker import (
+    _is_blade,
+    _split_into_sub_chunks,
+    chunk_file,
+    chunk_file_with_refs,
+)
+from source_recall.models import RefType, SearchQuality, SymbolType
 
 
 class TestTypeScriptChunking:
@@ -323,6 +328,358 @@ class TestParserCache:
         py = _get_cached_parser("python")
         ts = _get_cached_parser("typescript")
         assert py is not ts
+
+
+def _braces_balanced(text: str) -> bool:
+    """Whether a chunk contains as many closing braces as opening ones.
+
+    A cheap stand-in for "the function body was not cut in half": every
+    fixture used here keeps braces out of string literals.
+    """
+    return text.count("{") == text.count("}")
+
+
+class TestPhpChunking:
+    def test_class_is_split_into_shell_and_methods(
+        self, laravel_app_path: Path
+    ) -> None:
+        """A namespaced Laravel controller yields a class shell + methods."""
+        path = laravel_app_path / "app/Http/Controllers/ReviewController.php"
+        chunks, quality = chunk_file(
+            "app/Http/Controllers/ReviewController.php", path.read_text()
+        )
+
+        assert quality == SearchQuality.AST
+        names = {c.symbol_name for c in chunks}
+        assert "ReviewController" in names
+        assert "ReviewController.index" in names
+        assert "ReviewController.approve" in names
+        assert "ReviewController.cacheKey" in names
+
+        shell = next(c for c in chunks if c.symbol_type == SymbolType.CLASS_SHELL)
+        assert shell.symbol_name == "ReviewController"
+
+    def test_no_chunk_splits_a_method_body(self, laravel_app_path: Path) -> None:
+        """Every method arrives whole, never cut across two chunks."""
+        path = laravel_app_path / "app/Http/Controllers/ReviewController.php"
+        chunks, _ = chunk_file(
+            "app/Http/Controllers/ReviewController.php", path.read_text()
+        )
+
+        methods = [c for c in chunks if c.symbol_type == SymbolType.METHOD]
+        assert len(methods) == 5
+        for method in methods:
+            assert method.parent_chunk_id is None, "method was sub-chunked"
+            assert _braces_balanced(method.content)
+            assert method.content.rstrip().endswith("}")
+
+    def test_docblock_travels_with_its_method(self, laravel_app_path: Path) -> None:
+        """PHP hangs docblocks off a sibling comment node; re-attach them."""
+        path = laravel_app_path / "app/Http/Controllers/ReviewController.php"
+        chunks, _ = chunk_file(
+            "app/Http/Controllers/ReviewController.php", path.read_text()
+        )
+
+        index = next(c for c in chunks if c.symbol_name == "ReviewController.index")
+        assert index.content.lstrip().startswith("/**")
+        assert "@return JsonResponse" in index.content
+
+    def test_preamble_holds_namespace_and_imports(self, laravel_app_path: Path) -> None:
+        """Imports get their own chunk, not the first symbol's."""
+        path = laravel_app_path / "app/Http/Controllers/ReviewController.php"
+        chunks, _ = chunk_file(
+            "app/Http/Controllers/ReviewController.php", path.read_text()
+        )
+
+        preamble = chunks[0]
+        assert preamble.symbol_type == SymbolType.MODULE
+        assert "namespace App\\Http\\Controllers;" in preamble.content
+        assert "use App\\Models\\Review;" in preamble.content
+        # And it is not duplicated into per-statement chunks.
+        assert sum("namespace App" in c.content for c in chunks) == 1
+
+    def test_interface_trait_and_enum_keep_their_kind(
+        self, laravel_app_path: Path
+    ) -> None:
+        """Non-class declarations are not flattened into CLASS_SHELL."""
+        path = laravel_app_path / "app/Models/Review.php"
+        chunks, quality = chunk_file("app/Models/Review.php", path.read_text())
+
+        assert quality == SearchQuality.AST
+        by_name = {c.symbol_name: c for c in chunks}
+        assert by_name["Moderatable"].symbol_type == SymbolType.INTERFACE
+        assert by_name["RecordsModeration"].symbol_type == SymbolType.TRAIT
+        assert by_name["ReviewStatus"].symbol_type == SymbolType.ENUM
+        assert by_name["Review"].symbol_type == SymbolType.CLASS_SHELL
+        assert by_name["normalizeRating"].symbol_type == SymbolType.FUNCTION
+
+    def test_mixed_html_and_php_is_handled(self, laravel_app_path: Path) -> None:
+        """A template-style .php file still yields whole functions."""
+        path = laravel_app_path / "public/legacy-report.php"
+        chunks, quality = chunk_file("public/legacy-report.php", path.read_text())
+
+        assert quality == SearchQuality.AST
+        fn = next(c for c in chunks if c.symbol_name == "formatRow")
+        assert fn.symbol_type == SymbolType.FUNCTION
+        assert _braces_balanced(fn.content)
+        assert "return sprintf" in fn.content
+        # The surrounding HTML is indexed too, as block chunks.
+        assert any("<table>" in c.content for c in chunks)
+
+    def test_php_refs_are_extracted(self, laravel_app_path: Path) -> None:
+        """`use` imports and `extends` become graph edges."""
+        path = laravel_app_path / "app/Http/Controllers/ReviewController.php"
+        _, _, refs = chunk_file_with_refs(
+            "app/Http/Controllers/ReviewController.php", path.read_text()
+        )
+
+        targets = {(r.target_symbol, r.ref_type) for r in refs}
+        assert ("App\\Models\\Review", RefType.IMPORT) in targets
+        assert ("Controller", RefType.INHERITS) in targets
+
+    def test_non_ascii_php_keeps_method_text_aligned(self) -> None:
+        """Byte-offset slicing holds for the PHP grammar too."""
+        code = (
+            "<?php\n"
+            "/** Résumé du contrôleur, accents non ASCII. */\n"
+            "class Café\n"
+            "{\n"
+            "    public function première(): string\n"
+            "    {\n"
+            "        return 'naïve';\n"
+            "    }\n"
+            "}\n"
+        )
+        chunks, quality = chunk_file("Cafe.php", code)
+
+        assert quality == SearchQuality.AST
+        method = next(c for c in chunks if c.symbol_name == "Café.première")
+        assert method.content.startswith("public function première()")
+        assert method.content.rstrip().endswith("}")
+        assert "return 'naïve';" in method.content
+
+    def test_unparseable_php_falls_back(self) -> None:
+        """Error-dense input drops to text chunking, as for every grammar."""
+        code = "<?php\n" + ")))} ??? <<< ((( \n" * 40
+        _, quality = chunk_file("broken.php", code)
+        assert quality == SearchQuality.TEXT_FALLBACK
+
+
+class TestBladeChunking:
+    def test_blade_suffix_beats_php_extension(self, laravel_app_path: Path) -> None:
+        """`.blade.php` routes to the Blade strategy, not the PHP grammar.
+
+        The PHP grammar accepts a Blade template without errors - it just
+        sees one opaque ``text`` node - so a suffix collision would look
+        like a successful AST parse while producing a single file-sized
+        chunk.  REGEX quality is the observable proof Blade won.
+        """
+        path = laravel_app_path / "resources/views/reviews/index.blade.php"
+        chunks, quality = chunk_file(
+            "resources/views/reviews/index.blade.php", path.read_text()
+        )
+
+        assert quality == SearchQuality.REGEX
+        names = {c.symbol_name for c in chunks}
+        assert "section:content" in names
+        assert "push:scripts" in names
+
+    def test_is_blade_matches_only_the_compound_suffix(self) -> None:
+        """Routing predicate, independent of the chunking strategy."""
+        assert _is_blade("resources/views/home.blade.php") is True
+        assert _is_blade("resources/views/Home.Blade.PHP") is True
+        assert _is_blade("app/Models/User.php") is False
+        assert _is_blade("blade.php/app.py") is False
+
+    def test_section_body_is_one_chunk(self, laravel_app_path: Path) -> None:
+        """Nested control flow does not break a section apart."""
+        path = laravel_app_path / "resources/views/reviews/index.blade.php"
+        chunks, _ = chunk_file(
+            "resources/views/reviews/index.blade.php", path.read_text()
+        )
+
+        section = next(c for c in chunks if c.symbol_name == "section:content")
+        assert section.parent_chunk_id is None
+        assert section.content.startswith("@section('content')")
+        assert section.content.rstrip().endswith("@endsection")
+        # The whole @if/@else and its @foreach live inside that one chunk.
+        assert section.content.count("@foreach") == section.content.count("@endforeach")
+        assert section.content.count("@if") == section.content.count("@endif")
+
+    def test_directive_inside_a_blade_comment_is_ignored(
+        self, laravel_app_path: Path
+    ) -> None:
+        """`{{-- @section --}}` must not open a block."""
+        path = laravel_app_path / "resources/views/reviews/index.blade.php"
+        chunks, _ = chunk_file(
+            "resources/views/reviews/index.blade.php", path.read_text()
+        )
+
+        # The commented-out directive stays in the leading markup run, and
+        # only the two real named blocks are detected.
+        named = [c.symbol_name for c in chunks if c.symbol_name]
+        assert named == ["section:content", "push:scripts"]
+
+    def test_two_argument_section_is_inline(self, laravel_app_path: Path) -> None:
+        """`@section('title', 'Reviews')` has no body to chunk."""
+        path = laravel_app_path / "resources/views/reviews/index.blade.php"
+        chunks, _ = chunk_file(
+            "resources/views/reviews/index.blade.php", path.read_text()
+        )
+
+        assert not any(c.symbol_name == "section:title" for c in chunks)
+        assert any("@section('title', 'Reviews')" in c.content for c in chunks)
+
+    def test_escaped_at_sign_is_not_a_directive(self) -> None:
+        """`@@if` renders a literal `@if` and opens nothing."""
+        content = "<p>@@if is literal</p>\n@if ($x)\n<b>y</b>\n@endif\n"
+        chunks, _ = chunk_file("t.blade.php", content)
+
+        assert len(chunks) == 2
+        assert chunks[0].content == "<p>@@if is literal</p>"
+        assert chunks[1].content.startswith("@if ($x)")
+
+    def test_unclosed_directive_still_chunks(self) -> None:
+        """A malformed template closes open blocks at EOF instead of failing."""
+        content = "@section('a')\n<p>one</p>\n@section('b')\n<p>two</p>\n"
+        chunks, quality = chunk_file("t.blade.php", content)
+
+        assert quality == SearchQuality.REGEX
+        assert [c.symbol_name for c in chunks] == ["section:a"]
+
+    def test_oversized_section_splits_on_inner_directives(self) -> None:
+        """A section past max_chars descends to its nested blocks."""
+        filler = "        <p>row</p>\n" * 20
+        content = (
+            "@section('content')\n"
+            + filler
+            + "@foreach ($rows as $row)\n"
+            + filler
+            + "@endforeach\n"
+            + "@endsection\n"
+        )
+        chunks, _ = chunk_file("t.blade.php", content, max_chars=600)
+
+        # Every chunk is attributed to the section it came from, and the
+        # @foreach body was not cut mid-directive.
+        assert all(c.symbol_name == "section:content" for c in chunks)
+        foreach = next(c for c in chunks if c.content.startswith("@foreach"))
+        assert foreach.content.rstrip().endswith("@endforeach")
+
+    def test_beats_blank_line_splitting(self, laravel_app_path: Path) -> None:
+        """The Blade strategy is chosen over the text fallback."""
+        path = laravel_app_path / "resources/views/reviews/index.blade.php"
+        chunks, quality = chunk_file(
+            "resources/views/reviews/index.blade.php", path.read_text()
+        )
+
+        assert quality != SearchQuality.TEXT_FALLBACK
+        assert all(c.search_quality == SearchQuality.REGEX for c in chunks)
+
+    def test_blade_produces_no_refs(self, laravel_app_path: Path) -> None:
+        """Blade has no import syntax to mine; ref extraction stays quiet."""
+        path = laravel_app_path / "resources/views/reviews/index.blade.php"
+        _, _, refs = chunk_file_with_refs(
+            "resources/views/reviews/index.blade.php", path.read_text()
+        )
+        assert refs == []
+
+
+class TestVueChunking:
+    def test_sfc_blocks_and_script_symbols(self, laravel_app_path: Path) -> None:
+        """A Vue SFC splits by block, and `<script setup>` gets TS chunks."""
+        path = laravel_app_path / "resources/js/ReviewCard.vue"
+        chunks, quality = chunk_file("resources/js/ReviewCard.vue", path.read_text())
+
+        assert quality == SearchQuality.AST
+        names = {c.symbol_name for c in chunks}
+        assert "approve" in names
+        assert "reject" in names
+        assert "Review" in names
+        assert "template" in names
+        assert "style" in names
+
+    def test_script_chunks_match_typescript_quality(
+        self, laravel_app_path: Path
+    ) -> None:
+        """Script-block chunks carry the same types a .ts file would."""
+        path = laravel_app_path / "resources/js/ReviewCard.vue"
+        chunks, _ = chunk_file("resources/js/ReviewCard.vue", path.read_text())
+
+        by_name = {c.symbol_name: c for c in chunks}
+        assert by_name["Review"].symbol_type == SymbolType.INTERFACE
+        assert by_name["approve"].symbol_type == SymbolType.FUNCTION
+        assert by_name["canModerate"].symbol_type == SymbolType.FUNCTION
+        assert all(
+            c.search_quality == SearchQuality.AST
+            for c in (by_name["Review"], by_name["approve"])
+        )
+
+    def test_script_function_bodies_stay_whole(self, laravel_app_path: Path) -> None:
+        """No chunk boundary lands inside a function in the script block."""
+        path = laravel_app_path / "resources/js/ReviewCard.vue"
+        chunks, _ = chunk_file("resources/js/ReviewCard.vue", path.read_text())
+
+        approve = next(c for c in chunks if c.symbol_name == "approve")
+        assert approve.parent_chunk_id is None
+        assert _braces_balanced(approve.content)
+        assert "finally" in approve.content
+        assert approve.content.rstrip().endswith("}")
+
+    def test_script_line_numbers_are_rebased_onto_the_sfc(
+        self, laravel_app_path: Path
+    ) -> None:
+        """Script chunk lines point at the SFC, not at the script body."""
+        path = laravel_app_path / "resources/js/ReviewCard.vue"
+        source = path.read_text()
+        chunks, _ = chunk_file("resources/js/ReviewCard.vue", source)
+
+        lines = source.split("\n")
+        approve = next(c for c in chunks if c.symbol_name == "approve")
+        assert lines[approve.start_line - 1].startswith("async function approve")
+        assert lines[approve.end_line - 1] == "}"
+
+    def test_template_and_style_are_separate_blocks(
+        self, laravel_app_path: Path
+    ) -> None:
+        """The three SFC blocks do not bleed into each other."""
+        path = laravel_app_path / "resources/js/ReviewCard.vue"
+        chunks, _ = chunk_file("resources/js/ReviewCard.vue", path.read_text())
+
+        template = next(c for c in chunks if c.symbol_name == "template")
+        style = next(c for c in chunks if c.symbol_name == "style")
+        assert template.content.startswith("<template>")
+        assert template.content.rstrip().endswith("</template>")
+        assert "<script" not in template.content
+        assert style.content.startswith("<style scoped>")
+        assert "review-card__header" in style.content
+
+    def test_oversized_template_splits_on_element_boundaries(self) -> None:
+        """A big template descends into child elements, never mid-tag."""
+        row = '      <li class="row"><span>value</span></li>\n'
+        content = (
+            "<template>\n  <ul>\n"
+            + row * 60
+            + "  </ul>\n  <footer>done</footer>\n</template>\n"
+        )
+        chunks, quality = chunk_file("Big.vue", content, max_chars=800)
+
+        assert quality == SearchQuality.AST
+        assert len(chunks) > 1
+        for chunk in chunks:
+            if chunk.parent_chunk_id is None:
+                assert chunk.content.count("<li") == chunk.content.count("</li>")
+
+    def test_vue_script_imports_become_refs(self, laravel_app_path: Path) -> None:
+        """SFC imports are mined by the TypeScript ref extractor."""
+        path = laravel_app_path / "resources/js/ReviewCard.vue"
+        _, _, refs = chunk_file_with_refs(
+            "resources/js/ReviewCard.vue", path.read_text()
+        )
+
+        targets = {r.target_symbol for r in refs}
+        assert "computed" in targets
+        assert "StarRating" in targets
 
 
 class TestNodeTextByteOffsets:
