@@ -323,3 +323,41 @@ class TestParserCache:
         py = _get_cached_parser("python")
         ts = _get_cached_parser("typescript")
         assert py is not ts
+
+
+class TestNodeTextByteOffsets:
+    def test_non_ascii_python_does_not_shift_chunk_text(self) -> None:
+        """tree-sitter reports byte offsets; Python strings index code points.
+
+        Without decoding through UTF-8, every node after a multi-byte
+        character is sliced at the wrong place.
+        """
+        code = (
+            '"""Résumé du module, accents non ASCII."""\n'
+            "\n"
+            "class Café:\n"
+            "    def première(self) -> str:\n"
+            "        return 'naïve'\n"
+        )
+        chunks, quality = chunk_file("cafe.py", code)
+
+        assert quality == SearchQuality.AST
+        method = next(c for c in chunks if c.symbol_name == "Café.première")
+        assert method.content.startswith("def première(self)")
+        assert "return 'naïve'" in method.content
+
+    def test_non_ascii_typescript_does_not_shift_chunk_text(self) -> None:
+        """Same guard on the TS strategy, which slices the same way."""
+        code = (
+            "// Contrôleur, commentaire accentué\n"
+            "export function première(): string {\n"
+            "    return 'naïve'\n"
+            "}\n"
+        )
+        chunks, quality = chunk_file("cafe.ts", code)
+
+        assert quality == SearchQuality.AST
+        fn = next(c for c in chunks if c.symbol_name == "première")
+        assert fn.content.startswith("function première()")
+        assert "return 'naïve'" in fn.content
+        assert fn.content.rstrip().endswith("}")

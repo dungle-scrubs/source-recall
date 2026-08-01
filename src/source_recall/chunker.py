@@ -1431,6 +1431,44 @@ def _count_nodes(node: Node) -> tuple[int, int]:
     return total, errors
 
 
+def _byte_slice(content: str, start_byte: int, end_byte: int) -> str:
+    """Slice ``content`` by UTF-8 byte offsets.
+
+    tree-sitter reports byte offsets; Python strings index by code point.
+    The two agree only for pure-ASCII input, so anything else has to go
+    through the encoded form.
+
+    @param content: Full file content.
+    @param start_byte: Start offset in UTF-8 bytes.
+    @param end_byte: End offset in UTF-8 bytes.
+    @returns: The corresponding text.
+    """
+    if content.isascii():
+        return content[start_byte:end_byte]
+    return _encoded(content)[start_byte:end_byte].decode("utf-8", errors="replace")
+
+
+# One-entry cache: chunking a file makes many slices against the same
+# string object, and re-encoding per node would be quadratic.  Holding the
+# string keeps it alive, so an identity hit can never be a stale match.
+_encoded_cache: tuple[str, bytes] | None = None
+
+
+def _encoded(content: str) -> bytes:
+    """Return ``content`` UTF-8 encoded, reusing the last encoding.
+
+    @param content: Full file content.
+    @returns: UTF-8 bytes.
+    """
+    global _encoded_cache
+    cached = _encoded_cache
+    if cached is not None and cached[0] is content:
+        return cached[1]
+    data = content.encode("utf-8")
+    _encoded_cache = (content, data)
+    return data
+
+
 def _node_text(node: Node, content: str) -> str:
     """Extract the text of a node from the source content.
 
@@ -1438,7 +1476,7 @@ def _node_text(node: Node, content: str) -> str:
     @param content: Full file content.
     @returns: Text slice corresponding to the node.
     """
-    return content[node.start_byte : node.end_byte]
+    return _byte_slice(content, node.start_byte, node.end_byte)
 
 
 def _build_class_shell(node: Node, body: Node, content: str) -> str:
