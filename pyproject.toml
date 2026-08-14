@@ -60,7 +60,7 @@ embed = [
     # L5: Minor upgrades may change embedding behavior. Stored vectors
     # could become incompatible with new query vectors.  Consider
     # storing the library version in meta for compat checking.
-    "sentence-transformers>=3.0.0,<4.0.0",
+    "sentence-transformers>=3.0.0,<6.0.0",
     "onnxruntime>=1.18.0,<2.0.0",
     "einops>=0.8.0,<1.0.0",
 ]
