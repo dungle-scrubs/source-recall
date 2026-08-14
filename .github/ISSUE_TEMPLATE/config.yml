@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/dungle-scrubs/source-recall/security/advisories/new
+    about: Do not open a public issue for security vulnerabilities. Use a private advisory instead.
+  - name: Discussions / Questions
+    url: https://github.com/dungle-scrubs/source-recall/issues
+    about: Ask a question or start a discussion in Issues.
