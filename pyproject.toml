@@ -25,7 +25,7 @@ urls = { Homepage = "https://github.com/dungle-scrubs/source-recall", Repository
 dependencies = [
     # Pinned exactly — C ABI breaks across minor versions.
     # See AGENTS.md "tree-sitter pins are exact".
-    "tree-sitter==0.25.2",
+    "tree-sitter==0.26.0",
     "tree-sitter-language-pack==0.13.0",
     "typer>=0.15.0",
     "rich>=13.0.0",
@@ -33,7 +33,7 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     # L4: Pre-1.0 — vec0 virtual-table API may change.
     # Pinned exactly; monitor for 1.0 release.
-    "sqlite-vec==0.1.6",
+    "sqlite-vec==0.1.9",
     "fastapi>=0.115.0",
     "uvicorn>=0.32.0",
     # PDF parsing surface: pymupdf parses untrusted, attacker-controlled
