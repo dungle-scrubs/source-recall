@@ -88,3 +88,30 @@ The four markdown files in `docs/history/critiques/` document
 adversarial review of early design decisions. They drove
 the Phase 1 architecture. Read them before proposing
 structural changes.
+
+`docs/history/AUDIT_2026-09-05.md` is the most recent full
+audit: 85 findings across architecture, correctness,
+security, performance, and test integrity, plus 19 ranked
+design candidates. Read it before proposing a fix, so you
+know whether the problem is already recorded and how it was
+graded.
+
+## `docs/rfc/` is open work, not documentation
+
+Each file in `docs/rfc/` specifies one change that is agreed
+in shape but not yet built. Every RFC carries a `status`
+field. Anything not `Implemented` or `Withdrawn` is open.
+List them with:
+
+    grep -H '^status:' docs/rfc/*.rfc.md
+
+Open now: RFC-01, "Shared repo resolution and error
+contract" (Draft). It replaces the four copies of the
+repo-resolution ladder in `daemon.py` and `server.py` with
+one seam, and changes one client-visible status code. Five
+open questions must be answered before it moves to Accepted;
+two of them were decided by an agent and need confirmation.
+
+If you are asked what to work on next in this repo, this is
+it. Read the RFC before touching `_resolve_index` in either
+server, or before adding a repo-addressed endpoint.

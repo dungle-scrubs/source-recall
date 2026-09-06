@@ -11,3 +11,8 @@ historical reference material, not user documentation.
   narratives for the phased build.
 - `OPEN_SOURCE_READINESS.md` — the original release-readiness audit
   (superseded; kept for provenance).
+- `AUDIT_2026-09-05.md` — full audit of the codebase at `9e56235`:
+  85 findings across architecture, correctness, security, performance,
+  and test integrity, plus 19 ranked design candidates and the
+  AGENTS.md invariant checks. Current, not superseded. RFC-01 in
+  `docs/rfc/` answers one of its design candidates; the rest are open.
