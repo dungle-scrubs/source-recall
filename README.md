@@ -15,17 +15,20 @@ BM25 + vector search with reciprocal rank fusion.
 
 ## Install
 
-Full install (with vector search and reranking, ~2 GB model deps):
+From PyPI (the distribution is `dungle-scrubs-source-recall`):
+
+```bash
+# FTS-only: no model download, instant startup, keyword search only
+uv tool install dungle-scrubs-source-recall
+
+# Full: vector search and reranking, ~2 GB model deps
+uv tool install "dungle-scrubs-source-recall[embed]"
+```
+
+From a checkout (development):
 
 ```bash
 uv tool install -e .[embed]
-```
-
-FTS-only install (no model download, instant startup, keyword search
-only):
-
-```bash
-uv tool install -e .
 ```
 
 This gives you the `sr` CLI globally.

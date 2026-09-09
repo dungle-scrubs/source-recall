@@ -1,6 +1,6 @@
 [project]
 name = "dungle-scrubs-source-recall"
-version = "0.1.0"
+version = "0.1.0"  # x-release-please-version
 description = "Code search and retrieval for AI coding tools"
 readme = "README.md"
 keywords = ["code-search", "retrieval", "tree-sitter", "embeddings", "semantic-search", "developer-tools"]
@@ -60,7 +60,11 @@ embed = [
     # L5: Minor upgrades may change embedding behavior. Stored vectors
     # could become incompatible with new query vectors.  Consider
     # storing the library version in meta for compat checking.
-    "sentence-transformers>=3.0.0,<4.0.0",
+    # Floor at the 5.x line: 3.x caps transformers <5, which keeps five
+    # known vulnerabilities (PYSEC-2025-217, PYSEC-2026-2288/2289/2290,
+    # CVE-2026-9856) unfixable in the resolved graph. 5.x allows the
+    # fixed transformers 5.10+. Validated by the slow model tests.
+    "sentence-transformers>=5.0.0",
     "onnxruntime>=1.18.0,<2.0.0",
     "einops>=0.8.0,<1.0.0",
 ]
@@ -69,6 +73,7 @@ embed = [
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.9.0",
+    "ty>=0.0.44",
     # The embed extra so the test suite has access to the real
     # embedder/reranker for slow-marked tests.
     "dungle-scrubs-source-recall[embed]",
