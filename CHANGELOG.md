@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1](https://github.com/dungle-scrubs/source-recall/compare/v0.1.0...v0.1.1) (2026-09-09)
+
+
+### Added
+
+* **cli:** add sr --version ([b8f726e](https://github.com/dungle-scrubs/source-recall/commit/b8f726ef1b5b70c825d04c9f81310abcc2c2c8ee))
+
+
+### Fixed
+
+* **builder,daemon:** close refresh read-path data loss and bound shutdown ([b670b8a](https://github.com/dungle-scrubs/source-recall/commit/b670b8a6ed82252df150d96b7b4979cdfc225b85))
+* **builder,store:** prevent refresh data loss and cross-device sidecar corruption ([90b93b3](https://github.com/dungle-scrubs/source-recall/commit/90b93b3b86fa5f5cfc892ca148f64e3839751109))
+* **chunker,builder,embedder:** stage 5 chunker & builder correctness ([d461ea1](https://github.com/dungle-scrubs/source-recall/commit/d461ea10f8f193fba835f6e88901bac0bd50e963))
+* **daemon:** authenticate routes, validate Host, contain repo paths ([6e736b8](https://github.com/dungle-scrubs/source-recall/commit/6e736b80efa5779d1601c55e02dc0b7a669014cf))
+* **daemon:** clear _stop_event on lifespan startup ([0ae41b1](https://github.com/dungle-scrubs/source-recall/commit/0ae41b143e1603a9f39d4bb2fed20b8503c3fb2f))
+* **daemon:** remove completed bg index threads from tracking list ([f4ba7e4](https://github.com/dungle-scrubs/source-recall/commit/f4ba7e42b499de26e72bb46ce520c50c8e37555e))
+* **daemon:** warm models at startup, embed fan-out once, honor shutdown timeout ([acd0987](https://github.com/dungle-scrubs/source-recall/commit/acd0987940ae1bbe69891a52689c67fe8c8b8136))
+* **embedder:** verify config.json checksum before trusting remote model ([04c4beb](https://github.com/dungle-scrubs/source-recall/commit/04c4bebefce585f0cf09c85838c75f18fb6265ad))
+* fail closed on git-status detection failure and bound shutdown ([1862aa7](https://github.com/dungle-scrubs/source-recall/commit/1862aa70b4bc2d01ee74a655609f0ae712a80d5c))
+* **packaging:** complete PyPI metadata and fix stale build pin ([70880b0](https://github.com/dungle-scrubs/source-recall/commit/70880b07e77e8d2b67cc6ec4e10ff49bbef38286))
+* **querier:** typed search boundary, graph-expand gate, reader self-heal ([1fe955a](https://github.com/dungle-scrubs/source-recall/commit/1fe955a516828f3fb200fec25ff26cc984534f78))
+* **refresh:** preserve index entries on transient access failures ([d43b373](https://github.com/dungle-scrubs/source-recall/commit/d43b373cc5cb7c4460d2c1833c9b095f5c62175a))
+* **security:** harden daemon auth and model-integrity gate ([68a9e8e](https://github.com/dungle-scrubs/source-recall/commit/68a9e8e7447d052aa02717ec64314bb9f477be86))
+* **store:** batch symbol IN-list and make per-name cap quality-aware ([91b00dd](https://github.com/dungle-scrubs/source-recall/commit/91b00dd5e0f0a4d72fe2c2a4af89d349a4563cfc))
+* **store:** harden atomic_swap, memoize vec-table check, bound symbol lookup ([53f5c8d](https://github.com/dungle-scrubs/source-recall/commit/53f5c8dd2ced0a9ec56749f4316e18e79c9dcc10))
+* **store:** release savepoints after ROLLBACK TO on failure paths ([81a93e3](https://github.com/dungle-scrubs/source-recall/commit/81a93e3528c90e78674ef5ab9e01fd5c13e51cb8))
+* **verify:** reconcile flaky bg-index thread-join test ([04b2e1c](https://github.com/dungle-scrubs/source-recall/commit/04b2e1c12124fed19cbab4486f4e73b6133c389e))
+
+
+### Documentation
+
+* add CODE_OF_CONDUCT.md and SECURITY.md ([f709385](https://github.com/dungle-scrubs/source-recall/commit/f70938591c01f3a96add32d5d63ea46a2a9da40a))
+* **audit:** remove incorrect findings H-3 and old M-1 ([4cf1ac1](https://github.com/dungle-scrubs/source-recall/commit/4cf1ac1b03c99d9103e2714ae08a0e1c95a10e0b))
+* **changelog:** record packaging metadata and toolchain fixes ([c263335](https://github.com/dungle-scrubs/source-recall/commit/c2633353f89d8f3f643bf30708e4cb98426c832c))
+* **changelog:** record version flag and launchd cleanup ([e6218b9](https://github.com/dungle-scrubs/source-recall/commit/e6218b9d85e0bd86123f48b5ee7080da447fdcf5))
+* open-source release-readiness audit ([ba5d008](https://github.com/dungle-scrubs/source-recall/commit/ba5d0089d3be0f01c7f71a8b882810eded111eb7))
+* relocate internal docs to docs/history, add CoC and SECURITY ([1962051](https://github.com/dungle-scrubs/source-recall/commit/1962051f71633a9a3b77cc4df2f653e52176c312))
+* remove old root copies of relocated history docs ([67b5719](https://github.com/dungle-scrubs/source-recall/commit/67b571952238d597ac665b8656abdd980c1366a8))
+* **roadmap:** dedupe Phase 2 section, drop stale blocker list ([adfa222](https://github.com/dungle-scrubs/source-recall/commit/adfa222f18e3724cc2806673d86f287884d05f2d))
+* **roadmap:** mark Phase 1c as Done; add release-readiness section ([2e31e19](https://github.com/dungle-scrubs/source-recall/commit/2e31e19d2d87ea919959697f2c4d75a0bf46df38))
+
+
+### Maintenance
+
+* add GitHub Actions workflow; fix lint; track uv.lock ([f23cfaf](https://github.com/dungle-scrubs/source-recall/commit/f23cfaf267e4f467b458920959f4177e84ff6249))
+* **deps-dev:** update uv-build requirement ([#17](https://github.com/dungle-scrubs/source-recall/issues/17)) ([760fa5d](https://github.com/dungle-scrubs/source-recall/commit/760fa5df2bc3a5f0d4a4b04f69ed5a584d81df63))
+* **deps:** bump actions/cache from 4.3.0 to 6.1.0 ([#22](https://github.com/dungle-scrubs/source-recall/issues/22)) ([88b85de](https://github.com/dungle-scrubs/source-recall/commit/88b85def1c7a477f39b377577f5f74b61fad14d4))
+* **deps:** bump sqlite-vec in the pip-minor-patch group ([#23](https://github.com/dungle-scrubs/source-recall/issues/23)) ([aecbfca](https://github.com/dungle-scrubs/source-recall/commit/aecbfca2923aa195f67c7e1236b5f7168134afce))
+* harden for public release — templates, CI concurrency, deps, topics ([ec5333c](https://github.com/dungle-scrubs/source-recall/commit/ec5333cdaeb92d7b999d7a53a80f4cb1e69700df))
+* **launchd:** remove static plist and deprecated recipes ([37a9c87](https://github.com/dungle-scrubs/source-recall/commit/37a9c8706bb87c7ffe2a5751fd8b1f991ac21917))
+* **pins,launchd:** guard tree-sitter pins, cover launchd, de-flake refresh ([4b53844](https://github.com/dungle-scrubs/source-recall/commit/4b53844cb836e2ff55f1a3bb91b540de4b429533))
+* **pyproject:** remove unused [tool.ty] block ([d98584f](https://github.com/dungle-scrubs/source-recall/commit/d98584fbbb40c6246c29cb29d0c6b222537d3f1a))
+* release/publish parity with scraper ([#21](https://github.com/dungle-scrubs/source-recall/issues/21)) ([2d7ed20](https://github.com/dungle-scrubs/source-recall/commit/2d7ed20e4b27ff25fc8e5353ec9d017de2140aa3))
+* **release:** add install smoke before uv build ([47c6be3](https://github.com/dungle-scrubs/source-recall/commit/47c6be376f2ca7b2d6810a6db57ee752b311080e))
+* rename .mise.toml to mise.toml ([f50740a](https://github.com/dungle-scrubs/source-recall/commit/f50740ab0598c8b78c911a2f37e8288f73060eb8))
+* **toolchain:** align uv pin to 0.11.25 across mise and CI ([3a0a07c](https://github.com/dungle-scrubs/source-recall/commit/3a0a07c38cae70ecadd1d2a0a078d08129d873a7))
+* untrack author-local .plans/ and .tallow/ scratch dirs ([7219375](https://github.com/dungle-scrubs/source-recall/commit/721937577708468f8d48846c47d9b2cc1cab2a8a))
+
 ## [Unreleased]
 
 ### Added

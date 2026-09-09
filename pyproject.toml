@@ -1,6 +1,6 @@
 [project]
 name = "dungle-scrubs-source-recall"
-version = "0.1.0"  # x-release-please-version
+version = "0.1.1"  # x-release-please-version
 description = "Code search and retrieval for AI coding tools"
 readme = "README.md"
 keywords = ["code-search", "retrieval", "tree-sitter", "embeddings", "semantic-search", "developer-tools"]
