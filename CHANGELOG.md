@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2](https://github.com/dungle-scrubs/source-recall/compare/v0.1.1...v0.1.2) (2026-09-09)
+
+
+### Documentation
+
+* brand marks, social preview, 2026-09-05 audit, RFC-01 ([#25](https://github.com/dungle-scrubs/source-recall/issues/25)) ([4397d91](https://github.com/dungle-scrubs/source-recall/commit/4397d91a98a3079a597a0d175c9dd933bcc1fd30))
+
+
+### Maintenance
+
+* relock after v0.1.1 ([#26](https://github.com/dungle-scrubs/source-recall/issues/26)) ([7c1d442](https://github.com/dungle-scrubs/source-recall/commit/7c1d442d74dec3efc9f53c9d4f4724a3a61ab0b8))
+
 ## [0.1.1](https://github.com/dungle-scrubs/source-recall/compare/v0.1.0...v0.1.1) (2026-09-09)
 
 
