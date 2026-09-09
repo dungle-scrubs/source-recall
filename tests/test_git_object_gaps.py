@@ -129,6 +129,7 @@ class TestNonGitRepoBuild:
             assert store.get_file_hash("lib.py") is not None
             # content_hash should be sha256 (64 hex chars), not blob SHA (40).
             rec = store.get_file_hash("app.py")
+            assert rec is not None
             assert len(rec.content_hash) == 64
             # Chunks should exist.
             assert store.get_chunk_count() > 0
@@ -283,11 +284,14 @@ class TestLegacyDetectChangesWithBlobHash:
         with IndexStore(db_path) as store:
             store.run_migrations()
             rec = store.get_file_hash("app.py")
+            assert rec is not None
             assert len(rec.content_hash) == 40
 
         # Force legacy path by monkeypatching _try_git_object_refresh.
         original = builder._try_git_object_refresh
-        builder._try_git_object_refresh = lambda _store, _branch: None
+        builder._try_git_object_refresh = (  # ty: ignore[invalid-assignment] deliberate plain-function override forcing the legacy refresh path
+            lambda _store, _branch: None
+        )
 
         # Modify a file so there's something to detect.
         (repo / "app.py").write_text("def hello(): return 'changed'\n")
@@ -304,7 +308,7 @@ class TestLegacyDetectChangesWithBlobHash:
         assert changed >= 1  # At least app.py detected as changed.
 
         # Restore.
-        builder._try_git_object_refresh = original
+        builder._try_git_object_refresh = original  # ty: ignore[invalid-assignment] restore the bound method after the deliberate override
 
 
 # =========================================================================

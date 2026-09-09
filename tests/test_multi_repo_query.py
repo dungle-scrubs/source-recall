@@ -13,6 +13,22 @@ from source_recall.daemon_config import DaemonConfig
 from source_recall.embedder import BagOfWordsEmbedder
 
 
+class _CountingEmbedder(BagOfWordsEmbedder):
+    """BagOfWordsEmbedder that records every embed_query call.
+
+    Test double aligned with the real method (same name and signature)
+    instead of an instance-attribute spy over the bound method.
+    """
+
+    def __init__(self, dimensions: int, calls: list[str]) -> None:
+        super().__init__(dimensions=dimensions)
+        self.calls = calls
+
+    def embed_query(self, query: str) -> list[float]:
+        self.calls.append(query)
+        return super().embed_query(query)
+
+
 @pytest.fixture
 def multi_repo_client(
     py_app_path: Path, tmp_path: Path
@@ -89,7 +105,8 @@ class TestMultiRepoQuery:
         from source_recall import Index
         from source_recall.daemon import create_daemon_app
 
-        emb = BagOfWordsEmbedder(dimensions=64)
+        calls: list[str] = []
+        emb = _CountingEmbedder(dimensions=64, calls=calls)
         Index(py_app_path, embedder=emb).build()
         repo2 = tmp_path / "repo2"
         shutil.copytree(py_app_path, repo2)
@@ -103,15 +120,6 @@ class TestMultiRepoQuery:
             config_path=tmp_path / "repos.toml",
         )
         app = create_daemon_app(config, embedder=emb)
-
-        calls: list[str] = []
-        orig = emb.embed_query
-
-        def spy(q: str) -> list[float]:
-            calls.append(q)
-            return orig(q)
-
-        emb.embed_query = spy  # type: ignore[method-assign]
 
         with TestClient(app) as client:
             # Drain the startup warmup (which also embeds) before counting.

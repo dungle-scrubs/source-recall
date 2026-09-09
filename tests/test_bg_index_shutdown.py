@@ -61,7 +61,7 @@ class TestBackgroundIndexThreadTracking:
 
         original_build = Index.build
 
-        def slow_build(self: object) -> object:
+        def slow_build(self: Index) -> Path:
             build_started.set()
             time.sleep(0.5)  # Simulate non-trivial build.
             result = original_build(self)
@@ -100,7 +100,7 @@ class TestBackgroundIndexThreadTracking:
 
         original_build = Index.build
 
-        def counting_build(self: object) -> object:
+        def counting_build(self: Index) -> Path:
             result = original_build(self)
             finished["count"] += 1
             return result
@@ -184,7 +184,7 @@ class TestBackgroundIndexThreadTracking:
 
             # Both bg index threads have completed.  Now patch join and
             # exit the TestClient to trigger lifespan shutdown.
-            threading.Thread.join = recording_join  # type: ignore[method-assign]
+            threading.Thread.join = recording_join
             try:
                 pass  # __exit__ runs shutdown
             finally:
@@ -193,7 +193,7 @@ class TestBackgroundIndexThreadTracking:
                 # when the context exits (next test will reset state).
                 pass
 
-        threading.Thread.join = real_join  # type: ignore[method-assign]
+        threading.Thread.join = real_join
 
         # Filter out joins from threads we didn't add via /repos POST.
         # The periodic refresh thread (sr-periodic-refresh) also gets

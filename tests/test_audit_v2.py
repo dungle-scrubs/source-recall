@@ -661,7 +661,7 @@ class TestMigrationRollback:
 
         fake_version = original_version + 100
         original_migrations = store_mod._MIGRATIONS
-        store_mod._SCHEMA_VERSION = fake_version
+        store_mod._SCHEMA_VERSION = fake_version  # ty: ignore[invalid-assignment] deliberate out-of-range int simulating a newer schema
         store_mod._MIGRATIONS = list(original_migrations) + [
             (
                 fake_version,
@@ -684,7 +684,7 @@ class TestMigrationRollback:
             assert count == 0  # Empty but functional.
         finally:
             store_mod._MIGRATIONS = original_migrations
-            store_mod._SCHEMA_VERSION = original_version
+            store_mod._SCHEMA_VERSION = original_version  # ty: ignore[invalid-assignment] restore module constant after the deliberate override
             store.close()
 
 

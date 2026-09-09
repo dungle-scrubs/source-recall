@@ -112,10 +112,12 @@ class TestRefreshReadFailurePreservesData:
         # destructive delete before the fix.
         real_read_text = Path.read_text
 
-        def flaky_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        def flaky_read_text(
+            self: Path, encoding: str | None = None, errors: str | None = None
+        ) -> str:
             if self.name == "a.py":
                 raise OSError("simulated read failure on a.py")
-            return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+            return real_read_text(self, encoding=encoding, errors=errors)
 
         monkeypatch.setattr(Path, "read_text", flaky_read_text)
 
@@ -269,7 +271,7 @@ class TestBoundedShutdown:
             def close(self) -> None:
                 closed.set()
 
-        slot.index = FakeIndex()  # type: ignore[assignment]
+        slot.index = FakeIndex()  # ty: ignore[invalid-assignment] deliberate close()-only double; RepoSlot.index is typed Index
 
         # A "stuck refresh" holds the slot lock and never releases it.
         release = threading.Event()

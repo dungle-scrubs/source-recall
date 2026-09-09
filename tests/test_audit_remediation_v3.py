@@ -11,6 +11,7 @@ swap leaves the target and its sidecars untouched.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -88,10 +89,10 @@ class TestRefreshChunkFailurePreservesData:
 
         real_chunk = builder_mod.chunk_file_with_refs
 
-        def flaky_chunk(rel_path: str, content: str, **kwargs: object):
+        def flaky_chunk(rel_path: str, content: str, *, max_chars: int = 6000):
             if rel_path == "a.py":
                 raise ValueError("simulated chunker failure on a.py")
-            return real_chunk(rel_path, content, **kwargs)
+            return real_chunk(rel_path, content, max_chars=max_chars)
 
         monkeypatch.setattr(builder_mod, "chunk_file_with_refs", flaky_chunk)
 
@@ -180,12 +181,14 @@ class TestAtomicSwapCrossDeviceGuard:
             def __init__(self, dev: int) -> None:
                 self.st_dev = dev
 
-        def fake_stat(self: Path, *args: object, **kwargs: object):  # type: ignore[override]
+        def fake_stat(
+            self: Path, *, follow_symlinks: bool = True
+        ) -> os.stat_result | _FakeStat:
             if self == tmp_db:
                 return _FakeStat(1000)
             if self == target.parent:
                 return _FakeStat(2000)
-            return real_stat(self, *args, **kwargs)
+            return real_stat(self, follow_symlinks=follow_symlinks)
 
         monkeypatch.setattr(Path, "stat", fake_stat)
 

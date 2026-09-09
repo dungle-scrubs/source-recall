@@ -6,7 +6,7 @@ import logging
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from source_recall.concurrency import ReaderWriterLock
 from source_recall.config import SRConfig, resolve_config
@@ -24,7 +24,7 @@ from source_recall.models import (
 )
 
 try:
-    __version__ = _pkg_version("source-recall")
+    __version__ = _pkg_version("dungle-scrubs-source-recall")
 except PackageNotFoundError:  # pragma: no cover - editable/source checkout
     __version__ = "0.0.0+unknown"
 
@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from source_recall.embedder import Embedder
+    from source_recall.querier import IndexQuerier
+    from source_recall.reranker import Reranker
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,13 @@ logger = logging.getLogger(__name__)
 # it so concurrent query/status run in parallel while refresh/build/close
 # take an exclusive write lock to swap the underlying querier (M-2 fix).
 _ReaderWriterLock = ReaderWriterLock
+
+# The shared models._SENTINEL (a bare ``object()``) as an "omitted"
+# default for Index(embedder=...).  The cast keeps the public parameter
+# type at Embedder | None while admitting the sentinel; identity is
+# preserved (cast returns its argument unchanged), so ``is _SENTINEL``
+# checks keep working.
+_UNSET_EMBEDDER = cast("Embedder | None", _SENTINEL)
 
 
 __all__ = [
@@ -77,7 +86,7 @@ class Index:
         on_progress: Callable[[str, int, int], None] | None = None,
         on_phase: Callable[[str], None] | None = None,
         on_progress_detail: Callable[[dict[str, object]], None] | None = None,
-        embedder: Embedder | None | object = _SENTINEL,
+        embedder: Embedder | None = _UNSET_EMBEDDER,
         **kwargs: object,
     ) -> None:
         self.repo_path = Path(repo_path).resolve()
@@ -86,6 +95,7 @@ class Index:
         self._on_phase = on_phase
         self._on_progress_detail = on_progress_detail
 
+        self._embedder: Embedder | None
         if embedder is _SENTINEL:
             # Auto-create embedder based on config.
             if self.config.embed_enabled:
@@ -95,10 +105,12 @@ class Index:
             else:
                 self._embedder = None
         else:
-            self._embedder = embedder  # type: ignore[assignment]
+            self._embedder = embedder
 
-        self._reranker: object = _SENTINEL  # Lazy-loaded.
-        self._querier: object | None = None  # Cached IndexQuerier.
+        # Lazy-loaded; _SENTINEL until the first _get_reranker() call.  The
+        # cast admits the same shared sentinel as the embedder default.
+        self._reranker: Reranker | None = cast("Reranker | None", _SENTINEL)
+        self._querier: IndexQuerier | None = None  # Cached IndexQuerier.
         # M2: reader/writer lock.  query()/status() are readers (may run
         # concurrently); refresh()/build()/close() are writers (exclusive),
         # so a refresh cannot close the connection mid-query.
@@ -123,7 +135,7 @@ class Index:
             )
             return None
 
-    def _get_reranker(self) -> object | None:
+    def _get_reranker(self) -> Reranker | None:
         """Lazily create a CrossEncoderReranker if config allows.
 
         Only loads the model when rerank_enabled is True in config.
@@ -219,12 +231,12 @@ class Index:
         self._querier_lock.acquire_write()
         try:
             if self._querier is not None:
-                self._querier.close()  # type: ignore[union-attr]
+                self._querier.close()
                 self._querier = None
         finally:
             self._querier_lock.release_write()
 
-    def _ensure_querier(self) -> object:
+    def _ensure_querier(self) -> IndexQuerier:
         """Create a querier if one doesn't exist.
 
         Caller MUST already hold the *write* lock.
@@ -241,7 +253,7 @@ class Index:
         )
         return self._querier
 
-    def _with_querier(self) -> tuple[object, _ReaderWriterLock]:
+    def _with_querier(self) -> tuple[IndexQuerier, _ReaderWriterLock]:
         """Return the cached querier and the lock, holding the *read* lock.
 
         The caller MUST call ``release_read`` when done with the querier.
@@ -299,7 +311,7 @@ class Index:
         """
         querier, lock = self._with_querier()
         try:
-            return querier.query(  # type: ignore[union-attr]
+            return querier.query(
                 question, top_k=top_k, branch=branch, query_vec=query_vec
             )
         finally:
@@ -312,6 +324,6 @@ class Index:
         """
         querier, lock = self._with_querier()
         try:
-            return querier.status()  # type: ignore[union-attr]
+            return querier.status()
         finally:
             lock.release_read()

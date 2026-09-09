@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -122,19 +123,21 @@ def _auth_test_client(monkeypatch: pytest.MonkeyPatch) -> None:
     strip the header for a 401, or send a bogus ``host`` for a 400.
     """
     from fastapi.testclient import TestClient
+    from starlette.types import ASGIApp
 
     orig_init = TestClient.__init__
 
-    def patched_init(
-        self: TestClient, app: object = None, *args: object, **kwargs: object
-    ) -> None:
+    def patched_init(self: TestClient, app: ASGIApp, *args: Any, **kwargs: Any) -> None:
         if not args:  # base_url is the first positional after app.
             kwargs.setdefault("base_url", "http://127.0.0.1")
         token = getattr(getattr(app, "state", None), "sr_token", None)
         if token is not None:
-            headers = dict(kwargs.get("headers") or {})  # type: ignore[arg-type]
+            raw_headers = kwargs.get("headers")
+            headers: dict[str, str] = (
+                dict(raw_headers) if raw_headers is not None else {}
+            )
             headers.setdefault("X-SR-Token", token)
             kwargs["headers"] = headers
-        orig_init(self, app, *args, **kwargs)  # type: ignore[arg-type]
+        orig_init(self, app, *args, **kwargs)
 
     monkeypatch.setattr(TestClient, "__init__", patched_init)

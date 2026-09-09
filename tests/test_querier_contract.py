@@ -21,7 +21,7 @@ import pytest
 from source_recall import Index
 from source_recall.config import resolve_config
 from source_recall.embedder import BagOfWordsEmbedder
-from source_recall.models import RefData, RefType
+from source_recall.models import RefData, RefType, SearchRow
 from source_recall.querier import IndexQuerier
 from source_recall.store import IndexStore, get_db_path
 
@@ -132,9 +132,17 @@ class TestGraphExpansionNoMutation:
         caller_id = store.conn.execute(
             "SELECT id FROM chunks WHERE symbol_name = 'the_unique_caller_xyz'"
         ).fetchone()[0]
-        all_chunks: dict[str, dict] = {
-            caller_id: {"chunk_id": caller_id, "content": "stub"}
-        }
+        stub_row = SearchRow(
+            chunk_id=caller_id,
+            file_path="a.py",
+            symbol_name="the_unique_caller_xyz",
+            symbol_type="function",
+            content="stub",
+            start_line=1,
+            end_line=2,
+            search_quality="ast",
+        )
+        all_chunks: dict[str, SearchRow] = {caller_id: stub_row}
         snapshot_before = dict(all_chunks)
 
         querier._graph_expand(store, [caller_id], all_chunks, "q")

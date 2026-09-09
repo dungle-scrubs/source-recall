@@ -132,9 +132,11 @@ class TestCodeRankEncodeBatchSize:
         captured: dict[str, object] = {}
 
         class FakeModel:
-            def encode(self, texts, show_progress_bar=False, batch_size=None):
+            max_seq_length = 512
+
+            def encode(self, inputs, show_progress_bar=False, batch_size=None):
                 captured["batch_size"] = batch_size
-                return TestCodeRankEncodeBatchSize._FakeArray(len(texts))
+                return TestCodeRankEncodeBatchSize._FakeArray(len(inputs))
 
         emb._model = FakeModel()
         emb.embed_chunks(["a", "b"])
@@ -148,9 +150,11 @@ class TestCodeRankEncodeBatchSize:
         captured: dict[str, object] = {}
 
         class FakeModel:
-            def encode(self, texts, show_progress_bar=False, batch_size=None):
+            max_seq_length = 512
+
+            def encode(self, inputs, show_progress_bar=False, batch_size=None):
                 captured["batch_size"] = batch_size
-                return TestCodeRankEncodeBatchSize._FakeArray(len(texts))
+                return TestCodeRankEncodeBatchSize._FakeArray(len(inputs))
 
         emb._model = FakeModel()
         emb.embed_chunks(["a"])
@@ -390,7 +394,9 @@ class TestLoadModelConcurrency:
                 time.sleep(0.05)
 
         fake_mod = types.ModuleType("sentence_transformers")
-        fake_mod.SentenceTransformer = FakeSentenceTransformer  # type: ignore[attr-defined]
+        fake_mod.SentenceTransformer = (  # ty: ignore[unresolved-attribute] dynamic attribute on a fake module standing in for sentence-transformers
+            FakeSentenceTransformer
+        )
         monkeypatch.setitem(sys.modules, "sentence_transformers", fake_mod)
 
         barrier = threading.Barrier(2)
@@ -438,11 +444,20 @@ class TestCodeRankInference:
         # The model is loaded now; spy on encode to capture the exact input
         # string and confirm embed_query applies the required query prefix.
         captured: dict[str, object] = {}
-        real_encode = emb._model.encode  # type: ignore[union-attr]
+        real_encode = emb._model.encode  # ty: ignore[unresolved-attribute] deliberate reach into private _model (typed object); sentence-transformers is absent from the type env
 
-        def spy(texts, *args, **kwargs):  # type: ignore[no-untyped-def]
+        def spy(
+            texts: list[str],
+            *,
+            show_progress_bar: bool | None = False,
+            batch_size: int | None = None,
+        ) -> object:
             captured["texts"] = texts
-            return real_encode(texts, *args, **kwargs)
+            if batch_size is None:
+                return real_encode(texts, show_progress_bar=show_progress_bar)
+            return real_encode(
+                texts, show_progress_bar=show_progress_bar, batch_size=batch_size
+            )
 
         monkeypatch.setattr(emb._model, "encode", spy)
         emb.embed_query("find the parser")

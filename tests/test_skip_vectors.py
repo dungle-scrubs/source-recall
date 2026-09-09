@@ -11,6 +11,24 @@ from source_recall.embedder import BagOfWordsEmbedder
 from source_recall.store import IndexStore, get_db_path
 
 
+class _RefreshTrackingEmbedder(BagOfWordsEmbedder):
+    """BagOfWordsEmbedder that records embed_chunks batch sizes on demand.
+
+    Assigning ``sink`` starts recording; ``None`` stops it. Double aligned
+    with the real method signature instead of an instance-attribute spy,
+    so counting can be scoped to a single refresh.
+    """
+
+    def __init__(self, dimensions: int) -> None:
+        super().__init__(dimensions=dimensions)
+        self.sink: list[int] | None = None
+
+    def embed_chunks(self, texts: list[str]) -> list[list[float]]:
+        if self.sink is not None:
+            self.sink.append(len(texts))
+        return super().embed_chunks(texts)
+
+
 def _git_init(repo: Path, *, marker: str = "") -> None:
     """Initialize a git repo with one commit.
 
@@ -135,7 +153,7 @@ class TestFullBranchSwitchCycle:
             check=True,
         )
 
-        emb = BagOfWordsEmbedder(dimensions=64)
+        emb = _RefreshTrackingEmbedder(dimensions=64)
         config = resolve_config(str(repo))
         builder = IndexBuilder(repo, config, embedder=emb)
 
@@ -166,13 +184,7 @@ class TestFullBranchSwitchCycle:
 
         # Track embed calls during feature refresh.
         feature_embed_calls: list[int] = []
-        original_embed = emb.embed_chunks
-
-        def tracking_embed_feature(texts: list[str]) -> list[list[float]]:
-            feature_embed_calls.append(len(texts))
-            return original_embed(texts)
-
-        emb.embed_chunks = tracking_embed_feature
+        emb.sink = feature_embed_calls
 
         builder.refresh()
 
@@ -200,12 +212,7 @@ class TestFullBranchSwitchCycle:
 
         # Track embed calls on way back.
         return_embed_calls: list[int] = []
-
-        def tracking_embed_return(texts: list[str]) -> list[list[float]]:
-            return_embed_calls.append(len(texts))
-            return original_embed(texts)
-
-        emb.embed_chunks = tracking_embed_return
+        emb.sink = return_embed_calls
 
         builder.refresh()
 

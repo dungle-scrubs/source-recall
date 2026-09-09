@@ -486,10 +486,10 @@ class TestVecFailureTracking:
         class BrokenEmbedder:
             dimensions = 64
 
-            def embed_chunks(self, _texts: list[str]) -> list[list[float]]:
+            def embed_chunks(self, texts: list[str]) -> list[list[float]]:
                 raise RuntimeError("GPU on fire")
 
-            def embed_query(self, _query: str) -> list[float]:
+            def embed_query(self, query: str) -> list[float]:
                 return [0.0] * 64
 
         broken_builder = IndexBuilder(repo, config, embedder=BrokenEmbedder())

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from source_recall.builder import IndexBuilder
 from source_recall.config import resolve_config
-from source_recall.embedder import BagOfWordsEmbedder
+from source_recall.embedder import BagOfWordsEmbedder, Embedder
 from source_recall.store import IndexStore, get_db_path
 
 
@@ -40,7 +40,7 @@ def _git_init(repo: Path, *, marker: str = "") -> None:
     )
 
 
-def _make_builder(repo: Path, *, embedder: object | None = None) -> IndexBuilder:
+def _make_builder(repo: Path, *, embedder: Embedder | None = None) -> IndexBuilder:
     """Create a builder with optional embedder."""
     config = resolve_config(str(repo))
     return IndexBuilder(repo, config, embedder=embedder)
@@ -111,6 +111,7 @@ class TestIndexFileBlobFastPath:
         with IndexStore(db_path) as store:
             store.run_migrations()
             old_rec = store.get_file_hash("app.py")
+            assert old_rec is not None
             old_hash = old_rec.content_hash
 
         # Change the file.
@@ -303,7 +304,7 @@ class TestRefreshBranchSwitch:
             embed_calls.append(len(texts))
             return original_embed(texts)
 
-        emb.embed_chunks = tracking_embed
+        emb.embed_chunks = tracking_embed  # ty: ignore[invalid-assignment] deliberate spy: plain function replaces bound method to count embedded texts
 
         builder.refresh()
 
@@ -418,7 +419,7 @@ class TestRefreshBranchSwitch:
             embed_calls.append(len(texts))
             return original_embed(texts)
 
-        emb.embed_chunks = tracking_embed
+        emb.embed_chunks = tracking_embed  # ty: ignore[invalid-assignment] deliberate spy: plain function replaces bound method to count embedded texts
 
         builder.refresh()
 

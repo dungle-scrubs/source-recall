@@ -300,7 +300,7 @@ class TestDaemonWarmup:
             calls.append(q)
             return orig(q)
 
-        emb.embed_query = spy  # type: ignore[method-assign]
+        emb.embed_query = spy  # ty: ignore[invalid-assignment] deliberate spy: plain function replaces bound method to record warmup calls
 
         app = create_daemon_app(daemon_config, embedder=emb)
         with TestClient(app):

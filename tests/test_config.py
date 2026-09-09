@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from source_recall.config import SRConfig, format_config, resolve_config
 
 
@@ -23,11 +25,11 @@ class TestResolveConfig:
         assert config.top_k == 15
         assert config.max_file_size == 50_000
 
-    def test_env_vars(self, monkeypatch: object) -> None:
+    def test_env_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """SR_ env vars override defaults."""
         import os
 
-        monkeypatch.setattr(os, "environ", {**os.environ, "SR_TOP_K": "20"})  # type: ignore[attr-defined]
+        monkeypatch.setattr(os, "environ", {**os.environ, "SR_TOP_K": "20"})
         config = resolve_config()
         assert config.top_k == 20
 
@@ -87,13 +89,11 @@ class TestEmbedConfig:
         config = resolve_config()
         assert config.embed_enabled is True
 
-    def test_embed_enabled_from_env(self, monkeypatch: object) -> None:
+    def test_embed_enabled_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """SR_EMBED_ENABLED=false disables embeddings."""
         import os
 
-        monkeypatch.setattr(  # type: ignore[attr-defined]
-            os, "environ", {**os.environ, "SR_EMBED_ENABLED": "false"}
-        )
+        monkeypatch.setattr(os, "environ", {**os.environ, "SR_EMBED_ENABLED": "false"})
         config = resolve_config()
         assert config.embed_enabled is False
 
@@ -102,13 +102,11 @@ class TestEmbedConfig:
         config = resolve_config()
         assert config.embed_batch_size == 32
 
-    def test_embed_batch_size_from_env(self, monkeypatch: object) -> None:
+    def test_embed_batch_size_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """SR_EMBED_BATCH_SIZE env var is respected."""
         import os
 
-        monkeypatch.setattr(  # type: ignore[attr-defined]
-            os, "environ", {**os.environ, "SR_EMBED_BATCH_SIZE": "16"}
-        )
+        monkeypatch.setattr(os, "environ", {**os.environ, "SR_EMBED_BATCH_SIZE": "16"})
         config = resolve_config()
         assert config.embed_batch_size == 16
 

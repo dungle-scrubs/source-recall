@@ -17,8 +17,13 @@ from source_recall.chunker import _is_blade
 from source_recall.store import get_index_base
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+    from typing import Any
+
+    import httpx
     from pygments.lexer import Lexer
 
+    from source_recall.daemon_config import DaemonConfig
     from source_recall.models import IndexStatus
 
 
@@ -106,7 +111,13 @@ def index(
       sr index . --no-embed         # FTS-only (fast, no model download)\n
       sr index . --json             # JSON summary for agent consumption
     """
-    from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        TaskID,
+        TextColumn,
+    )
 
     from source_recall import Index
 
@@ -120,7 +131,7 @@ def index(
         console=err_console,
         transient=True,
     )
-    task_id: object = None
+    task_id: TaskID | None = None
 
     def on_progress(file_path: str, current: int, total: int) -> None:
         """Progress callback for indexing."""
@@ -128,15 +139,22 @@ def index(
         if task_id is None:
             task_id = progress.add_task("index", total=total, file=file_path)
             progress.start()
-        progress.update(task_id, completed=current, file=file_path)  # type: ignore[arg-type]
+        progress.update(task_id, completed=current, file=file_path)
 
     try:
-        kwargs: dict[str, object] = {}
-        if no_embed:
-            kwargs["embedder"] = None
-        if rerank:
-            kwargs["rerank_enabled"] = True
-        idx = Index(repo_path, on_progress=on_progress, **kwargs)
+        if no_embed and rerank:
+            idx = Index(
+                repo_path,
+                on_progress=on_progress,
+                embedder=None,
+                rerank_enabled=True,
+            )
+        elif no_embed:
+            idx = Index(repo_path, on_progress=on_progress, embedder=None)
+        elif rerank:
+            idx = Index(repo_path, on_progress=on_progress, rerank_enabled=True)
+        else:
+            idx = Index(repo_path, on_progress=on_progress)
         db_path = idx.build()
 
         if progress.live.is_started:
@@ -216,7 +234,7 @@ def _try_daemon_query(
     top_k: int | None = None,
     repo: str | None = None,
     branch: str | None = None,
-) -> object | None:
+) -> httpx.Response | None:
     """Attempt to query the daemon. Returns response or None if down.
 
     @param question: Search query.
@@ -294,14 +312,14 @@ def ask(
     daemon_resp = _try_daemon_query(question, top_k=top_k, repo=repo)
     if daemon_resp is not None:
         # Handle daemon-side errors before assuming success.
-        status_code = daemon_resp.status_code  # type: ignore[union-attr]
+        status_code = daemon_resp.status_code
         if status_code != 200:
-            data = daemon_resp.json()  # type: ignore[union-attr]
+            data = daemon_resp.json()
             detail = data.get("detail", f"Daemon error (HTTP {status_code})")
             err_console.print(f"[red]Error:[/red] {detail}")
             raise typer.Exit(1)
 
-        data = daemon_resp.json()  # type: ignore[union-attr]
+        data = daemon_resp.json()
         results_data = data.get("results", [])
 
         if not results_data:
@@ -943,15 +961,32 @@ daemon_app = typer.Typer(
 app.add_typer(daemon_app, name="daemon")
 
 
-def uvicorn_run(app: object, **kwargs: object) -> None:
+def uvicorn_run(
+    app: Callable[..., Any],
+    *,
+    host: str,
+    port: int,
+    log_level: str,
+    timeout_graceful_shutdown: int | None = None,
+) -> None:
     """Thin wrapper around uvicorn.run for testability.
 
     @param app: ASGI application.
-    @param kwargs: Forwarded to uvicorn.run.
+    @param host: Bind host, forwarded to uvicorn.run.
+    @param port: Bind port, forwarded to uvicorn.run.
+    @param log_level: Log level name, forwarded to uvicorn.run.
+    @param timeout_graceful_shutdown: Graceful-shutdown drain seconds,
+        forwarded to uvicorn.run.
     """
     import uvicorn
 
-    uvicorn.run(app, **kwargs)  # type: ignore[arg-type]
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level=log_level,
+        timeout_graceful_shutdown=timeout_graceful_shutdown,
+    )
 
 
 @daemon_app.command("run")
@@ -1010,7 +1045,7 @@ def daemon_run(
     )
 
 
-def _write_and_load_plist(config: object) -> Path:
+def _write_and_load_plist(config: DaemonConfig) -> Path:
     """Write plist and bootstrap via launchctl. Mockable in tests.
 
     @param config: DaemonConfig instance.
@@ -1018,7 +1053,7 @@ def _write_and_load_plist(config: object) -> Path:
     """
     from source_recall.launchd import install_plist
 
-    return install_plist(config)  # type: ignore[arg-type]
+    return install_plist(config)
 
 
 def _wait_for_health(url: str, timeout: float = 30.0) -> bool:
@@ -1123,7 +1158,7 @@ def daemon_status() -> None:
     """
     try:
         resp = _daemon_get("/health")
-        data = resp.json()  # type: ignore[union-attr]
+        data = resp.json()
         if data.get("ok"):
             console.print(
                 f"[green]●[/green] Daemon running "
@@ -1177,7 +1212,7 @@ def daemon_logs(
 # ---------------------------------------------------------------------------
 
 
-def _daemon_get(path: str) -> object:
+def _daemon_get(path: str) -> httpx.Response:
     """GET request to the daemon.
 
     @param path: URL path (e.g. '/repos').
@@ -1194,26 +1229,32 @@ def _daemon_get(path: str) -> object:
         raise ConnectionError(f"Daemon not running at {_daemon_url()}") from e
 
 
-def _daemon_post(path: str, **kwargs: object) -> object:
+def _daemon_post(
+    path: str,
+    *,
+    json: object | None = None,
+    headers: Mapping[str, str] | None = None,
+) -> httpx.Response:
     """POST request to the daemon.
 
     @param path: URL path.
-    @param kwargs: Forwarded to httpx.post.
+    @param json: JSON-serializable request body, forwarded to httpx.post.
+    @param headers: Extra headers merged over the auth headers.
     @returns: httpx.Response.
     @raises ConnectionError: If daemon is unreachable.
     """
     import httpx
 
-    headers = {**_daemon_headers(), **(kwargs.pop("headers", None) or {})}  # type: ignore[dict-item]
+    merged = {**_daemon_headers(), **(headers or {})}
     try:
         return httpx.post(
-            f"{_daemon_url()}{path}", timeout=10, headers=headers, **kwargs
-        )  # type: ignore[arg-type]
+            f"{_daemon_url()}{path}", timeout=10, headers=merged, json=json
+        )
     except httpx.ConnectError as e:
         raise ConnectionError(f"Daemon not running at {_daemon_url()}") from e
 
 
-def _daemon_delete(path: str) -> object:
+def _daemon_delete(path: str) -> httpx.Response:
     """DELETE request to the daemon.
 
     @param path: URL path.
@@ -1259,13 +1300,13 @@ def add_repo(
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1) from e
 
-    if resp.status_code == 201:  # type: ignore[union-attr]
-        data = resp.json()  # type: ignore[union-attr]
+    if resp.status_code == 201:
+        data = resp.json()
         console.print(
             f"[green]✓[/green] Added [cyan]{data['name']}[/cyan] ({data['state']})"
         )
     else:
-        detail = resp.json().get("detail", "Unknown error")  # type: ignore[union-attr]
+        detail = resp.json().get("detail", "Unknown error")
         err_console.print(f"[red]Error:[/red] {detail}")
         raise typer.Exit(1)
 
@@ -1287,10 +1328,10 @@ def remove_repo(
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1) from e
 
-    if resp.status_code == 200:  # type: ignore[union-attr]
+    if resp.status_code == 200:
         console.print(f"[green]✓[/green] Removed [cyan]{name}[/cyan]")
     else:
-        detail = resp.json().get("detail", "Unknown error")  # type: ignore[union-attr]
+        detail = resp.json().get("detail", "Unknown error")
         err_console.print(f"[red]Error:[/red] {detail}")
         raise typer.Exit(1)
 
@@ -1311,11 +1352,11 @@ def list_daemon_repos() -> None:
         err_console.print("[red]Error:[/red] Daemon not running.")
         raise typer.Exit(1) from None
 
-    if resp.status_code != 200:  # type: ignore[union-attr]
-        err_console.print(f"[red]Error:[/red] Unexpected status {resp.status_code}")  # type: ignore[union-attr]
+    if resp.status_code != 200:
+        err_console.print(f"[red]Error:[/red] Unexpected status {resp.status_code}")
         raise typer.Exit(1)
 
-    data = resp.json()  # type: ignore[union-attr]
+    data = resp.json()
     repos_list = data.get("repos", [])
 
     if not repos_list:

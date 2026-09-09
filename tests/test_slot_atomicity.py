@@ -24,7 +24,7 @@ class TestSlotAtomicTransition:
 
         def writer() -> None:
             for i in range(100):
-                slot.set_ready(f"idx-{i}")  # type: ignore[arg-type]
+                slot.set_ready(f"idx-{i}")  # ty: ignore[invalid-argument-type]  # str payload on purpose: drives state/index atomicity, not Index behavior
                 slot.set_error("oops")
 
         readers = [threading.Thread(target=reader) for _ in range(4)]
@@ -42,7 +42,7 @@ class TestSlotAtomicTransition:
     def test_set_ready_sets_both(self, tmp_path: Path) -> None:
         """set_ready() sets state and index together."""
         slot = RepoSlot(name="test", path=tmp_path)
-        slot.set_ready("my_index")  # type: ignore[arg-type]
+        slot.set_ready("my_index")  # ty: ignore[invalid-argument-type]  # wrong type on purpose: checks state/index pairing, not Index behavior
 
         assert slot.state == SlotState.READY
         assert slot.index == "my_index"
@@ -50,7 +50,7 @@ class TestSlotAtomicTransition:
     def test_set_error_clears_index(self, tmp_path: Path) -> None:
         """set_error() sets error state and clears index ref."""
         slot = RepoSlot(name="test", path=tmp_path)
-        slot.set_ready("my_index")  # type: ignore[arg-type]
+        slot.set_ready("my_index")  # ty: ignore[invalid-argument-type]  # wrong type on purpose: checks state/index pairing, not Index behavior
         slot.set_error("broken")
 
         assert slot.state == SlotState.ERROR
