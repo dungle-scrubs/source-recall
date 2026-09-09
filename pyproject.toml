@@ -33,7 +33,7 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     # L4: Pre-1.0 — vec0 virtual-table API may change.
     # Pinned exactly; monitor for 1.0 release.
-    "sqlite-vec==0.1.6",
+    "sqlite-vec==0.1.9",
     "fastapi>=0.115.0",
     "uvicorn>=0.32.0",
     # PDF parsing surface: pymupdf parses untrusted, attacker-controlled
