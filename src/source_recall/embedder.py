@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,34 @@ class EmbedderVerificationError(RuntimeError):
     """
 
 
+class _SentenceTransformerModel(Protocol):
+    """Minimal sentence_transformers.SentenceTransformer surface in use.
+
+    sentence-transformers is an optional extra, so its stubs cannot be
+    imported (even under TYPE_CHECKING) without breaking ``ty check`` on
+    FTS-only installs; this protocol pins only what CodeRankEmbedder
+    calls through the stored handle: ``encode`` with the keyword
+    arguments it passes.  (The ``max_seq_length = 512`` cap is set on the
+    raw constructed model inside ``_load_model`` before storage.)
+
+    ``encode`` returns ``Any`` deliberately: the shipped overload set
+    returns ``np.ndarray`` only on the ``convert_to_numpy=True`` default
+    branch (kept by every call here) and tensors otherwise, and a protocol
+    member must satisfy every overload — an ndarray-typed return never
+    structurally matches.
+    """
+
+    def encode(
+        self,
+        inputs: list[str],
+        *,
+        show_progress_bar: bool | None = ...,
+        batch_size: int = ...,
+    ) -> Any:
+        """Embed ``inputs`` into a ``(len(inputs), d)`` numpy batch."""
+        ...
+
+
 class CodeRankEmbedder:
     """Local CodeRankEmbed via sentence-transformers + ONNX Runtime.
 
@@ -148,12 +176,12 @@ class CodeRankEmbedder:
     ) -> None:
         self._show_progress = show_progress
         self._encode_batch_size = max(1, min(int(encode_batch_size), _MAX_ENCODE_BATCH))
-        self._model: object | None = None
+        self._model: _SentenceTransformerModel | None = None
         # Guards _load_model so the startup warmup thread and the first real
         # query cannot both construct (and download) the model.
         self._model_lock = threading.Lock()
 
-    def _load_model(self) -> object:
+    def _load_model(self) -> _SentenceTransformerModel:
         """Lazy-load the SentenceTransformer model.
 
         Idempotent under concurrency via double-checked locking: the Stage-4
@@ -375,10 +403,10 @@ class CodeRankEmbedder:
         # __init__ to a safe max.  Sequences are truncated to 512 tokens,
         # so the per-sequence attention matrix is bounded; the clamp keeps
         # the batch dimension from multiplying peak memory unboundedly.
-        embeddings = model.encode(  # type: ignore[union-attr]
+        embeddings = model.encode(
             texts, show_progress_bar=False, batch_size=self._encode_batch_size
         )
-        return embeddings.tolist()  # type: ignore[union-attr]
+        return embeddings.tolist()
 
     def embed_query(self, query: str) -> list[float]:
         """Embed a search query with CodeRankEmbed's required prefix.
@@ -388,7 +416,7 @@ class CodeRankEmbedder:
         """
         model = self._load_model()
         prefixed = f"{_QUERY_PREFIX}{query}"
-        return model.encode([prefixed], show_progress_bar=False)[0].tolist()  # type: ignore[union-attr]
+        return model.encode([prefixed], show_progress_bar=False)[0].tolist()
 
 
 # ---------------------------------------------------------------------------

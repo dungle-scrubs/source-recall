@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from tree_sitter import Node
+    from tree_sitter import Node, Parser
+    from tree_sitter_language_pack import SupportedLanguage
 
     _LineLookup = Callable[[int], int]
     _ChunkIdLookup = Callable[[int], str | None]
@@ -187,12 +188,12 @@ def _chunk_typescript(
     @returns: (chunks, quality).
     """
     ext = _get_extension(file_path)
-    lang = "tsx" if ext in {".tsx", ".jsx"} else "typescript"
+    lang: SupportedLanguage = "tsx" if ext in {".tsx", ".jsx"} else "typescript"
     return _chunk_ts_source(file_path, content, max_chars, lang)
 
 
 def _chunk_ts_source(
-    file_path: str, content: str, max_chars: int, lang: str
+    file_path: str, content: str, max_chars: int, lang: SupportedLanguage
 ) -> tuple[list[ChunkData], SearchQuality]:
     """Chunk a TypeScript/JavaScript source string with an explicit grammar.
 
@@ -2581,10 +2582,10 @@ def _extract_signature(lines: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-_parser_cache: dict[str, Any] = {}
+_parser_cache: dict[str, Parser] = {}
 
 
-def _get_cached_parser(language: str) -> Any:
+def _get_cached_parser(language: SupportedLanguage) -> Parser:
     """Return a cached tree-sitter parser for the given language (M5).
 
     Avoids per-file parser allocation overhead on large repos.
@@ -2604,7 +2605,7 @@ def _get_cached_parser(language: str) -> Any:
 
 
 def _parse_with_fallback(
-    _file_path: str, content: str, language: str
+    _file_path: str, content: str, language: SupportedLanguage
 ) -> tuple[Any, SearchQuality]:
     """Parse with tree-sitter, falling back on high error density.
 
@@ -2642,9 +2643,10 @@ def _count_nodes(node: Node) -> tuple[int, int]:
 
     reached_root = False
     while not reached_root:
-        if cursor.node.is_named:
+        current = cursor.node
+        if current is not None and current.is_named:
             total += 1
-            if cursor.node.is_error or cursor.node.type == "ERROR":
+            if current.is_error or current.type == "ERROR":
                 errors += 1
 
         if cursor.goto_first_child():
@@ -2801,7 +2803,9 @@ def _iter_nodes(node: Node) -> Iterator[Node]:
     cursor = node.walk()
     reached_root = False
     while not reached_root:
-        yield cursor.node
+        current = cursor.node
+        if current is not None:
+            yield current
 
         if cursor.goto_first_child():
             continue

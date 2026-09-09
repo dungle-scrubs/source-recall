@@ -768,7 +768,12 @@ def create_daemon_app(
                     if t in state["bg_threads"]:
                         state["bg_threads"].remove(t)
 
-        t.join = _join_then_cleanup  # type: ignore[method-assign]
+        # Deliberate unbound-def shadow of the bound ``Thread.join``: callers
+        # invoke it as t.join(timeout=...), so no self is ever passed. A typed
+        # Thread subclass with a join override was tried and reverted: it
+        # changes dispatch for class-level join patches (tests observe joins
+        # that way), so the monkey-patch stays.
+        t.join = _join_then_cleanup  # ty: ignore[invalid-assignment] deliberate shadow of bound Thread.join; rationale above
 
         return RepoStateResponse(
             name=slot.name,
@@ -958,6 +963,14 @@ def create_daemon_app(
                 )
 
         idx = slot.index
+        if idx is None:
+            # SlotState.READY implies a loaded index, but a concurrent
+            # remove() can close the slot between the READY check above and
+            # here; narrow explicitly instead of relying on that invariant.
+            raise HTTPException(
+                status_code=503,
+                detail=f"Repo '{repo}' index not loaded (state: {slot.state})",
+            )
 
         # Rate limit per repo (check before acquiring per-repo lock).
         key = slot.name

@@ -190,12 +190,15 @@ class TestSubChunking:
         assert len(chunks) > 1
 
         # All sub-chunks should have parent_chunk_id set.
+        indices: list[int] = []
         for c in chunks:
             assert c.parent_chunk_id is not None
-            assert c.sub_chunk_index is not None
+            idx = c.sub_chunk_index
+            assert idx is not None
+            indices.append(idx)
 
         # Sub-chunk indices should be sequential.
-        indices = sorted(c.sub_chunk_index for c in chunks)
+        indices.sort()
         assert indices == list(range(len(chunks)))
 
     def test_small_function_not_sub_chunked(self) -> None:

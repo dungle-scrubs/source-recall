@@ -37,7 +37,7 @@ class TestRemoveRepoCancelsBackgroundIndex:
         slot.cancel.set()
 
         idx = _FakeIndex()
-        slot.set_ready(idx)  # type: ignore[arg-type]
+        slot.set_ready(idx)  # ty: ignore[invalid-argument-type]  # fake Index: the recording double IS the test (no real db)
 
         assert idx.closed, "Cancelled set_ready must close the passed Index"
         assert slot.index is None, "Cancelled slot must not store the Index"
@@ -48,7 +48,7 @@ class TestRemoveRepoCancelsBackgroundIndex:
         slot = RepoSlot(name="r", path=tmp_path)
 
         idx = _FakeIndex()
-        slot.set_ready(idx)  # type: ignore[arg-type]
+        slot.set_ready(idx)  # ty: ignore[invalid-argument-type]  # fake Index: the recording double IS the test (no real db)
 
         assert not idx.closed
         assert slot.index is idx
@@ -65,7 +65,7 @@ class TestRemoveRepoCancelsBackgroundIndex:
             slot.set_indexing()
             # Simulate a build that respects cancel by finishing promptly.
             finished.wait(timeout=5)
-            slot.set_ready(_FakeIndex())  # type: ignore[arg-type]
+            slot.set_ready(_FakeIndex())  # ty: ignore[invalid-argument-type]  # fake Index: the recording double IS the test (no real db)
 
         t = threading.Thread(target=build, name="sr-index-r")
         slot.index_thread = t
@@ -95,7 +95,7 @@ class TestRemoveRepoCancelsBackgroundIndex:
         def build() -> None:
             slot.set_indexing()
             proceed.wait(timeout=5)
-            slot.set_ready(_FakeIndex())  # type: ignore[arg-type]
+            slot.set_ready(_FakeIndex())  # ty: ignore[invalid-argument-type]  # fake Index: the recording double IS the test (no real db)
 
         t = threading.Thread(target=build, name="sr-index-r")
         slot.index_thread = t

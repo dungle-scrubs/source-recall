@@ -36,7 +36,9 @@ import os
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import IO, Any
 
 import pytest
 
@@ -118,10 +120,10 @@ class TestTransientStatDoesNotDelete:
         # fine. The failure must NOT be read as "a.py is gone".
         real_stat = Path.stat
 
-        def flaky_stat(self: Path, *args: object, **kwargs: object) -> os.stat_result:
+        def flaky_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
             if self.name == "a.py":
                 raise OSError(errno.EIO, "simulated transient stat failure")
-            return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+            return real_stat(self, follow_symlinks=follow_symlinks)
 
         monkeypatch.setattr(Path, "stat", flaky_stat)
 
@@ -189,11 +191,20 @@ class TestPdfHashFailurePreservesData:
         real_open = builtins.open
 
         def flaky_open(
-            file: object, mode: str = "r", *args: object, **kwargs: object
-        ) -> object:
+            file: int | str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            mode: str = "r",
+            buffering: int = -1,
+            encoding: str | None = None,
+            errors: str | None = None,
+            newline: str | None = None,
+            closefd: bool = True,
+            opener: Callable[[str, int], int] | None = None,
+        ) -> IO[Any]:
             if str(file).endswith("doc.pdf") and "b" in mode:
                 raise OSError(errno.EIO, "simulated pdf hash read failure")
-            return real_open(file, mode, *args, **kwargs)  # type: ignore[arg-type]
+            return real_open(
+                file, mode, buffering, encoding, errors, newline, closefd, opener
+            )
 
         monkeypatch.setattr(builtins, "open", flaky_open)
 
@@ -240,7 +251,7 @@ class TestBoundedShutdownRealBlockingClose:
                 # stuck reader — never returns within the budget.
                 release.wait(timeout=30)
 
-        slot.index = BlockingIndex()  # type: ignore[assignment]
+        slot.index = BlockingIndex()  # ty: ignore[invalid-assignment] deliberate close()-blocks double; RepoSlot.index is typed Index
 
         start = time.monotonic()
         manager.close_all(lock_timeout_s=0.5)

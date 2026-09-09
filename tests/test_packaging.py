@@ -68,6 +68,26 @@ class TestEmbedExtra:
         assert data["project"].get("license") == "MIT"
 
 
+def test_version_resolves_from_distribution_metadata() -> None:
+    """__version__ resolves against pyproject's [project].name.
+
+    The distribution was renamed to dungle-scrubs-source-recall while the
+    import package stayed source_recall. A stale lookup name in
+    importlib.metadata silently degrades every `sr --version` report to
+    the 0.0.0+unknown fallback.
+    """
+    import importlib.metadata
+
+    import source_recall
+
+    data = _load_pyproject()
+    dist_name = data["project"]["name"]
+    assert source_recall.__version__ == importlib.metadata.version(dist_name), (
+        f"__version__ fell back or diverged: expected the installed "
+        f"{dist_name} version, got {source_recall.__version__!r}"
+    )
+
+
 class TestLazyImportContract:
     """The lazy-import contract that makes the embed split safe.
 

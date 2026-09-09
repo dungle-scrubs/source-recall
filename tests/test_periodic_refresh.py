@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +17,9 @@ _POLL_INTERVAL_S = 0.05
 _POLL_TIMEOUT_S = 10.0
 
 
-def _poll_until(predicate: object, timeout: float = _POLL_TIMEOUT_S) -> bool:
+def _poll_until(
+    predicate: Callable[[], object], timeout: float = _POLL_TIMEOUT_S
+) -> bool:
     """Poll ``predicate()`` until it is truthy or the deadline passes.
 
     Bounded, load-tolerant replacement for a fixed ``time.sleep``: returns

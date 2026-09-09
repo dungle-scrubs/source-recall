@@ -24,7 +24,7 @@ Steps to reproduce:
 - source-recall version: `sr --version` →
 - Python version: `python --version` →
 - OS:
-- Install method: `uv tool install -e .[embed]` / `uv tool install -e .` / other
+- Install method: `uv tool install dungle-scrubs-source-recall[embed]` / `uv tool install dungle-scrubs-source-recall` / `uv tool install -e .` / other
 
 ## Additional context
 

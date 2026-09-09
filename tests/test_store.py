@@ -656,10 +656,14 @@ class TestAtomicSwap:
 
         real_unlink = os.unlink
 
-        def fake_unlink(path: object, *args: object, **kwargs: object) -> None:
+        def fake_unlink(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            *,
+            dir_fd: int | None = None,
+        ) -> None:
             if str(path).endswith("test.db-wal"):
                 raise PermissionError("sidecar held by an open handle")
-            real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+            real_unlink(path, dir_fd=dir_fd)
 
         monkeypatch.setattr(os, "unlink", fake_unlink)
 

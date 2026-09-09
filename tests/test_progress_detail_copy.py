@@ -19,7 +19,7 @@ class TestProgressDetailDeepCopy:
         slot = RepoSlot(name="r", path=tmp_path)
         slot.set_indexing()
 
-        original = {"spans": {"embed": 1.0}, "total": 10}
+        original: dict[str, object] = {"spans": {"embed": 1.0}, "total": 10}
         slot.update_progress_detail(original)
 
         # Mutate the original's nested dict.
@@ -27,7 +27,9 @@ class TestProgressDetailDeepCopy:
         original["total"] = 999
 
         stored = slot.progress_detail
-        assert stored["spans"]["embed"] == 1.0, (
+        spans = stored["spans"]
+        assert isinstance(spans, dict), "stored detail must keep spans as a nested dict"
+        assert spans["embed"] == 1.0, (
             "Nested mutation leaked into the slot's stored detail (shallow copy bug)"
         )
         assert stored["total"] == 10

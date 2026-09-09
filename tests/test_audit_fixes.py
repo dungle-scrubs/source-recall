@@ -1588,6 +1588,7 @@ class TestPersistConfigFailure:
         assert "my-repo" in manager.slots
 
         # Persist should work when directory is created.
+        assert config.config_path is not None
         config.config_path.parent.mkdir(parents=True, exist_ok=True)
         toml_str = config.to_toml()
         assert "daemon" in toml_str

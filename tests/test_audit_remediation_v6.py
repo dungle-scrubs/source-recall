@@ -348,7 +348,7 @@ class TestSetReadyCancelledCloseIsBounded:
                 release.wait(timeout=30)
 
         start = time.monotonic()
-        slot.set_ready(BlockingIndex())  # type: ignore[arg-type]
+        slot.set_ready(BlockingIndex())  # ty: ignore[invalid-argument-type] deliberate close()-blocks double; set_ready is typed Index
         elapsed = time.monotonic() - start
 
         assert elapsed < 3.0, (

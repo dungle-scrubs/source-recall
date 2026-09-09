@@ -2,6 +2,12 @@ version: 2
 updates:
   - package-ecosystem: pip
     directory: "/"
+    ignore:
+      # Exact pins per AGENTS.md "tree-sitter pins are exact"; the
+      # language-pack C ABI breaks across minor versions. Upgrades are
+      # manual (verified chunker-wide), never Dependabot.
+      - dependency-name: "tree-sitter"
+      - dependency-name: "tree-sitter-language-pack"
     schedule:
       interval: weekly
       day: monday

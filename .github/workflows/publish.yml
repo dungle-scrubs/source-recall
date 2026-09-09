@@ -1,39 +1,22 @@
-name: Release
+name: Publish to PyPI
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref, branch, or tag to publish
+        required: false
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  # Never cancel an in-flight release: cancelling mid-`uv publish`
-  # can abort an upload half-done.
+  group: ${{ github.workflow }}-${{ inputs.ref || github.ref }}
+  # Never cancel an in-flight publish: cancelling mid-`uv publish` can
+  # abort an upload half-done (same rationale as release.yml).
   cancel-in-progress: false
 
-permissions:
-  contents: write
-  pull-requests: write
-
 jobs:
-  release-please:
-    runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-    steps:
-      # Pinned by commit SHA. Bump via Dependabot; tags shown for reference.
-      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7  # v5.0.0
-        id: release
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # Config and manifest live at the repo root.
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-
   publish:
     name: pypi / publish
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     # Protected environment: configure required reviewers / tag restrictions in
     # the GitHub repo settings for defense-in-depth on PyPI publishing.
@@ -45,9 +28,7 @@ jobs:
       # Pinned by commit SHA. Bump via Dependabot; tags shown for reference.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # Check out the release tag, not main, so the build matches
-          # the published artifact.
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ inputs.ref || github.ref }}
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
@@ -58,10 +39,9 @@ jobs:
 
       - name: Verify install
         # Resolve the lock and confirm the package imports + reports its
-        # version before building. `uv lock` first: release-please bumps
-        # pyproject's version but not uv.lock's project entry, so a plain
-        # --frozen sync at the tag would carry a stale lock. `uv lock` is
-        # minimum-change; only the project's own entry moves.
+        # version before building. `uv lock` first: at a tag the committed
+        # lock's project entry lags pyproject's version (release-please
+        # does not update uv.lock); `uv lock` is minimum-change.
         run: |
           uv lock
           uv sync

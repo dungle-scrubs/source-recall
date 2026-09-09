@@ -180,7 +180,7 @@ class TestVecChunksStore:
         assert vec_store.get_vector_count() == 3
 
         # Wrap the apsw connection so the second DELETE fails mid-batch.
-        real_conn = vec_store._get_vec_conn()  # type: ignore[union-attr]
+        real_conn = vec_store._get_vec_conn()
         delete_count = {"n": 0}
 
         class _FlakyConn:
@@ -192,14 +192,14 @@ class TestVecChunksStore:
                         raise RuntimeError(msg)
                 return real_conn.execute(sql, *args)
 
-        vec_store._vec_conn = _FlakyConn()  # type: ignore[assignment]
+        vec_store._vec_conn = _FlakyConn()
 
         with pytest.raises(RuntimeError, match="simulated"):
             vec_store.delete_vectors_by_ids(ids)
 
         # Restore the real connection and confirm the rollback left all
         # three rows intact.
-        vec_store._vec_conn = real_conn  # type: ignore[assignment]
+        vec_store._vec_conn = real_conn
         assert vec_store.get_vector_count() == 3
 
     def test_no_vec_table_returns_zero(self, tmp_path: Path) -> None:
@@ -263,6 +263,7 @@ class TestSchemaMigration:
         s2.run_migrations()
 
         version = s2.get_meta("schema_version")
+        assert version is not None, "schema_version must exist after migration"
         assert int(version) >= 3
         s2.close()
 
@@ -333,7 +334,7 @@ class TestGracefulDegradation:
         class ExplodingEmbedder(BagOfWordsEmbedder):
             """Embedder that always raises on embed_chunks."""
 
-            def embed_chunks(self, _texts: list[str]) -> list[list[float]]:
+            def embed_chunks(self, texts: list[str]) -> list[list[float]]:
                 msg = "GPU exploded"
                 raise RuntimeError(msg)
 
