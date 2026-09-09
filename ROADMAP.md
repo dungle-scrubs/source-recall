@@ -29,6 +29,21 @@ per query. Validated by `tests/test_refs.py` (11 tests) and
 
 ## Planned
 
+### RFC-01 - Shared repo resolution and error contract
+Next up. `daemon.py` and `server.py` answer "which repo does
+this request mean" with four separate copies of the same branch
+ladder, and the copies have diverged in status code, message, and
+readiness checks. One resolution seam over a registry protocol both
+servers satisfy, three typed errors, one HTTP mapping per server.
+Folds in three audit findings that live in the same code: unlocked
+registry iteration, the refresh rate-limit key that buckets one repo
+twice, and the closed slot that still reports ready. Changes one
+client-visible status code.
+
+Spec: [`docs/rfc/01_shared-repo-resolution-and-error-contract.rfc.md`](docs/rfc/01_shared-repo-resolution-and-error-contract.rfc.md).
+Status Draft; five open questions to answer before it moves to
+Accepted.
+
 ### Phase 2 — MCP server
 Model Context Protocol server so LLM tools (Claude, Cursor, etc.)
 can use source-recall as a retrieval backend. Separate from the
